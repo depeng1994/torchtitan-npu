@@ -50,6 +50,7 @@ STEPS=100
 USE_GOLDEN="${USE_GOLDEN:-0}"
 DEBUG_ARGS="
     --debug.no-moe-force-load-balance
+    --debug.print-config
 "
 
 # HF assets
@@ -84,7 +85,7 @@ TRAINING_ARGS="
 "
 
 # Checkpoint
-# `checkpoint.folder` is the output/resume root (`CKPT_SAVE_LOAD_PATH`).  If it
+# `checkpoint.folder` is the output/resume root (`CKPT_SAVE_LOAD_PATH`). If it
 # already contains a valid step-* checkpoint, upstream TorchTitan resumes from
 # it and ignores `initial-load-path`; use a new/empty folder when cold-starting
 # from `CKPT_INIT_LOAD_PATH`.
@@ -103,6 +104,14 @@ PROFILER_ARGS="
     --profiler.profiler-warmup 3
     --profiler.profiler-active 1
 "
+PROFILER_OVERRIDES=(
+    'torchtitan_npu.override.common.profiler.cann={
+        "profile_ranks": [0],
+        "profile_with_memory": false,
+        "profile_with_stack": false,
+        "enable_online_parse": false
+    }'
+)
 
 # Communication
 COMM_ARGS="
@@ -163,5 +172,5 @@ bash scripts/run_train_multinodes.sh \
     $PROFILER_ARGS \
     $COMM_ARGS \
     $CHECKPOINT_ARGS \
-    --override.imports "${NPU_OPS_OVERRIDES[@]}" $OPTIMIZER_OVERRIDES \
+    --override.imports "${NPU_OPS_OVERRIDES[@]}" "${PROFILER_OVERRIDES[@]}" $OPTIMIZER_OVERRIDES \
     "$@"

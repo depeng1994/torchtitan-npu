@@ -4,46 +4,60 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Run this script on a single node.
+# Run this script on each participating node; NODE_IPS lists all node addresses.
 # Append CLI arguments to override the defaults below:
-#   ./examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh --training.steps 5
+#   NODE_IPS=192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13 \
+#     ./examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
+#     --checkpoint.initial-load-path /path/to/model_ckpt --training.steps 5
 # USE_GOLDEN=1 selects Golden. For deterministic execution, append
 # --debug.seed 42 --debug.deterministic to the command line.
 
 set -euo pipefail
 
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_EXEC_TIMEOUT=17330
+export ACL_DEVICE_SYNC_TIMEOUT=2147480
+export HCCL_EVENT_TIMEOUT=2147480
+#close hccl watchdog, loadweight timeout
+export HCCL_ASYNC_ERROR_HANDLING=0
+# Use the command line `npu-smi info -t topo` to query the CPU Affinity of the NPU cards for configuration.
+export CPU_AFFINITY_CONF=1,npu0:288-311,npu1:312-335,npu2:336-359,npu3:360-383,npu4:96-119,npu5:120-143,npu6:144-167,npu7:168-191
+
+NODE_IPS="${NODE_IPS:-xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx}"
 NGPU="${NGPU:-8}"
-WORLD_SIZE="${NGPU}"
+NNODES=$(awk -F, '{print NF}' <<< "${NODE_IPS}")
+WORLD_SIZE=$((NGPU * NNODES))
 
 # Model
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}"
-CONFIG="${CONFIG:-deepseek_v4_flash_43layers_16experts}"
+CONFIG="${CONFIG:-deepseek_v4_pro_61layers_32experts}"
 
 # Dataloader & Checkpoint
 DATASET="${DATASET:-c4_test}"
 DATASET_PATH="${DATASET_PATH:-tests/assets/c4_test}" # your data path
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-/path/to/DeepSeekV4_tokenizer}" # your tokenizer path
 CKPT_SAVE_LOAD_PATH="${CKPT_SAVE_LOAD_PATH:-/path/to/save_ckpt}" # your model save/load ckpt path
+CKPT_INIT_LOAD_PATH="${CKPT_INIT_LOAD_PATH:-/path/to/init_load_ckpt}" # your model initial load ckpt path
 
 # Parallelism
-TP=1
-PP=1
-EP=8
-CP=1
-DP_SHARD=8
+TP="${TP:-1}"
+PP="${PP:-1}"
+EP="${EP:-32}"
+CP="${CP:-1}"
+DP_SHARD="${DP_SHARD:-32}"
 DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
 SPMD_BACKEND="spmd_types"
 
 # Training
-SEQ_LEN=4096
+SEQ_LEN="${SEQ_LEN:-4096}"
 MBS=1
-GBS=64
-STEPS=100
+GBS="${GBS:-256}"
+STEPS="${STEPS:-100}"
 
 # Debug
 USE_GOLDEN="${USE_GOLDEN:-0}"
 DEBUG_ARGS="
-    --debug.no-moe-force-load-balance
+    --debug.moe-force-load-balance
     --debug.print-config
 "
 
@@ -79,13 +93,16 @@ TRAINING_ARGS="
 "
 
 # Checkpoint
-# `checkpoint.folder` is the save/load root (`CKPT_SAVE_LOAD_PATH`). If it
+# `checkpoint.folder` is the output/resume root (`CKPT_SAVE_LOAD_PATH`). If it
 # already contains a valid step-* checkpoint, upstream TorchTitan resumes from
-# it; use a new/empty folder when starting a fresh run.
+# it and ignores `initial-load-path`; use a new/empty folder when cold-starting
+# from `CKPT_INIT_LOAD_PATH`.
 CHECKPOINT_ARGS="
-    --checkpoint.no-enable
+    --checkpoint.enable
     --checkpoint.load-only
     --checkpoint.folder ${CKPT_SAVE_LOAD_PATH}
+    --checkpoint.initial-load-path ${CKPT_INIT_LOAD_PATH}
+    --checkpoint.initial-load-in-hf
 "
 
 # Profiler
@@ -152,9 +169,10 @@ fi
 
 MODULE="${MODULE}" \
 CONFIG="${CONFIG}" \
+NODE_IPS="${NODE_IPS}" \
 NGPU="${NGPU}" \
 LOG_PREFIX="${LOG_PREFIX:-${CONFIG}}" \
-bash scripts/run_train.sh \
+bash scripts/run_train_multinodes.sh \
     $HF_ASSETS_ARGS \
     $DATALOADER_ARGS \
     $PARALLELISM_ARGS \
