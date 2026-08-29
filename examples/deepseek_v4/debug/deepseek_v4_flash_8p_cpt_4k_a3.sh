@@ -79,7 +79,7 @@ TRAINING_ARGS="
 "
 
 # Checkpoint
-# `checkpoint.folder` is the save/load root (`CKPT_SAVE_LOAD_PATH`).  If it
+# `checkpoint.folder` is the save/load root (`CKPT_SAVE_LOAD_PATH`). If it
 # already contains a valid step-* checkpoint, upstream TorchTitan resumes from
 # it; use a new/empty folder when starting a fresh run.
 CHECKPOINT_ARGS="
@@ -97,6 +97,14 @@ PROFILER_ARGS="
     --profiler.profiler-repeat 1
     --profiler.profiler-skip-first 4
 "
+PROFILER_OVERRIDES=(
+    'torchtitan_npu.override.common.profiler.cann={
+        "profile_ranks": [0],
+        "profile_with_memory": false,
+        "profile_with_stack": false,
+        "enable_online_parse": false
+    }'
+)
 
 # Communication
 COMM_ARGS="
@@ -139,8 +147,6 @@ else
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post
         # MoE token dispatcher
         torchtitan_npu.override.common.token_dispatcher.npu_all_to_all_token_dispatcher
-        # Profiling
-        "torchtitan_npu.override.common.profiler.cann={\"profile_ranks\":[0],\"profile_with_memory\":false,\"profile_with_stack\":false,\"enable_online_parse\":false}"
     )
 fi
 
@@ -158,5 +164,5 @@ bash scripts/run_train.sh \
     $PROFILER_ARGS \
     $COMM_ARGS \
     $CHECKPOINT_ARGS \
-    --override.imports "${NPU_OPS_OVERRIDES[@]}" $OPTIMIZER_OVERRIDES \
+    --override.imports "${NPU_OPS_OVERRIDES[@]}" "${PROFILER_OVERRIDES[@]}" $OPTIMIZER_OVERRIDES \
     "$@"

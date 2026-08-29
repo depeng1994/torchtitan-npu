@@ -1,142 +1,214 @@
-## 单机最简命令：
-1. 默认单机1P裁剪模型 + USE_GOLDEN
+# DeepSeek-V4 training examples
+
+本目录只保留少量稳定入口，模型规模、序列长度、并行策略和量化方式优先通过 CLI 覆盖，不为每一种组合新增独立脚本。
+
+## 入口关系
+
+Flash 多机训练以 `deepseek_v4_flash_cpt_4k_a3.sh` 为公共基线：
+
+```text
+deepseek_v4_flash_cpt_4k_a3.sh
+└── deepseek_v4_flash_cpt_4k_a5.sh
+    └── deepseek_v4_flash_cpt_1024k_a5.sh
+```
+
+- `deepseek_v4_flash_cpt_4k_a3.sh`：公共训练参数、override、checkpoint、optimizer 等基线配置。
+- `deepseek_v4_flash_cpt_4k_a5.sh`：只增加 A5 运行环境，其他配置复用 A3 基线。
+- `deepseek_v4_flash_cpt_1024k_a5.sh`：继续复用 A5 4K 入口，只通过 CLI 覆盖 1M 所需的 CP、DP、序列长度和 global batch size。
+- 用户传入的 `"$@"` 始终位于最后，因此可以覆盖脚本中的默认 CLI 参数。
+
+## 常用环境变量
+
+运行前至少根据环境设置以下路径和节点信息：
+
+```sh
+export NODE_IPS="192.168.1.10,192.168.1.11,..."
+export HF_ASSETS_PATH=/path/to/DeepSeekV4_tokenizer
+export CKPT_SAVE_LOAD_PATH=/path/to/save_or_resume_ckpt
+export CKPT_INIT_LOAD_PATH=/path/to/init_hf_ckpt
+```
+
+A5 默认每节点使用 8 张 NPU，A3 默认每节点使用 16 张 NPU；需要改变时设置 `NGPU`。
+
+## 裁剪 Debug 模型
+
+Debug/performance 验证优先使用等价裁剪模型，避免为了快速验证直接启动完整规模模型。这里统一放置不同规模的裁剪 Debug 入口，卡数不是这一节的分类依据。
+
+### 1P mini 模型
+
 ```sh
 bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
-USE_GOLDEN=1 bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
+
+USE_GOLDEN=1 \
+bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
 ```
-2.默认单机8P等效裁剪模型 + Profiling
+
+### 8P Flash 16-expert Debug
+
 ```sh
 bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
-  --profiler.enable-profiling \
   --training.steps 10
 ```
-3. 首次导出 Hugging Face Checkpoint
+
+需要采集 profile 时显式追加：
+
+```sh
+--profiler.enable-profiling
+```
+
+Profiler override 使用多行 JSON 配置，但仍作为 `--override.imports` 的单个参数传入。
+
+### 32P Pro 32-expert Debug
+
+Pro 32-expert 是独立的裁剪模型 debug/performance 入口，不与 8P Flash launcher 强制复用：
+
+```sh
+NODE_IPS="${NODE_IPS}" \
+COMPILE_BACKEND=aot_eager \
+bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
+  --debug.moe-force-load-balance \
+  --training.steps 20
+```
+
+128K 场景不新增 launcher，只通过 CLI 改变并行和训练配置：
+
+```sh
+NODE_IPS="${NODE_IPS}" \
+COMPILE_BACKEND=aot_eager \
+bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
+  --parallelism.context-parallel-degree 32 \
+  --parallelism.data-parallel-shard-degree 1 \
+  --parallelism.data-parallel-replicate-degree 1 \
+  --training.seq-len 131072 \
+  --training.global-batch-size 8 \
+  --debug.moe-force-load-balance \
+  --training.steps 20
+```
+
+需要 MXFP8 时继续追加后文的量化参数即可。
+
+### 导出和加载 Debug Hugging Face checkpoint
+
+导出 checkpoint：
+
 ```sh
 bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
   --checkpoint.folder ./export_ckpt \
-  --training.steps 1 \
-  --debug.seed 42 \
-  --debug.deterministic \
   --checkpoint.enable \
   --checkpoint.no-load-only \
-  --checkpoint.last-save-in-hf
-```
-4. 加载 Debug Hugging Face Checkpoint 训练
-```sh
-bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
+  --checkpoint.last-save-in-hf \
   --training.steps 1 \
   --debug.seed 42 \
-  --debug.deterministic \
-  --checkpoint.enable \
-  --checkpoint.initial-load-path ./export_ckpt/checkpoint/step-1 \
-  --checkpoint.initial-load-in-hf
+  --debug.deterministic
 ```
 
-## 多机模型命令：
-1. A3 DeepSeek V4 flash full‑model 4k序列训练
+从导出的 HF checkpoint 冷启动时，使用新的或空的 `checkpoint.folder`，避免已有 step checkpoint 优先触发 resume：
+
 ```sh
-NODE_IPS=192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13,192.168.1.14,192.168.1.15,192.168.1.16,192.168.1.17 \
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
+  --checkpoint.folder ./load_ckpt \
+  --checkpoint.enable \
+  --checkpoint.initial-load-path ./export_ckpt/checkpoint/step-1 \
+  --checkpoint.initial-load-in-hf \
+  --training.steps 1 \
+  --debug.seed 42 \
+  --debug.deterministic
+```
+
+## 多机完整模型训练
+
+### A3 4K
+
+```sh
+NODE_IPS="${NODE_IPS}" \
 bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
-  --checkpoint.initial-load-path /path/to/model_ckpt \
   --training.steps 500
 ```
-2. A5 DeepSeek V4 flash bf16 full‑model 4k序列 performance
+
+### A5 4K
+
 ```sh
-NODE_IPS="192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13,192.168.1.14,192.168.1.15,192.168.1.16,192.168.1.17,\
-192.168.1.18,192.168.1.19,192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23,192.168.1.24,192.168.1.25" \
+NODE_IPS="${NODE_IPS}" \
 COMPILE_BACKEND=aot_eager \
 bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
   --debug.moe-force-load-balance \
   --training.steps 20
 ```
-3. A5 DeepSeek V4 flash mxfp8 full‑model 4k序列 performance
+
+### A5 64K
+
+64K 不需要新增 launcher，直接在 A5 4K 入口上覆盖训练和并行参数：
+
 ```sh
-NODE_IPS="192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13,192.168.1.14,192.168.1.15,192.168.1.16,192.168.1.17,\
-192.168.1.18,192.168.1.19,192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23,192.168.1.24,192.168.1.25" \
+NODE_IPS="${NODE_IPS}" \
 COMPILE_BACKEND=aot_eager \
 bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
-  --debug.moe-force-load-balance \
-  --extension.quantization.enable-quantized-training \
-  --extension.quantization.recipe all_block_fp8 \
-  --training.steps 20
-```
-4. A5 DeepSeek V4 flash bf16 full‑model 64k序列 performance
-```sh
-NODE_IPS="192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13,192.168.1.14,192.168.1.15,192.168.1.16,192.168.1.17,\
-192.168.1.18,192.168.1.19,192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23,192.168.1.24,192.168.1.25" \
-EP=128 CP=8 DP_SHARD=16 SEQ_LEN=65536 GBS=128 \
-COMPILE_BACKEND=aot_eager \
-bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
+  --parallelism.context-parallel-degree 8 \
+  --parallelism.data-parallel-shard-degree 16 \
+  --parallelism.data-parallel-replicate-degree 1 \
+  --training.seq-len 65536 \
+  --training.global-batch-size 128 \
   --debug.moe-force-load-balance \
   --training.steps 20
 ```
-5. A5 DeepSeek V4 flash mxfp8 full‑model 64k序列 performance
+
+### A5 1M
+
+1M wrapper 只提供该场景的默认 CLI 覆盖；仍可在命令末尾继续覆盖：
+
 ```sh
-NODE_IPS="192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13,192.168.1.14,192.168.1.15,192.168.1.16,192.168.1.17,\
-192.168.1.18,192.168.1.19,192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23,192.168.1.24,192.168.1.25" \
-EP=128 CP=8 DP_SHARD=16 SEQ_LEN=65536 GBS=128 \
-COMPILE_BACKEND=aot_eager \
-bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
-  --debug.moe-force-load-balance \
-  --extension.quantization.enable-quantized-training \
-  --extension.quantization.recipe all_block_fp8 \
-  --training.steps 20
-```
-6. A5 DeepSeek V4 flash bf16 full‑model 1M序列 performance
-```sh
-NODE_IPS="192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13,192.168.1.14,192.168.1.15,192.168.1.16,192.168.1.17,\
-192.168.1.18,192.168.1.19,192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23,192.168.1.24,192.168.1.25" \
+NODE_IPS="${NODE_IPS}" \
 COMPILE_BACKEND=aot_eager \
 bash examples/deepseek_v4/deepseek_v4_flash_cpt_1024k_a5.sh \
   --debug.moe-force-load-balance \
   --training.steps 20
 ```
-7. A5 DeepSeek V4 flash mxfp8 full‑model 1M序列 performance
+
+等价的主要差异参数为：
+
 ```sh
-NODE_IPS="192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13,192.168.1.14,192.168.1.15,192.168.1.16,192.168.1.17,\
-192.168.1.18,192.168.1.19,192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23,192.168.1.24,192.168.1.25" \
-COMPILE_BACKEND=aot_eager \
-bash examples/deepseek_v4/deepseek_v4_flash_cpt_1024k_a5.sh \
-  --debug.moe-force-load-balance \
-  --extension.quantization.enable-quantized-training \
-  --extension.quantization.recipe all_block_fp8 \
-  --training.steps 20
+--parallelism.context-parallel-degree 128 \
+--parallelism.data-parallel-shard-degree 1 \
+--parallelism.data-parallel-replicate-degree 1 \
+--training.seq-len 1048576 \
+--training.global-batch-size 8
 ```
-8. A5 DeepSeek V4 Pro bf16 裁剪模型 4k序列 performance
+
+## MXFP8
+
+量化训练作为正交能力，不再为每个序列长度复制一套命令。在上述任意支持的 A5 Flash 命令末尾追加：
+
 ```sh
-NODE_IPS=192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13 \
-COMPILE_BACKEND=aot_eager \
-bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
-  --debug.moe-force-load-balance \
-  --training.steps 20
+--extension.quantization.enable-quantized-training \
+--extension.quantization.recipe all_block_fp8
 ```
-9. A5 DeepSeek V4 Pro mxfp8 裁剪模型 4k序列 performance
+
+例如 A5 64K MXFP8 只是在 64K 命令后追加这两个参数。
+
+## Profiling
+
+需要采集 profile 时显式开启：
+
 ```sh
-NODE_IPS=192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13 \
-COMPILE_BACKEND=aot_eager \
-bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
-  --debug.moe-force-load-balance \
-  --extension.quantization.enable-quantized-training \
-  --extension.quantization.recipe all_block_fp8 \
-  --training.steps 20
+--profiler.enable-profiling
 ```
-10. A5 DeepSeek V4 Pro bf16 裁剪模型 128k序列 performance
+
+公共 A3 基线提供如下 schedule，A5 Flash 直接继承，用户仍可通过 CLI 覆盖：
+
 ```sh
-NODE_IPS=192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13 \
-EP=32 CP=32 DP_SHARD=1 SEQ_LEN=131072 GBS=8 \
-COMPILE_BACKEND=aot_eager \
-bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
-  --debug.moe-force-load-balance \
-  --training.steps 20
+--profiler.profile-freq 1 \
+--profiler.profiler-warmup 0 \
+--profiler.profiler-active 1 \
+--profiler.profiler-repeat 1 \
+--profiler.profiler-skip-first 4
 ```
-11. A5 DeepSeek V4 Pro mxfp8 裁剪模型 128k序列 performance
+
+## Checkpoint 说明
+
+Flash 多机 CPT 基线默认启用 `--checkpoint.load-only`，即只负责加载，不会保存新的训练 checkpoint。需要保存时必须显式覆盖：
+
 ```sh
-NODE_IPS=192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13 \
-EP=32 CP=32 DP_SHARD=1 SEQ_LEN=131072 GBS=8 \
-COMPILE_BACKEND=aot_eager \
-bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
-  --debug.moe-force-load-balance \
-  --extension.quantization.enable-quantized-training \
-  --extension.quantization.recipe all_block_fp8 \
-  --training.steps 20
+--checkpoint.no-load-only
 ```
+
+当 `checkpoint.folder` 已存在有效的 `step-*` checkpoint 时，TorchTitan 会优先 resume，该情况下 `checkpoint.initial-load-path` 不作为冷启动来源；要从 `initial-load-path` 冷启动，请使用新的或空的 `checkpoint.folder`。
