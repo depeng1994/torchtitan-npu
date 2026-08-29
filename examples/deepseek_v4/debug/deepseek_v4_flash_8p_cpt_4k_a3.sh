@@ -44,6 +44,7 @@ STEPS=100
 USE_GOLDEN="${USE_GOLDEN:-0}"
 DEBUG_ARGS="
     --debug.no-moe-force-load-balance
+    --debug.print-config
 "
 
 # HF assets
@@ -90,9 +91,11 @@ CHECKPOINT_ARGS="
 # Profiler
 PROFILER_ARGS="
     --profiler.no-enable-profiling
-    --profiler.profile-freq 10
-    --profiler.profiler-warmup 3
+    --profiler.profile-freq 1
+    --profiler.profiler-warmup 0
     --profiler.profiler-active 1
+    --profiler.profiler-repeat 1
+    --profiler.profiler-skip-first 4
 "
 
 # Communication
@@ -136,6 +139,8 @@ else
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post
         # MoE token dispatcher
         torchtitan_npu.override.common.token_dispatcher.npu_all_to_all_token_dispatcher
+        # Profiling
+        "torchtitan_npu.override.common.profiler.cann={\"profile_ranks\":[0],\"profile_with_memory\":false,\"profile_with_stack\":false,\"enable_online_parse\":false}"
     )
 fi
 

@@ -6,17 +6,26 @@
 
 # Run this script on each participating node; NODE_IPS lists all node addresses.
 # Append CLI arguments to override the defaults below:
-#   NODE_IPS=192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13,192.168.1.14,192.168.1.15,192.168.1.16,192.168.1.17 \
-#     ./examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
+#   NODE_IPS=192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13,192.168.1.14,192.168.1.15,192.168.1.16,192.168.1.17,192.168.1.18,192.168.1.19,192.168.1.20,192.168.1.21,192.168.1.22,192.168.1.23,192.168.1.24,192.168.1.25 \
+#     ./examples/deepseek_v4/deepseek_v4_flash_cpt_1024k_a5.sh \
 #     --checkpoint.initial-load-path /path/to/model_ckpt --training.steps 5
 # USE_GOLDEN=1 selects Golden. For deterministic execution, append
 # --debug.seed 42 --debug.deterministic to the command line.
 
 set -euo pipefail
 
-NODE_IPS="${NODE_IPS:-xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, \
-                      xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx}"
-NGPU="${NGPU:-16}"
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_EXEC_TIMEOUT=17330
+export ACL_DEVICE_SYNC_TIMEOUT=2147480
+export HCCL_EVENT_TIMEOUT=2147480
+#close hccl watchdog, loadweight timeout
+export HCCL_ASYNC_ERROR_HANDLING=0
+# Use the command line `npu-smi info -t topo` to query the CPU Affinity of the NPU cards for configuration.
+export CPU_AFFINITY_CONF=1,npu0:288-311,npu1:312-335,npu2:336-359,npu3:360-383,npu4:96-119,npu5:120-143,npu6:144-167,npu7:168-191
+
+NODE_IPS="${NODE_IPS:-xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, \
+                      xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx}"
+NGPU="${NGPU:-8}"
 NNODES=$(awk -F, '{print NF}' <<< "${NODE_IPS}")
 WORLD_SIZE=$((NGPU * NNODES))
 
@@ -32,19 +41,19 @@ CKPT_SAVE_LOAD_PATH="${CKPT_SAVE_LOAD_PATH:-/path/to/save_ckpt}" # your model sa
 CKPT_INIT_LOAD_PATH="${CKPT_INIT_LOAD_PATH:-/path/to/init_load_ckpt}" # your model initial load ckpt path
 
 # Parallelism
-TP=1
-PP=1
-EP=128
-CP=1
-DP_SHARD=128
+TP="${TP:-1}"
+PP="${PP:-1}"
+EP="${EP:-128}"
+CP="${CP:-128}"
+DP_SHARD="${DP_SHARD:-1}"
 DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
 SPMD_BACKEND="spmd_types"
 
 # Training
-SEQ_LEN=4096
+SEQ_LEN="${SEQ_LEN:-1048576}"
 MBS=1
-GBS=1024
-STEPS=100
+GBS="${GBS:-8}"
+STEPS="${STEPS:-100}"
 
 # Debug
 USE_GOLDEN="${USE_GOLDEN:-0}"
@@ -100,9 +109,11 @@ CHECKPOINT_ARGS="
 # Profiler
 PROFILER_ARGS="
     --profiler.no-enable-profiling
-    --profiler.profile-freq 10
-    --profiler.profiler-warmup 3
+    --profiler.profile-freq 1
+    --profiler.profiler-warmup 0
     --profiler.profiler-active 1
+    --profiler.profiler-repeat 1
+    --profiler.profiler-skip-first 4
 "
 
 # Communication
@@ -146,6 +157,8 @@ else
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post
         # MoE token dispatcher
         torchtitan_npu.override.common.token_dispatcher.npu_all_to_all_token_dispatcher
+        # Profiling
+        "torchtitan_npu.override.common.profiler.cann={\"profile_ranks\":[0],\"profile_with_memory\":false,\"profile_with_stack\":false,\"enable_online_parse\":false}"
     )
 fi
 
