@@ -32,6 +32,7 @@ jobs:
       - name: Run DSV4 config and meta FLOPs tests
         run: |
           python - <<'PY'
+          import importlib
           import pathlib
           import sys
           import types
@@ -51,6 +52,16 @@ jobs:
               module.__package__ = name
               module.__path__ = [str(path)]
               sys.modules[name] = module
+
+          # Load only the pure-Python TorchTitan compatibility patches required
+          # to construct the DSV4 config/model.  Avoid the package-level NPU
+          # runtime initialization that requires CANN/HCCL on a CPU runner.
+          importlib.import_module(
+              "torchtitan_npu.patches.torchtitan.models.common.moe"
+          )
+          importlib.import_module(
+              "torchtitan_npu.patches.torchtitan.models.common.token_dispatcher"
+          )
 
           raise SystemExit(
               pytest.main(
