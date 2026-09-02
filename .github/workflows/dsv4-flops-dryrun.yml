@@ -26,7 +26,7 @@ jobs:
             torch==2.14.0.dev20260719
           python -m pip install \
             "torchtitan @ git+https://github.com/pytorch/torchtitan.git@2807d3f550fe27db18bd9395ba63176364eaed6d" \
-            pybind11==3.0.4 numpy PyYAML ninja scipy==1.13.1 safetensors==0.8.0 pytest
+            pybind11==3.0.4 numpy PyYAML ninja scipy==1.13.1 safetensors==0.8.0 pytest triton
           python -m pip install \
             --find-links https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torch-npu/index.html \
             torch_npu==2.14.0.dev20260808
