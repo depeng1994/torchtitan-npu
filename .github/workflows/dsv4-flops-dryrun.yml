@@ -27,11 +27,37 @@ jobs:
           python -m pip install \
             "torchtitan @ git+https://github.com/pytorch/torchtitan.git@2807d3f550fe27db18bd9395ba63176364eaed6d" \
             pybind11==3.0.4 numpy PyYAML ninja scipy==1.13.1 safetensors==0.8.0 pytest triton
-          python -m pip install \
-            --find-links https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torch-npu/index.html \
-            torch_npu==2.14.0.dev20260808
           python -m pip install -e . --no-deps
 
       - name: Run DSV4 config and meta FLOPs tests
         run: |
-          python -m pytest -q tests/unit_tests/models/deepseek_v4/test_dsv4_config.py
+          python - <<'PY'
+          import pathlib
+          import sys
+          import types
+
+          import pytest
+
+          root = pathlib.Path.cwd()
+          namespace_packages = {
+              "torchtitan_npu": root / "torchtitan_npu",
+              "torchtitan_npu.patches": root / "torchtitan_npu" / "patches",
+              "torchtitan_npu.patches.torchtitan": root / "torchtitan_npu" / "patches" / "torchtitan",
+              "torchtitan_npu.patches.torchtitan.models": root / "torchtitan_npu" / "patches" / "torchtitan" / "models",
+              "torchtitan_npu.patches.torchtitan.models.common": root / "torchtitan_npu" / "patches" / "torchtitan" / "models" / "common",
+          }
+          for name, path in namespace_packages.items():
+              module = types.ModuleType(name)
+              module.__package__ = name
+              module.__path__ = [str(path)]
+              sys.modules[name] = module
+
+          raise SystemExit(
+              pytest.main(
+                  [
+                      "-q",
+                      "tests/unit_tests/models/deepseek_v4/test_dsv4_config.py",
+                  ]
+              )
+          )
+          PY
