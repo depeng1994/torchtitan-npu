@@ -1,0 +1,37 @@
+name: DSV4 FLOPs dry run
+
+on:
+  push:
+    branches:
+      - fix/dsv4-flops-estimator
+  workflow_dispatch:
+
+jobs:
+  meta-flops:
+    runs-on: ubuntu-latest
+    env:
+      TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            --extra-index-url https://download.pytorch.org/whl/nightly/cpu \
+            torch==2.14.0.dev20260719
+          python -m pip install \
+            "torchtitan @ git+https://github.com/pytorch/torchtitan.git@2807d3f550fe27db18bd9395ba63176364eaed6d" \
+            pybind11==3.0.4 numpy PyYAML ninja scipy==1.13.1 safetensors==0.8.0 pytest
+          python -m pip install \
+            --find-links https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torch-npu/index.html \
+            torch_npu==2.14.0.dev20260808
+          python -m pip install -e . --no-deps
+
+      - name: Run DSV4 config and meta FLOPs tests
+        run: |
+          python -m pytest -q tests/unit_tests/models/deepseek_v4/test_dsv4_config.py
