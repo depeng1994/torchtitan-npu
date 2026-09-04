@@ -9,6 +9,7 @@ from torchtitan.tools import utils as titan_utils
 
 _upstream_get_peak_flops = titan_utils.get_peak_flops
 
+# MFU uses the BF16 Cube peak rather than the larger total-throughput figure.
 _ASCEND_BF16_PEAK_FLOPS = {
     "Ascend910_9392": 353.8944e12,
     "Ascend910B1": 373.88e12,
