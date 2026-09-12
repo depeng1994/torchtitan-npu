@@ -101,6 +101,7 @@ def set_compressed_sparse_attention_sharding(wrapper_cfg) -> None:
             "idx_q": replicated_activation,
             "idx_k": replicated_activation,
             "idx_w": replicated_activation,
+            "sparse_indices": replicated_activation,
             "attn_sink": _attn_sink_placement,
         },
         in_dst_shardings={
@@ -110,6 +111,7 @@ def set_compressed_sparse_attention_sharding(wrapper_cfg) -> None:
             "idx_q": replicated_activation,
             "idx_k": replicated_activation,
             "idx_w": replicated_activation,
+            "sparse_indices": replicated_activation,
             "attn_sink": _attn_sink_placement,
         },
         # local_map requires the core output placement even though its input
@@ -173,10 +175,17 @@ def set_compressor_sharding(compressor_cfg):
         state_shardings={"cache": _dense_param_rep},
     )
     compressor_cfg.wkv.sharding_config = _replicate_weight
-    compressor_cfg.wgate.sharding_config = _replicate_weight
+    if compressor_cfg.wgate is not None:
+        compressor_cfg.wgate.sharding_config = _replicate_weight
     compressor_cfg.norm.sharding_config = _replicate_weight
     # ``ape`` is a plain parameter on the Compressor module itself.
-    compressor_cfg.sharding_config = ShardingConfig(state_shardings={"ape": _dense_param_rep})
+    compressor_cfg.sharding_config = ShardingConfig(
+        state_shardings=(
+            {"ape": _dense_param_rep}
+            if compressor_cfg.compress_ratio > 1 and getattr(compressor_cfg, "use_ape", True)
+            else {}
+        )
+    )
 
 
 def set_indexer_sharding(indexer_cfg):
@@ -200,7 +209,13 @@ def set_indexer_sharding(indexer_cfg):
     indexer_cfg.weights_proj.sharding_config = ShardingConfig(
         state_shardings={"weight": _dense_param_rep},
     )
-    set_compressor_sharding(indexer_cfg.compressor)
+    if indexer_cfg.compressor is not None:
+        set_compressor_sharding(indexer_cfg.compressor)
+    else:
+        if indexer_cfg.wk is not None:
+            indexer_cfg.wk.sharding_config = _replicate_weight
+        if indexer_cfg.k_norm is not None:
+            indexer_cfg.k_norm.sharding_config = _replicate_weight
 
 
 def set_deepseek_v4_layer_sharding(
@@ -233,6 +248,12 @@ def set_deepseek_v4_layer_sharding(
         enable_sp=enable_sp,
         expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
     )
+    if getattr(layer_cfg.moe.router, "vision_enabled", False):
+        layer_cfg.moe.router.sharding_config = ShardingConfig(
+            state_shardings={
+                "bias_vl": dense_param_placement(tp=spmd.R),
+            }
+        )
     input_ids_src_placement = dense_activation_placement(tp=spmd.R)
     input_ids_dst_placement = (
         dense_token_ids_sequence_parallel_placement() if enable_ep else dense_activation_placement(tp=spmd.R)
@@ -260,6 +281,12 @@ def set_deepseek_v4_sharding_config(
             "hc_scale": _dense_param_rep,
         },
     )
+    if config.image_marker_embeddings is not None:
+        config.image_marker_embeddings.sharding_config = ShardingConfig(
+            state_shardings=dict.fromkeys(
+                ("image_start", "image_newline", "image_end"), _dense_param_rep
+            )
+        )
 
     for layer_cfg in config.layers:
         set_deepseek_v4_layer_sharding(layer_cfg, enable_sp=enable_sp, enable_ep=enable_ep)

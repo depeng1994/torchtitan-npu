@@ -14,20 +14,20 @@ transformers, and the fused AscendC kernels are checked within tolerance of it.
 """
 
 import itertools
-import os
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
+from torchtitan_npu.models.deepseek_v4.golden import golden_enabled
 from torchtitan_npu.models.deepseek_v4.metadata import CompressedVarlenMetadata
 from torchtitan_npu.models.deepseek_v4.reference import (
     ReferenceCompressedVarlenMetadata,
 )
 
 # Bound the ``[B, M, topk, D]`` gather used by sparse attention.
-_ATTN_CHUNK = int(os.environ.get("TTNPU_DSA_ATTN_CHUNK", "256"))
+_ATTN_CHUNK = 32  # the frozen Stage-01 chunk; the value does not change the exact result
 
 
 def _window_topk_idxs(
@@ -90,6 +90,10 @@ def _sparse_attn(
     *,
     return_lse: bool,
 ):
+    if golden_enabled():
+        return _sparse_attn_golden(
+            q_BMHD, kv_BND, attn_sink_H, topk_idxs_BMK, softmax_scale,
+        )
     m = q_BMHD.size(1)
     chunk = _ATTN_CHUNK if _ATTN_CHUNK > 0 else m
     outs, lses = [], []
@@ -114,6 +118,46 @@ def _sparse_attn(
     return out_BMHD
 
 
+def _sparse_attn_golden(q_BMHD, kv_BND, attn_sink_H, topk_idxs_BMK, softmax_scale):
+    """Bound broadcast products along queries without changing reduction axes."""
+    m = q_BMHD.size(1)
+    chunk = _ATTN_CHUNK if _ATTN_CHUNK > 0 else m
+    return torch.cat([
+        _sparse_attn_golden_chunk(
+            q_BMHD[:, start : start + chunk], kv_BND, attn_sink_H,
+            topk_idxs_BMK[:, start : start + chunk], softmax_scale,
+        )
+        for start in range(0, m, chunk)
+    ], dim=1)
+
+
+def _sparse_attn_golden_chunk(
+    q_BMHD: torch.Tensor,
+    kv_BND: torch.Tensor,
+    attn_sink_H: torch.Tensor,
+    topk_idxs_BMK: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Exact pure-Torch operation order used by the ds-code golden stub."""
+    batch, seqlen, heads, head_dim = q_BMHD.shape
+    safe = topk_idxs_BMK.clamp_min(0).long()
+    gathered = kv_BND[:, None].expand(batch, seqlen, kv_BND.size(1), head_dim)
+    gathered = gathered.gather(
+        2, safe.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+    )
+    score = (
+        q_BMHD.unsqueeze(2) * gathered.unsqueeze(3)
+    ).sum(dim=-1) * softmax_scale
+    score = score.permute(0, 1, 3, 2)
+    score = score.masked_fill(topk_idxs_BMK.unsqueeze(2) < 0, -torch.inf)
+    sink = attn_sink_H.view(1, 1, heads, 1).expand(batch, seqlen, heads, 1)
+    score = torch.cat([score, sink], dim=-1)
+    prob = score.softmax(dim=-1)
+    return (
+        prob[..., :-1].unsqueeze(-1) * gathered.unsqueeze(2)
+    ).sum(dim=3).to(q_BMHD.dtype)
+
+
 def _sequence_ranges(cu_seqlens: torch.Tensor) -> list[tuple[int, int]]:
     """Materialize host-side sequence ranges for the eager document loops.
 
@@ -136,23 +180,29 @@ def _packed_block_docs(plan, total_blocks: int, device) -> torch.Tensor:
     )
 
 
-def _container_to_local_indices(
-    sparse_indices: torch.Tensor,
-    metadata: ReferenceCompressedVarlenMetadata,
+def _localize_precomputed_indices(
+    topk_indices: torch.Tensor,
+    metadata: CompressedVarlenMetadata,
+    ratio: int,
 ) -> torch.Tensor:
-    if sparse_indices.ndim == 4 and sparse_indices.shape[2] == 1:
-        sparse_indices = sparse_indices.squeeze(2)
-    if sparse_indices.ndim != 3:
-        raise ValueError("golden LI expects sparse_indices with shape [B, L, K] or [B, L, 1, K].")
-    # Align global container slots from LI with packed local KV indices.
-    block_local = metadata.reference.ratios[4].block_local
-    if block_local is None:
-        raise ValueError("golden LI requires reference block-local indices.")
-    safe = sparse_indices.clamp_min(0).long()
-    block_local = block_local.unsqueeze(1).expand(-1, sparse_indices.shape[1], -1)
-    local = torch.gather(block_local, dim=2, index=safe)
-    valid = (sparse_indices >= 0) & (local >= 0)
-    return torch.where(valid, local, torch.full_like(local, -1)).flatten(0, 1)
+    """Convert container-grid indices into the current document's local grid."""
+    cu_q = metadata.varlen.cu_seq_q.to(device=topk_indices.device, dtype=torch.long)
+    lengths = torch.diff(cu_q)
+    query_docs = torch.repeat_interleave(
+        torch.arange(lengths.numel(), device=topk_indices.device), lengths
+    )
+    if ratio > 1:
+        plan = metadata.plans.get(ratio)
+        if plan is None or plan.cu_seqlens_cmp_k is None:
+            raise ValueError(f"missing compressed plan for ratio={ratio}")
+        starts = plan.cu_seqlens_cmp_k.to(device=topk_indices.device, dtype=torch.long)
+    else:
+        starts = cu_q
+    doc_start = starts[query_docs]
+    doc_end = starts[query_docs + 1]
+    indices = topk_indices.reshape(-1, topk_indices.shape[-1]).to(torch.long)
+    valid = (indices >= doc_start.unsqueeze(-1)) & (indices < doc_end.unsqueeze(-1))
+    return torch.where(valid, indices - doc_start.unsqueeze(-1), -1).view_as(topk_indices)
 
 
 class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
@@ -253,9 +303,9 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         idx_q=None,
         idx_k=None,
         idx_w=None,
+        sparse_indices=None,
         attn_sink=None,
         *,
-        sparse_indices=None,
         attention_masks: ReferenceCompressedVarlenMetadata | None = None,
     ):
         if not isinstance(attention_masks, CompressedVarlenMetadata):
@@ -267,24 +317,40 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         metadata = attention_masks
         query = q.flatten(0, 1)
         original_kv = swa_k.flatten(0, 1)
+        shared_full = self.compress_ratio == 1 and cmp_k is not None
+        precomputed_topk = getattr(self, "_v41_topk_indices", None)
+        if precomputed_topk is not None:
+            precomputed_topk = _localize_precomputed_indices(
+                precomputed_topk,
+                metadata,
+                self.compress_ratio,
+            )
         plan = metadata.plans.get(self.compress_ratio)
-        compressed_kv = (
-            query.new_empty((0, query.shape[-1]))
-            if cmp_k is None or plan is None
-            else cmp_k.flatten(0, 1)[: plan.cu_seqlens_cmp_k[-1]]
-        )
+        if cmp_k is None or (not shared_full and plan is None):
+            compressed_kv = query.new_empty((0, query.shape[-1]))
+        elif shared_full:
+            compressed_kv = cmp_k.flatten(0, 1)
+        else:
+            compressed_kv = cmp_k.flatten(0, 1)[: plan.cu_seqlens_cmp_k[-1]]
 
-        if self.compress_ratio == 4:
-            if sparse_indices is None:
-                raise ValueError("ratio-4 golden reference requires sparse_indices.")
-            compressed_indices = _container_to_local_indices(sparse_indices, metadata)
+        index_score = None
+        if precomputed_topk is not None:
+            compressed_indices = precomputed_topk.reshape(
+                -1, precomputed_topk.shape[-1]
+            )
+        elif self.compress_ratio == 4:
+            compressed_indices, _ = self._select_topk(idx_q, idx_k, idx_w, metadata)
         elif self.compress_ratio > 1:
             compressed_indices = self._packed_compressed_indices(metadata, query.device)
         else:
             compressed_indices = None
 
         outputs = []
-        compressed = None if self.compress_ratio <= 1 else metadata.plans.get(self.compress_ratio)
+        compressed = (
+            None
+            if self.compress_ratio <= 1
+            else metadata.plans.get(self.compress_ratio)
+        )
         block_ranges = (
             None
             if compressed is None
@@ -297,7 +363,29 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             document_query = query[q_start:q_end].unsqueeze(0)
             document_kv = original_kv[q_start:q_end]
             indices = _window_topk_idxs(self.window_size, 1, length, query.device)
-            if compressed is not None:
+            if shared_full and precomputed_topk is None:
+                document_compressed = compressed_kv[q_start:q_end]
+                local = torch.arange(length, device=query.device)
+                document_indices = local.unsqueeze(0).expand(length, -1)
+                causal = document_indices <= local.unsqueeze(1)
+                document_indices = torch.where(
+                    causal,
+                    document_indices,
+                    torch.full_like(document_indices, -1),
+                ).unsqueeze(0)
+                indices = torch.cat([indices, document_indices], dim=-1)
+                document_kv = torch.cat([document_kv, document_compressed], dim=0)
+            elif shared_full:
+                document_compressed = compressed_kv[q_start:q_end]
+                document_indices = precomputed_topk.reshape(-1, precomputed_topk.shape[-1])[q_start:q_end]
+                document_indices = torch.where(
+                    document_indices < 0,
+                    document_indices,
+                    document_indices + length,
+                ).unsqueeze(0)
+                indices = torch.cat([indices, document_indices], dim=-1)
+                document_kv = torch.cat([document_kv, document_compressed], dim=0)
+            elif compressed is not None:
                 c_start, c_end = block_ranges[  # pyrefly: ignore [unsupported-operation]
                     document_id
                 ]
@@ -312,6 +400,8 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
                 ).unsqueeze(0)
                 indices = torch.cat([indices, document_indices], dim=-1)
                 document_kv = torch.cat([document_kv, document_compressed], dim=0)
+            if golden_enabled():
+                indices = indices.to(torch.int32)
             result = _sparse_attn(
                 document_query,
                 document_kv.unsqueeze(0),

@@ -162,8 +162,8 @@ def derive_reference_layout(
 
     ratios: dict[int, ReferenceRatioLayout] = {}
     for ratio, plan in plans.items():
-        if ratio == 1:
-            ratios[1] = ReferenceRatioLayout(
+        if ratio <= 1:
+            ratios[ratio] = ReferenceRatioLayout(
                 static_blocks=_build_static_blocks(seq_len, 0, 1, window_size, block_size, device),
             )
             continue
@@ -265,5 +265,6 @@ class ReferenceMetadataExtension(MetadataExtension):
             plans=metadata.plans,
             window=metadata.window,
             seq_len_host=metadata.seq_len_host,
+            index_dense_masks=metadata.index_dense_masks,
             reference=reference,
         )

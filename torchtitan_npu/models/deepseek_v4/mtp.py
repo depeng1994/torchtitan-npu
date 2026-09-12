@@ -215,6 +215,17 @@ class _MTPAttentionContext(NamedTuple):
     positions: torch.Tensor | None
 
 
+def _make_identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
+    """Return the one-hot stream mix used at the input of the main stack."""
+    pre_mix = torch.zeros(
+        (*x.shape[:2], hc_mult),
+        device=x.device,
+        dtype=torch.float32,
+    )
+    pre_mix[..., 0] = 1.0
+    return pre_mix
+
+
 class _MTPForwardState(NamedTuple):
     tok_embeddings: Any
     hc_hidden: torch.Tensor
@@ -345,9 +356,10 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         positions: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
         mtp_batch: MTPBatch | None = None,
+        input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         attention_context = _MTPAttentionContext(attention_masks, positions)
-        state = self._forward_main(tokens, attention_context)
+        state = self._forward_main(tokens, attention_context, input_embeds=input_embeds)
 
         if self.mtp_layers is None:
             if self._skip_lm_head or self.lm_head is None:
@@ -372,21 +384,50 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         self,
         tokens: torch.Tensor,
         attention_context: _MTPAttentionContext,
+        input_embeds: torch.Tensor | None = None,
     ) -> _MTPForwardState:
         tok_embeddings = self.tok_embeddings
         input_ids = tokens.detach().long()
-        hidden = tok_embeddings(tokens) if tok_embeddings is not None else tokens
+        hidden = (
+            input_embeds
+            if input_embeds is not None
+            else (tok_embeddings(tokens) if tok_embeddings is not None else tokens)
+        )
         hidden = hidden.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
 
+        pre_mix = None
+        last_layer = None
         for layer in self.layers.values():
-            hidden = layer(
-                hidden,
-                input_ids,
-                attention_context.attention_masks,
-                attention_context.positions,
-            )
+            forward_with_pre_mix = getattr(layer, "forward_with_pre_mix", None)
+            if forward_with_pre_mix is None:
+                hidden = layer(
+                    hidden,
+                    input_ids,
+                    attention_context.attention_masks,
+                    attention_context.positions,
+                )
+                pre_mix = None
+            else:
+                if pre_mix is None:
+                    pre_mix = _make_identity_pre_mix(hidden, self.hc_mult)
+                hidden, pre_mix = layer(
+                    hidden,
+                    input_ids,
+                    attention_context.attention_masks,
+                    attention_context.positions,
+                    pre_mix=pre_mix,
+                )
+                last_layer = layer
 
-        main_hidden = self.hc_head(hidden)
+        if pre_mix is not None and last_layer is not None:
+            collapse = getattr(last_layer, "collapse_pre_mix", None)
+            if collapse is None:
+                raise TypeError(
+                    "a DeepSeek-V4 block with forward_with_pre_mix must expose collapse_pre_mix"
+                )
+            main_hidden = collapse(hidden, pre_mix)
+        else:
+            main_hidden = self.hc_head(hidden)
         main_hidden = self.norm(main_hidden) if self.norm is not None else main_hidden
         return _MTPForwardState(tok_embeddings, hidden, main_hidden)
 

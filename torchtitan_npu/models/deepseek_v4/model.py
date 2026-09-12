@@ -20,14 +20,20 @@ from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 
-from torchtitan_npu.models.common.metadata_extension import (
-    LightningIndexerMetadata,
-    MetadataExtension,
-)
+from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 
-from .metadata import CompressedVarlenMetadata, build_compressed_varlen_metadata
+from .metadata import (
+    CompressedVarlenMetadata,
+    build_compressed_varlen_metadata,
+    ensure_index_dense_masks,
+)
 from .mhc import HcPost, HcPre
-from .mtp import DeepSeekV4MTPDecoder, MTPBatch, prepare_mtp_batch
+from .mtp import (
+    DeepSeekV4MTPDecoder,
+    MTPBatch,
+    _make_identity_pre_mix,
+    prepare_mtp_batch,
+)
 from .token_dispatcher import build_cp_plan
 
 if TYPE_CHECKING:
@@ -44,12 +50,16 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         hc_attn_pre: HcPre.Config
         hc_ffn_pre: HcPre.Config
         hc_post: HcPost.Config
+        layer_id: int = -1
 
     def __init__(self, config: Config):
         super().__init__()
         cfg = config
 
         self.moe_enabled = True
+        self.layer_id = config.layer_id
+        self._v41_plan = None
+        self._v41_context = None
 
         self.attention = cfg.attention.build()
         self.attention_norm = cfg.attention_norm.build()
@@ -60,22 +70,64 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         self.hc_ffn_pre = cfg.hc_ffn_pre.build()
         self.hc_post = cfg.hc_post.build()
 
+    def forward_with_pre_mix(
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_masks: AttentionMasksType | None,
+        positions: torch.Tensor | None = None,
+        *,
+        pre_mix: torch.Tensor,
+    ):
+        residual = x
+        x, post, comb, attn_pre = self.hc_attn_pre.forward_with_pre_mix(x, pre_mix)
+        attention_kwargs = {}
+        if self._v41_plan is not None:
+            attention_kwargs = {
+                "v41_layer_id": self.layer_id,
+                "v41_plan": self._v41_plan,
+                "v41_context": self._v41_context,
+            }
+        x = self.attention(
+            self.attention_norm(x),
+            attention_masks,
+            positions,
+            **attention_kwargs,
+        )
+        x = self.hc_post(x, residual, post, comb)
+        residual = x
+        x, post, comb, ffn_pre = self.hc_ffn_pre.forward_with_pre_mix(x, attn_pre)
+        x = self.moe(self.ffn_norm(x), input_ids=input_ids, image_mask=getattr(self, "_v41_image_mask", None))
+        x = self.hc_post(x, residual, post, comb)
+        return x, ffn_pre
+
+    def collapse_pre_mix(self, x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+        """Collapse the final mHC streams before the decoder norm and head."""
+        return self.hc_attn_pre.collapse(x, pre_mix)
+
     def forward(
         self,
         x: torch.Tensor,
         input_ids: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        *,
+        pre_mix: torch.Tensor | None = None,
     ):
-        residual = x
-        x, post, comb = self.hc_attn_pre(x)
-        x = self.attention(self.attention_norm(x), attention_masks, positions)
-        x = self.hc_post(x, residual, post, comb)
-        residual = x
-        x, post, comb = self.hc_ffn_pre(x)
-        x = self.moe(self.ffn_norm(x), input_ids=input_ids)
-        x = self.hc_post(x, residual, post, comb)
-        return x
+        """Compatibility wrapper for callers that invoke a block directly."""
+        return_tuple = pre_mix is not None
+        if pre_mix is None:
+            pre_mix = _make_identity_pre_mix(x, self.hc_attn_pre.hc_mult)
+        hidden, next_pre_mix = self.forward_with_pre_mix(
+            x,
+            input_ids,
+            attention_masks,
+            positions,
+            pre_mix=pre_mix,
+        )
+        if return_tuple:
+            return hidden, next_pre_mix
+        return hidden
 
 
 class DeepSeekV4Model(DeepSeekV4MTPDecoder):
@@ -87,9 +139,11 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         window_size: int
         block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
         metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
-        lightning_indexer_metadata: LightningIndexerMetadata.Config = field(
-            default_factory=LightningIndexerMetadata.Config
-        )
+        kv_source_layers: tuple[int, ...] | None = None
+        index_source_layers: tuple[int, ...] | None = None
+        candidate_source_layer: int | None = None
+        candidate_topk_blocks: int = 2048
+        candidate_block_size: int = 8
 
         def update_from_config(self, *, config, **kwargs):
             if hasattr(config, "training"):
@@ -146,7 +200,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
             for layers in (self.layers, self.mtp_layers):
                 for layer in layers:
                     attention = layer.attention
-                    inner_attention = attention.compressed_sparse_attention.inner_attention
+                    inner_attention = attention.inner_attention
                     num_flops_per_token += (
                         6 * attention.n_heads * (2 * attention.head_dim) * min(seq_len, inner_attention.window_size)
                     )
@@ -186,9 +240,46 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         )
         self.window_size = cfg.window_size
         self.block_size = cfg.block_size
+        self.vocab_size = cfg.vocab_size
 
         self._metadata_extension = cfg.metadata_extension.build()
-        self._lightning_indexer_metadata = cfg.lightning_indexer_metadata.build()
+        self._v41_plan = None
+        self._v41_context = None
+        if cfg.kv_source_layers is not None:
+            from torchtitan_npu.models.deepseek_v4_1.attention import (
+                V41AttentionContext,
+                build_v41_compression_spec,
+            )
+
+            self._v41_plan = build_v41_compression_spec(
+                layer_ids=tuple(range(cfg.n_layers)),
+                ratios=self.compress_ratios[: cfg.n_layers],
+                kv_source_layers=cfg.kv_source_layers,
+                index_source_layers=cfg.index_source_layers or (),
+                candidate_source_layer=(
+                    20 if cfg.candidate_source_layer is None else cfg.candidate_source_layer
+                ),
+                candidate_topk_blocks=cfg.candidate_topk_blocks,
+                candidate_block_size=cfg.candidate_block_size,
+            )
+            self._v41_context = V41AttentionContext.empty()
+            for layer in self.layers.values():
+                layer._v41_plan = self._v41_plan
+                layer._v41_context = self._v41_context
+
+    def shard_extra_kwargs_for_cp(
+        self,
+        extra_kwargs: dict,
+        *,
+        cp_mesh: DeviceMesh,
+        global_seq_len: int,
+        load_balancer_type: str | None,
+    ) -> None:
+        """Shard batch metadata a subclass carries through the CP split.
+
+        The base decoder owns no such metadata, so this is a no-op; the V4.1
+        multimodality subclass shards its image spans and token-type tensors.
+        """
 
     def build_attention_masks(
         self,
@@ -210,6 +301,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         kernel metadata) runs last.
         """
         positions = extra_kwargs.get("positions")
+        global_seq_len = None
         mtp_batch = None
         if cp_mesh is not None and self.mtp_layers is not None:
             mtp_batch = prepare_mtp_batch(
@@ -226,6 +318,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                 f"{type(masks)}."
             )
         common = build_compressed_varlen_metadata(masks, self.compress_ratios)
+        global_seq_len = common.seq_len
         if cp_mesh is not None:
             inputs, labels, positions, common, mtp_batch = self._build_cp_metadata(
                 inputs,
@@ -237,10 +330,15 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                 mtp_batch,
             )
             extra_kwargs["positions"] = positions
+            self.shard_extra_kwargs_for_cp(
+                extra_kwargs,
+                cp_mesh=cp_mesh,
+                global_seq_len=global_seq_len,
+                load_balancer_type=load_balancer_type,
+            )
         if mtp_batch is not None:
             extra_kwargs["mtp_batch"] = mtp_batch
-        if self._lightning_indexer_metadata is not None:
-            common = self._lightning_indexer_metadata(common)
+        common = ensure_index_dense_masks(common)
         if self._metadata_extension is not None:
             common = self._metadata_extension(common)
         extra_kwargs["attention_masks"] = common

@@ -24,11 +24,10 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from torchtitan_npu.models.common.metadata_extension import LightningIndexerMetadata
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .attention import Attention, CompressedSparseAttention, CompressedSparseInnerAttention
-from .compressor import Compressor, Indexer, LightningIndexer
+from .compressor import Compressor, Indexer
 from .mhc import HcHead, HcPost, HcPre
 from .model import (
     DeepSeekV4Model,
@@ -105,12 +104,14 @@ def _make_compressor_config(
     norm_eps: float,
     coff: int,
     rope: RoPE.Config,
+    use_ape: bool = True,
 ) -> Compressor.Config:
     return Compressor.Config(
         rope=dataclasses.replace(rope),
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
+        use_ape=use_ape,
         param_init=_APE_INIT,
         wkv=Linear.Config(
             in_features=dim,
@@ -118,11 +119,15 @@ def _make_compressor_config(
             bias=False,
             param_init=_LINEAR_INIT,
         ),
-        wgate=Linear.Config(
-            in_features=dim,
-            out_features=coff * head_dim,
-            bias=False,
-            param_init=_LINEAR_INIT,
+        wgate=(
+            None
+            if compress_ratio == 1
+            else Linear.Config(
+                in_features=dim,
+                out_features=coff * head_dim,
+                bias=False,
+                param_init=_LINEAR_INIT,
+            )
         ),
         norm=RMSNorm.Config(
             normalized_shape=head_dim,
@@ -142,13 +147,16 @@ def _make_indexer_config(
     compress_ratio: int,
     norm_eps: float,
     rope: RoPE.Config,
+    coff: int = 2,
+    source_key: bool = False,
+    source_head_dim: int | None = None,
 ) -> Indexer.Config:
-    coff = 2  # overlap always True for indexer
-    return Indexer.Config(
+    config_kwargs = dict(
         rope=dataclasses.replace(rope),
         num_index_heads=num_index_heads,
         index_head_dim=index_head_dim,
         rope_head_dim=rope_head_dim,
+        compress_ratio=compress_ratio,
         wq_b=Linear.Config(
             in_features=q_lora_rank,
             out_features=num_index_heads * index_head_dim,
@@ -161,7 +169,25 @@ def _make_indexer_config(
             bias=False,
             param_init=_LINEAR_INIT,
         ),
-        compressor=_make_compressor_config(
+    )
+    if source_key:
+        if source_head_dim is None:
+            raise ValueError("source-key indexer requires source_head_dim")
+        config_kwargs.update(
+            wk=Linear.Config(
+                in_features=source_head_dim,
+                out_features=index_head_dim,
+                bias=False,
+                param_init=_LINEAR_INIT,
+            ),
+            k_norm=RMSNorm.Config(
+                normalized_shape=index_head_dim,
+                eps=norm_eps,
+                param_init=_NORM_INIT,
+            ),
+        )
+    elif source_head_dim is None:
+        config_kwargs["compressor"] = _make_compressor_config(
             dim=dim,
             head_dim=index_head_dim,
             rope_head_dim=rope_head_dim,
@@ -169,8 +195,8 @@ def _make_indexer_config(
             norm_eps=norm_eps,
             coff=coff,
             rope=rope,
-        ),
-    )
+        )
+    return Indexer.Config(**config_kwargs)
 
 
 def _make_v4_attn_config(
@@ -189,6 +215,9 @@ def _make_v4_attn_config(
     index_head_dim: int,
     index_topk: int,
     rope: RoPE.Config,
+    v41_mode: bool = False,
+    is_kv_source: bool = True,
+    is_index_source: bool = False,
 ) -> Attention.Config:
     hd = head_dim
     per_group_in = (n_heads * hd) // n_groups
@@ -196,10 +225,15 @@ def _make_v4_attn_config(
     softmax_scale = head_dim**-0.5
     compressor_cfg = None
     indexer_cfg = None
-    lightning_indexer_cfg = None
 
-    if compress_ratio == 4:
-        coff = 2  # 1 + overlap (overlap=True when compress_ratio==4)
+    owns_compressor = (
+        compress_ratio > 1 if not v41_mode else is_kv_source
+    )
+    owns_indexer = (
+        compress_ratio == 4 if not v41_mode else is_index_source
+    )
+    if owns_compressor:
+        coff = 2 if compress_ratio == 4 else 1
         compressor_cfg = _make_compressor_config(
             dim=dim,
             head_dim=hd,
@@ -208,7 +242,9 @@ def _make_v4_attn_config(
             norm_eps=norm_eps,
             coff=coff,
             rope=rope,
+            use_ape=not v41_mode,
         )
+    if owns_indexer:
         indexer_cfg = _make_indexer_config(
             dim=dim,
             num_index_heads=index_n_heads,
@@ -218,18 +254,9 @@ def _make_v4_attn_config(
             compress_ratio=compress_ratio,
             norm_eps=norm_eps,
             rope=rope,
-        )
-        lightning_indexer_cfg = LightningIndexer.Config(index_topk=index_topk)
-    elif compress_ratio > 1:
-        coff = 1  # no overlap
-        compressor_cfg = _make_compressor_config(
-            dim=dim,
-            head_dim=hd,
-            rope_head_dim=rope_head_dim,
-            compress_ratio=compress_ratio,
-            norm_eps=norm_eps,
-            coff=coff,
-            rope=rope,
+            coff=1 if v41_mode else 2,
+            source_key=v41_mode and is_kv_source,
+            source_head_dim=hd if v41_mode else None,
         )
     inner_attention_cfg = CompressedSparseInnerAttention.Config(
         window_size=window_size,
@@ -238,7 +265,7 @@ def _make_v4_attn_config(
         index_topk=index_topk,
     )
     compressed_sparse_attention_cfg = CompressedSparseAttention.Config(
-        lightning_indexer=lightning_indexer_cfg,
+        lightning_indexer=None,
         inner_attention=inner_attention_cfg,
     )
 
@@ -398,12 +425,21 @@ def _build_v4_layers(
     hc_mult: int = 4,
     sinkhorn_iters: int = 20,
     hc_eps: float = 1e-6,
+    kv_source_layers: tuple[int, ...] | None = None,
+    index_source_layers: tuple[int, ...] | None = None,
 ) -> list[DeepSeekV4TransformerBlock.Config]:
     if len(compress_ratios) != n_layers:
         raise ValueError(f"compress_ratios ({len(compress_ratios)} entries) must cover n_layers ({n_layers}).")
     layers = []
     for layer_id in range(n_layers):
         cr = compress_ratios[layer_id]
+        v41_mode = kv_source_layers is not None
+        is_kv_source = not v41_mode or layer_id in kv_source_layers
+        is_index_source = (
+            cr == 4
+            if not v41_mode
+            else index_source_layers is not None and layer_id in index_source_layers
+        )
 
         attn_cfg = _make_v4_attn_config(
             dim=dim,
@@ -419,7 +455,10 @@ def _build_v4_layers(
             index_n_heads=index_n_heads,
             index_head_dim=index_head_dim,
             index_topk=index_topk,
-            rope=rope_compress if cr > 1 else rope,
+            rope=rope_compress if cr > 1 or (v41_mode and cr == 1) else rope,
+            v41_mode=v41_mode,
+            is_kv_source=is_kv_source,
+            is_index_source=is_index_source,
         )
 
         moe_cfg = _make_v4_moe_config(
@@ -440,6 +479,7 @@ def _build_v4_layers(
 
         layers.append(
             DeepSeekV4TransformerBlock.Config(
+                layer_id=layer_id,
                 attention=attn_cfg,
                 attention_norm=RMSNorm.Config(
                     normalized_shape=dim,
@@ -494,10 +534,11 @@ def _build_mtp_layers(
         attention.compress_ratio = 1
         attention.compressor = None
         attention.indexer = None
-        # MTP attention is dense; disable the prebuilt LI wrapper branch too.
-        attention.compressed_sparse_attention.lightning_indexer = None
         attention.rope = copy.deepcopy(rope)
-        inner_attention = attention.compressed_sparse_attention.inner_attention
+        inner_attention = cast(
+            "CompressedSparseInnerAttention.Config",
+            attention.inner_attention,
+        )
         inner_attention.compress_ratio = 1
 
         moe = copy.deepcopy(inner_cfg.moe)
@@ -583,6 +624,11 @@ def _make_v4_config(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     num_mtp_layers: int = 0,
+    kv_source_layers: tuple[int, ...] | None = None,
+    index_source_layers: tuple[int, ...] | None = None,
+    candidate_source_layer: int | None = None,
+    candidate_topk_blocks: int = 2048,
+    candidate_block_size: int = 8,
 ) -> DeepSeekV4Model.Config:
     """Build a DSV4 model config from the flavor constants."""
 
@@ -634,6 +680,8 @@ def _make_v4_config(
         hc_mult=hc_mult,
         sinkhorn_iters=sinkhorn_iters,
         hc_eps=hc_eps,
+        kv_source_layers=kv_source_layers,
+        index_source_layers=index_source_layers,
     )
 
     mtp_layers = []
@@ -671,12 +719,6 @@ def _make_v4_config(
             index_head_dim=index_head_dim,
             index_topk=index_topk,
         ),
-        lightning_indexer_metadata=LightningIndexerMetadata.Config(
-            window_size=window_size,
-            index_n_heads=index_n_heads,
-            index_head_dim=index_head_dim,
-            index_topk=index_topk,
-        ),
         hc_mult=hc_mult,
         compress_ratios=compress_ratios,
         n_layers=n_layers,
@@ -688,6 +730,11 @@ def _make_v4_config(
             param_init=_HC_PARAM_INIT,
         ),
         mtp_layers=mtp_layers,
+        kv_source_layers=kv_source_layers,
+        index_source_layers=index_source_layers,
+        candidate_source_layer=candidate_source_layer,
+        candidate_topk_blocks=candidate_topk_blocks,
+        candidate_block_size=candidate_block_size,
     )
 
 
@@ -740,10 +787,12 @@ def _deepseek_v4_flash(
     *,
     num_experts: int = 256,
     num_mtp_layers: int = 0,
+    n_layers: int = 43,
+    compress_ratios: tuple[int, ...] | None = None,
 ) -> DeepSeekV4Model.Config:
     return _make_v4_config(
         dim=4096,
-        n_layers=43,
+        n_layers=n_layers,
         vocab_size=129280,
         n_heads=64,
         head_dim=512,
@@ -751,7 +800,7 @@ def _deepseek_v4_flash(
         q_lora_rank=1024,
         o_lora_rank=1024,
         n_groups=8,
-        compress_ratios=(1, 1) + (4, 128) * 20 + (4,),
+        compress_ratios=compress_ratios or ((1, 1) + (4, 128) * 20 + (4,)),
         window_size=128,
         norm_eps=1e-6,
         index_n_heads=64,

@@ -39,7 +39,7 @@ compressed region is the concatenation of its documents' complete blocks,
 padded to ``S // ratio`` slots.
 """
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 import torch
@@ -57,7 +57,9 @@ __all__ = [
     "CompressedKernelContract",
     "CompressedVarlenMetadata",
     "build_compressed_varlen_metadata",
+    "build_index_dense_mask",
     "build_kernel_layout",
+    "ensure_index_dense_masks",
 ]
 
 
@@ -185,6 +187,9 @@ class CompressedVarlenMetadata:
     ``build_compressed_varlen_metadata`` boundary so the ``seq_len`` property
     avoids a per-layer ``.item()`` D2H sync inside the compiled region."""
 
+    index_dense_masks: dict[int, torch.Tensor] = field(default_factory=dict)
+    """Backend-independent causal masks used by V4.1 index/candidate stages."""
+
     @property
     def batch_size(self) -> int:
         """Container batch size (``1`` for the current packed scenario)."""
@@ -253,15 +258,15 @@ def build_kernel_layout(
     device = cu_seq_q.device
     plans: dict[int, CompressedBlockLayout] = {}
     for ratio in distinct_ratios:
-        if ratio == 1:
-            plans[1] = CompressedBlockLayout(
+        if ratio <= 1:
+            plans[ratio] = CompressedBlockLayout(
                 cu_seqlens_cmp_k=None,
                 block_remainder=None,
                 gather_indices=None,
             )
             continue
-        if ratio not in (4, 128):
-            raise NotImplementedError(f"CompressedBlockLayout does not support ratio={ratio}; expected 1, 4, or 128.")
+        if ratio <= 1:
+            raise ValueError(f"invalid compressed ratio={ratio}")
         c_lens = [length // ratio for length in lengths]
         cu_seqs = torch.cat(
             [
@@ -321,11 +326,79 @@ def build_compressed_varlen_metadata(
     # Cache the total token count on the host so the ``seq_len`` property
     # avoids a per-layer ``.item()`` D2H sync inside the compiled region.
     # Built once here (eager boundary) from ``cu_seq_q[-1]``.
-    return CompressedVarlenMetadata(
+    metadata = CompressedVarlenMetadata(
         varlen=varlen,
         plans=plans,
         seq_len_host=int(varlen.cu_seq_q[-1].item()),
     )
+    return ensure_index_dense_masks(metadata)
+
+
+def build_index_dense_mask(
+    metadata: CompressedVarlenMetadata,
+    ratio: int,
+) -> torch.Tensor:
+    """Build the causal index-selection mask for any metadata backend.
+
+    The reference attention tier already materializes this mask, but the
+    AscendC slim tier intentionally does not.  Deriving the same compact
+    document/block coordinates from the common varlen and compression plan
+    keeps the V4.1 candidate/index stage backend-independent.  The returned
+    shape is ``[1, 1, query_len, container_len]`` and includes document and
+    causal reachability only; candidate filtering remains the indexer's job.
+    """
+    cached = metadata.index_dense_masks.get(ratio)
+    if cached is not None:
+        return cached
+    if ratio < 0:
+        raise ValueError(f"compression ratio must be non-negative, got {ratio}")
+    ratio = max(ratio, 1)
+    cu_q = metadata.varlen.cu_seq_q
+    seq_len = metadata.seq_len
+    device = cu_q.device
+    lengths = torch.diff(cu_q).to(torch.long)
+    doc_ids = torch.repeat_interleave(
+        torch.arange(lengths.numel(), device=device, dtype=torch.long), lengths
+    )
+    token_starts = cu_q[:-1].to(torch.long)
+    positions = torch.arange(seq_len, device=device, dtype=torch.long) - token_starts[
+        doc_ids
+    ]
+
+    if ratio == 1:
+        return (
+            (doc_ids[:, None] == doc_ids[None, :])
+            & (positions[:, None] >= positions[None, :])
+        ).unsqueeze(0).unsqueeze(1)
+
+    plan = metadata.plans.get(ratio)
+    if plan is None or plan.cu_seqlens_cmp_k is None:
+        raise ValueError(f"metadata has no compressed plan for ratio={ratio}")
+    cu_cmp = plan.cu_seqlens_cmp_k.to(torch.long)
+    container_len = plan.out_width
+    if container_len is None:
+        container_len = seq_len // ratio
+    block_ids = torch.arange(container_len, device=device, dtype=torch.long)
+    block_doc = torch.searchsorted(cu_cmp[1:], block_ids, right=True)
+    block_local = block_ids - cu_cmp[block_doc]
+    valid = block_ids < cu_cmp[-1]
+    block_doc = block_doc.masked_fill(~valid, -1)
+    block_local = block_local.masked_fill(~valid, -1)
+    causal_limit = (positions + 1) // ratio
+    return (
+        (doc_ids[:, None] == block_doc[None, :])
+        & (block_local[None, :] < causal_limit[:, None])
+    ).unsqueeze(0).unsqueeze(1)
+
+
+def ensure_index_dense_masks(metadata: CompressedVarlenMetadata) -> CompressedVarlenMetadata:
+    """Materialize index masks once at the eager metadata boundary."""
+    if not metadata.index_dense_masks:
+        metadata.index_dense_masks = {
+            ratio: build_index_dense_mask(metadata, ratio)
+            for ratio in metadata.plans
+        }
+    return metadata
 
 
 def register_pytree_node_for_dataclass(cls: type) -> None:

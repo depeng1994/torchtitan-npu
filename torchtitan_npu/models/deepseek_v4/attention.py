@@ -17,10 +17,11 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
+from torchtitan_npu.models.deepseek_v4.golden import golden_enabled
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor, Indexer, LightningIndexer
-from .metadata import CompressedVarlenMetadata
+from .metadata import CompressedVarlenMetadata, build_index_dense_mask
 from .reference import ReferenceCompressedVarlenMetadata
 from .token_dispatcher import CPTokenDispatcher
 
@@ -94,7 +95,7 @@ class CompressedSparseInnerAttention(FlexAttention):
         n_kv_blocks = (kv_len + bk - 1) // bk
         n_q_blocks = seqlen // bq
         sink_idx = seqlen + n_cmp
-        ratio = self.compress_ratio
+        ratio = getattr(self, "_v41_compress_ratio", self.compress_ratio)
         window_size = self.window_size
         if metadata.plans.get(ratio) is None:
             raise ValueError(f"No compression layout for ratio={ratio}.")
@@ -178,9 +179,9 @@ class CompressedSparseInnerAttention(FlexAttention):
         idx_q=None,
         idx_k=None,
         idx_w=None,
-        *,
-        attn_sink: torch.Tensor | None = None,
         sparse_indices=None,
+        attn_sink: torch.Tensor | None = None,
+        *,
         attention_masks: ReferenceCompressedVarlenMetadata | None = None,
     ) -> torch.Tensor:
         if not isinstance(attention_masks, CompressedVarlenMetadata):
@@ -196,17 +197,25 @@ class CompressedSparseInnerAttention(FlexAttention):
         n_cmp = 0 if cmp_k is None else cmp_k.size(1)
         sink_idx = seqlen + n_cmp
 
-        topk_indices = None
-        if self.compress_ratio == 4:
-            if sparse_indices is None:
-                raise ValueError("CompressedSparseInnerAttention requires sparse_indices when compress_ratio=4")
-            if sparse_indices.ndim == 4 and sparse_indices.shape[2] == 1:
-                sparse_indices = sparse_indices.squeeze(2)
-            if sparse_indices.ndim != 3:
+        topk_indices = getattr(self, "_v41_topk_indices", None)
+        if topk_indices is None and self.compress_ratio == 4:
+            if idx_q is None or idx_k is None or idx_w is None:
                 raise ValueError(
-                    "CompressedSparseInnerAttention expects sparse_indices with shape [B, L, K] or [B, L, 1, K]."
+                    "CompressedSparseInnerAttention requires idx_q, idx_k, and idx_w when compress_ratio=4"
                 )
-            topk_indices = sparse_indices
+            if metadata.plans.get(4) is None:
+                raise ValueError(
+                    "CompressedSparseInnerAttention requires the ratio-4 compression layout for indexer selection."
+                )
+            topk_indices, _ = Indexer.select(
+                idx_q,
+                idx_k,
+                idx_w,
+                metadata.reference.ratios[  # pyrefly: ignore [bad-argument-type]
+                    4
+                ].dense_mask,
+                self.index_topk,
+            )
 
         kv = swa_k.unsqueeze(2)
         if cmp_k is not None:
@@ -325,7 +334,13 @@ class Attention(BaseAttention):
 
         self.compressor = cfg.compressor.build() if cfg.compressor is not None else None
         self.indexer = cfg.indexer.build() if cfg.indexer is not None else None
+
         self.compressed_sparse_attention = cfg.compressed_sparse_attention.build()
+
+    @property
+    def inner_attention(self):
+        """Read-only compatibility access to the wrapped attention module."""
+        return self.compressed_sparse_attention.inner_attention
 
     def parallelize(self, parallel_dims) -> None:
         """Parallelize the attention, then wire the CP mesh on the
@@ -336,7 +351,32 @@ class Attention(BaseAttention):
         super().parallelize(parallel_dims)
         self.token_dispatcher.wire_meshes(cp_mesh=parallel_dims.get_optional_mesh("cp"))
 
-    def forward(self, x, attention_masks, positions):
+    def _golden_rope(self, x: torch.Tensor, positions: torch.Tensor, *, inverse: bool = False):
+        """Apply the reference complex-pair rotation through the float cache."""
+        cache = self.rope._reshape_cache(x, positions)
+        if isinstance(cache, tuple):
+            # The workaround RoPE hands back an interleaved cos/sin pair.
+            cos, sin = cache
+            freqs = torch.complex(cos[..., ::2], sin[..., ::2])
+        else:
+            # The base RoPE already carries the cache as complex exponentials.
+            freqs = cache
+        if inverse:
+            freqs = freqs.conj()
+        real, imag = x.float().reshape(*x.shape[:-1], -1, 2).unbind(-1)
+        c, s = freqs.real, freqs.imag
+        return torch.stack((real * c - imag * s, imag * c + real * s), dim=-1).flatten(-2).type_as(x)
+
+    def forward(
+        self,
+        x,
+        attention_masks,
+        positions,
+        *,
+        v41_layer_id: int | None = None,
+        v41_plan=None,
+        v41_context=None,
+    ):
         """The unified attention forward (CP and non-CP).
 
         The Q side and the swa projection run on the local stream; the
@@ -345,8 +385,8 @@ class Attention(BaseAttention):
         ``swa_k`` rows (the window plan) into the packed ori stream, the
         compressors gather their own block rows internally, and ``select``
         packs the pooled streams into the padded containers.  The
-        containers' all-gather is declarative — the wrapper's
-        ``ShardingConfig`` (``cp: S(1) -> R``) emits it at the wrapper
+        containers' all-gather is declarative — the core's
+        ``ShardingConfig`` (``cp: S(1) -> R``) emits it at the core
         boundary.
         """
         window = attention_masks.window
@@ -356,9 +396,13 @@ class Attention(BaseAttention):
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr)
         q = q.view(bsz, seqlen, -1, self.head_dim)
-        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.norm_eps)
         q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
-        q_rope = self.rope(q_rope, positions=positions)
+        golden = golden_enabled()
+        q_rope = (
+            self._golden_rope(q_rope, positions)
+            if golden
+            else self.rope(q_rope, positions=positions)
+        )
         q = torch.cat([q_nope, q_rope], dim=-1)
 
         # The swa projection + RoPE run on the local rows (the sender's own
@@ -367,32 +411,178 @@ class Attention(BaseAttention):
         # rows into the packed ori stream.
         swa_k = self.kv_norm(self.wkv(x))
         kv_nope, kv_rope = torch.split(swa_k, [self.head_dim - rd, rd], dim=-1)
-        kv_rope = self.rope(
-            kv_rope.unsqueeze(2),
-            positions=positions.reshape(1, -1),
-        ).squeeze(2)
+        kv_input = kv_rope.unsqueeze(2)
+        kv_rope = (
+            self._golden_rope(kv_input, positions.reshape(1, -1)).squeeze(2)
+            if golden
+            else self.rope(kv_input, positions=positions.reshape(1, -1)).squeeze(2)
+        )
         swa_k = torch.cat([kv_nope, kv_rope], dim=-1)
         swa_k = self.token_dispatcher.gather(swa_k, window)
 
         cmp_k = None
+        compressor_latent = None
+        pooled = None
         idx_q = idx_k = idx_w = None
 
-        if self.compress_ratio > 1 and self.indexer is not None:
+        shared_kv = None
+        shared_topk = None
+        if v41_plan is not None and v41_context is not None and v41_layer_id is not None:
+            is_v41_source = v41_layer_id in v41_plan.kv_source_layers
+            if not is_v41_source:
+                shared_kv, _, shared_topk = v41_context.resolve(v41_plan, v41_layer_id)
+            if shared_kv is not None:
+                cmp_k = shared_kv[0]
+            if is_v41_source:
+                if self.compressor is None:
+                    raise ValueError("V4.1 KV source requires a compressor")
+                pooled, compressor_latent = self.compressor(
+                    x,
+                    attention_masks,
+                    positions=positions,
+                    return_pre_rope=True,
+                )
+                if self.compress_ratio == 1:
+                    cmp_k = pooled
+                else:
+                    plan = attention_masks.plans[self.compress_ratio]
+                    cmp_k = self.token_dispatcher.select(pooled, plan)
+
+        has_v41_indexer = (
+            v41_plan is not None
+            and v41_layer_id is not None
+            and v41_layer_id in v41_plan.index_source_layers
+        )
+        if self.indexer is not None and (self.compress_ratio > 1 or has_v41_indexer):
+            index_source = (
+                None
+                if v41_plan is None or v41_layer_id is None
+                else v41_plan.index_source_before(v41_layer_id)
+            )
+            if (
+                v41_plan is not None
+                and v41_layer_id is not None
+                and v41_layer_id in v41_plan.kv_source_layers
+            ):
+                index_source = None
+            shared_index_k = (
+                None
+                if v41_context is None or index_source is None
+                else v41_context.index_keys.get(index_source)
+            )
+            indexer_kwargs = {
+                "positions": positions,
+                "attention_masks": attention_masks,
+            }
+            if shared_index_k is not None:
+                indexer_kwargs["key_override"] = shared_index_k
+            if compressor_latent is not None:
+                indexer_kwargs["latent"] = compressor_latent
             idx_q, idx_k, idx_w = self.indexer(
                 x.detach(),
                 qr.detach(),
-                positions=positions,
-                attention_masks=attention_masks,
+                **indexer_kwargs,
             )
             # The indexer's outputs: idx_q / idx_w (local), idx_k (the
             # pooled stream — packed into the container).
-            idx_k = self.token_dispatcher.select(idx_k, attention_masks.plans[4])
+            index_ratio = self.compress_ratio
+            if index_source is not None and v41_plan is not None:
+                index_ratio = v41_plan.ratios[index_source]
+            index_plan = attention_masks.plans[index_ratio]
+            if index_plan.gather_indices is not None and shared_index_k is None:
+                idx_k = self.token_dispatcher.select(idx_k, index_plan)
+            if (
+                v41_plan is not None
+                and v41_context is not None
+                and v41_layer_id is not None
+                and v41_layer_id in v41_plan.index_source_layers
+            ):
+                reference = getattr(attention_masks, "reference", None)
+                dense_mask = getattr(attention_masks, "index_dense_masks", {}).get(index_ratio)
+                if dense_mask is None and reference is not None:
+                    ratio_layout = reference.ratios.get(index_ratio)
+                    dense_mask = None if ratio_layout is None else ratio_layout.dense_mask
+                if dense_mask is None:
+                    dense_mask = build_index_dense_mask(attention_masks, index_ratio)
+                if dense_mask is not None:
+                    candidate_mask = None
+                    if (
+                        v41_plan is not None
+                        and v41_context is not None
+                        and v41_layer_id is not None
+                        and v41_layer_id > v41_plan.candidate_source_layer
+                    ):
+                        candidate_mask = v41_context.candidates
+                    shared_topk, index_scores = Indexer.select(
+                        idx_q,
+                        idx_k,
+                        idx_w,
+                        dense_mask,
+                        getattr(self.compressed_sparse_attention.inner_attention, "index_topk", 512),
+                        candidate_mask=candidate_mask,
+                    )
+                    if (
+                        v41_plan is not None
+                        and v41_context is not None
+                        and v41_layer_id == v41_plan.candidate_source_layer
+                    ):
+                        from torchtitan_npu.models.deepseek_v4_1.attention import (
+                            select_candidate_blocks,
+                        )
 
-        if self.compress_ratio > 1:
+                        compress_lens = dense_mask.squeeze(1).sum(dim=-1)
+                        v41_context.put_candidates(
+                            select_candidate_blocks(
+                                index_scores,
+                                compress_lens,
+                                v41_plan.candidate_topk_blocks,
+                                v41_plan.candidate_block_size,
+                            )
+                        )
+                    v41_context.put_source(
+                        v41_layer_id,
+                        index_key=idx_k,
+                        topk_indices=shared_topk,
+                    )
+
+        needs_local_kv = self.compress_ratio > 1 or (
+            v41_plan is not None
+            and v41_context is not None
+            and v41_layer_id is not None
+            and v41_layer_id in v41_plan.kv_source_layers
+        )
+        if needs_local_kv and cmp_k is None:
             assert self.compressor is not None, "compress_ratio > 1 requires the compressor submodule."
-            plan = attention_masks.plans[self.compress_ratio]
-            pooled = self.compressor(x, attention_masks)
-            cmp_k = self.token_dispatcher.select(pooled, plan)
+            pooled = self.compressor(
+                x,
+                attention_masks,
+                positions=positions,
+            )
+            if self.compress_ratio == 1:
+                cmp_k = pooled
+            else:
+                plan = attention_masks.plans[self.compress_ratio]
+                cmp_k = self.token_dispatcher.select(pooled, plan)
+
+        if (
+            v41_plan is not None
+            and v41_context is not None
+            and v41_layer_id is not None
+            and v41_layer_id in v41_plan.kv_source_layers
+        ):
+            source_kv = cmp_k if cmp_k is not None else swa_k
+            v41_context.put_source(
+                v41_layer_id,
+                compressed_kv=(source_kv, source_kv),
+            )
+        if v41_plan is not None:
+            self.compressed_sparse_attention.inner_attention._v41_topk_indices = shared_topk
+            kv_source = v41_plan.kv_source_for(v41_layer_id)
+            self.compressed_sparse_attention.inner_attention._v41_compress_ratio = (
+                self.compress_ratio
+                if kv_source is None
+                else v41_plan.ratios[kv_source]
+            )
 
         # Inner-attention positional contract: absent components are None.
         #   sink + swa_k always; + cmp_k when compress_ratio > 1;
@@ -409,13 +599,21 @@ class Attention(BaseAttention):
         )
 
         o_nope, o_rope = torch.split(o, [self.head_dim - rd, rd], dim=-1)
-        o_rope = self.rope(o_rope, positions=positions, inverse=True)
+        o_rope = (
+            self._golden_rope(o_rope, positions, inverse=True)
+            if golden
+            else self.rope(o_rope, positions=positions, inverse=True)
+        )
         o = torch.cat([o_nope, o_rope], dim=-1)
 
         # ``wo_a`` is a BatchedLinear over the head groups; group the heads
         # before the per-group matmul.
         n_local_groups = self.n_groups // (self.n_heads // o.shape[2])
         o = o.view(bsz, seqlen, n_local_groups, -1)
-        o = self.wo_a(o)
+        if golden_enabled():
+            wo_a = self.wo_a.weight.view(n_local_groups, self.wo_a.out_features, -1)
+            o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        else:
+            o = self.wo_a(o)
         o = o.reshape(bsz, seqlen, -1)
         return self.wo_b(o)

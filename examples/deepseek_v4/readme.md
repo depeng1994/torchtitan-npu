@@ -56,6 +56,45 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
 --profiler.enable-profiling
 ```
 
+### 8P Flash 40 层 16 expert + ViT（V4.1 Golden）
+
+`debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh` 是 V4.1（V4 基座 + ViT 多模态）的单机 8 卡入口。
+配置与模型规模复用上面的 8P Flash debug 基线，只在 CLI 上覆盖四项：`--training.seq-len 512`、
+`--training.global-batch-size 8`、`--training.steps 40`、`--lr-scheduler.total-steps 40`，
+并默认关闭编译（`COMPILE_BACKEND=""`，编译会改变被追踪的图，而 Golden 口径要求逐位复现）。
+
+```sh
+bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh
+# 覆盖步数、切到 AscendC kernel、退回编译后端：
+bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh --training.steps 5
+USE_GOLDEN=0 bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh
+COMPILE_BACKEND=aot_eager bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh
+```
+
+该入口默认 `--checkpoint.no-enable`（不保存也不加载）；需要 checkpoint 时用 CLI 显式打开。
+
+#### V4.1 Golden 开关
+
+只有一个开关：**`USE_GOLDEN`**（默认 `1`）。
+
+| 值 | 走哪条路 | 什么时候用 |
+|---|---|---|
+| `USE_GOLDEN=1`（默认） | 参考算子：纯 Torch 的 RoPE / 稀疏注意力 / 逐专家 MoE，与推理基线逐位对齐 | 复现冻结 Stage-01 基线、对拍、比赛验收 |
+| `USE_GOLDEN=0` | AscendC 融合算子 | 训练吞吐优先，数值不再与推理基线逐位对齐 |
+
+```sh
+bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh                 # golden
+USE_GOLDEN=0 bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh    # AscendC
+```
+
+实现：`USE_GOLDEN=1` 时 launcher 只装入一个 override ——
+`torchtitan_npu.override.common.golden`，它一次性装好 RoPE workaround、纯 Torch 稀疏注意力与
+逐专家 MoE，并把开关钉住给之后导入的模块。模型侧统一通过
+`torchtitan_npu.models.deepseek_v4.golden.golden_enabled()` 读取，不再散落 `os.getenv`。
+
+模型的宽度、层数、专家数、视觉层数与图片路径现在都由 config（`DeepSeekV41CropConfig`）决定，
+不再通过环境变量注入；稀疏注意力的分块长度固定为冻结基线使用的 32。
+
 ### 32P Pro 32-expert Debug
 
 Pro 32-expert 是独立的裁剪模型 debug/performance 入口，不与 8P Flash launcher 强制复用：
