@@ -66,6 +66,7 @@ def set_compressed_sparse_attention_sharding(wrapper_cfg) -> None:
         "idx_q": replicated_activation,
         "idx_k": replicated_activation,
         "idx_w": replicated_activation,
+        "sparse_indices": replicated_activation,
     }
     output_shardings = dict(input_shardings)
     for name in ("cmp_k", "idx_k"):
