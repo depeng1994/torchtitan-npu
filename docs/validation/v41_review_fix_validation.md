@@ -1,76 +1,105 @@
-# DeepSeek V4.1 - GPT Review Fix Validation Checklist
+# DeepSeek V4.1 Review / Validation Record
 
-## 分支信息
-- 分支：`rfc/deepseek-v4-1-training`
-- 基于：`depeng1994/torchtitan-npu` 的 master （commit a23bda7）
-- Git PR 798 原始提交：`38595e0` (feat-dsv41-golden-baseline) + `43da3cb` (test: switch debug-model)
-- 修复提交：
-  - `3dfd4c4` - fix: P0 blockers + P1 items（mHC restore, Q RMS rescale, Indexer rotation, CP1 config）
-  - `e6df959` - fix: P1 items（checkpoint adapter, directory rename）
-  - `6b2f643` - fix: remaining blockers（Q RMS per-head fix, CP1 runtime guard, dependency direction）
-  - `39cb5cd` - fix: sharding getattr guard（V4 无 vision config 不报错）
-  - `c38e5a3` - fix: V41 Config update_from_config 显式 parent call（slots dataclass super 兼容）
-  - `3798b91` - fix: V41 block FSDP 兼容（layer() 经 __call__ 触发 shard/unshard hooks）
+## 当前状态
 
-## GPT Review 闭环清单
+分支：`rfc/deepseek-v4-1-training`
 
-| # | P级 | 问题 | 修复方法 | 状态 |
-|---|------|------|----------|------|
-| 1 | P0 | V4 mHC 被改成 Single-Pass | 恢复 DeepSeekV4TransformerBlock.forward() 经典语义；_forward_main() 恢复 hc_head；V41Model 独立实现 Single-Pass loop | ✅ 闭环 |
-| 2 | P0 | V4 Attention wq_b 后 RMS rescale 被删 | Attention.Config.post_q_rms_norm=True（V4）/ False（V4.1）；per-head RMS after view | ✅ 闭环 |
-| 3 | P1 | Indexer Hadamard 由 golden_enabled() 控制 | Indexer.Config.rotation="hadamard"（V4）/ "none"（V4.1） | ✅ 闭环 |
-| 4 | P1 | CP 配置允许 CP2 | CropConfig CP1-only + V41Model.Config.update_from_config runtime guard | ✅ 闭环 |
-| 5 | P1 | V4 base 依赖 V41（反向 import） | V41 plan/context 移到 V41Model.__init__，V4 只留 generic seam | ✅ 闭环 |
-| 6 | P1 | Checkpoint adapter 未组合 vision | DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter) 组合 vision mapping | ✅ 闭环 |
-| 7 | P1 | 目录 deepseek_v4_1 | 改名为 deepseek_v41（models/override/tests/examples） | ✅ 闭环 |
-| 8 | P1 | V41AttentionContext 显式化 | 已降级为 follow-up（需在启用 PP/CP2 前完成） | ➡️ Follow-up |
-| 9 | P1 | ratio=1 metadata 语义统一 | 已降级为 follow-up（需在 production CSA2 CP2+ 前完成） | ➡️ Follow-up |
-| 10 | P2 | 384 experts full-scale flavor | 后续补充 | ➡️ Follow-up |
+本文件同时保留已经完成的历史验证，以及最新 architecture/correctness refactor 之后必须重新执行的 validation gate。**历史 Golden 结果不自动外推到最新 HEAD。**
 
-## 验证清单
+## Review 闭环
 
-| 验证点 | 验证方法 | 输出件 | 结果 |
-|--------|----------|--------|------|
-| 语法检查 | `python -m py_compile` 全部修改文件 | 无错误 | ✅ 通过 |
-| V4 单元测试 | `pytest tests/unit_tests/models/deepseek_v4/`（244 tests） | 244 passed, 1 skipped（环境问题） | ✅ 通过 |
-| 目录改名完整性 | grep 确认无 deepseek_v4_1 引用残留 | 0 残留引用 | ✅ 通过 |
-| V4 → V41 反向依赖 | grep 确认 V4 侧无 deepseek_v41 import | 无 import | ✅ 通过 |
-| CP1 runtime guard | V41Model.Config.update_from_config 拒绝 CP != 1 | 已实现 | ✅ 通过 |
-| Checkpoint adapter 注册 | model_registry 使用 DeepSeekV41StateDictAdapter | 已注册 | ✅ 通过 |
-| Ruff 静态检查 | `ruff check` 修改文件 | 1 个 RUF005 预存问题 | ✅ 通过 |
-| OAT 合规检查 | `pre-commit run oat-check` | Passed | ✅ 通过 |
-| dsv41_golden_8p_ep8 | 8卡 NPU 100-step exact loss | 100 步跑通；step 1 精确匹配，step 2+ 偏差 0.003%~0.05%（不累积） | ⚠️ golden 待上游刷新（见下文） |
-| dsv41 1P 冒烟 | 1卡 debugmodel 2-step（本地 a3 2NPU 环境） | loss=12.20, rc=0 | ✅ 通过 |
-| dsv4_golden_1rank | 1卡 V4 golden test | 需空闲 NPU | ⚠️ NPU 被占用 |
-| dsv4_golden_ep2_fsdp2 | 2卡 V4 golden test | 需空闲 NPU | ⚠️ NPU 被占用 |
+| # | 问题 | 当前实现 | 状态 |
+|---|---|---|---|
+| 1 | V4 mHC 被改成 Single-Pass | V4 保持 classic mHC；V41 block/model 独立实现 Single-Pass | ✅ 闭环 |
+| 2 | V4 post-wq_b RMS 被破坏 | V4 `post_q_rms_norm=True`；V41=False | ✅ 闭环 |
+| 3 | Indexer Hadamard 被 Golden 开关控制 | rotation 成为通用配置；V4=`hadamard`，V41=`none` | ✅ 闭环 |
+| 4 | V41 支持面过度声明 | CP!=1、PP!=1、compile、AscendC 均 fail-fast | ✅ 闭环 |
+| 5 | V4 → V41 反向依赖 / 语义泄漏 | V4 只保留 version-neutral primitive / extension seam；CSA2 policy、vision sharding/FSDP、VL bias mapping 均由 `deepseek_v41` 所有 | ✅ 闭环 |
+| 6 | V41 Attention policy 混在 V4 forward | `DeepSeekV41Attention` 独立负责 source/reuse/reindex/candidate orchestration | ✅ 闭环 |
+| 7 | ratio=1 被当成“无压缩” sentinel | reference metadata 增加显式 `materialized_ratios`；V4 默认不 materialize，V41 将 ratio=1 materialize 为真实 token-for-token global KV | ✅ 闭环 |
+| 8 | compressor/indexer ownership 由 ratio 隐式推断 | builder 使用 version-neutral ownership/key-source policy；V41 registry 显式组装 source/reindex ownership | ✅ 闭环 |
+| 9 | StateDict V41 namespace 污染 V4 | V4 adapter 只处理 V4；V41 adapter 自己注册 `bias_vl` + vision/marker ownership | ✅ 闭环 |
+| 10 | StateDict round-trip UT 无效 | exact HF key-set equality + tensor equality | ✅ 闭环 |
+| 11 | Golden override 依赖 `_v41_*` 动态属性 | Golden sparse attention 显式消费 `sparse_indices` + active `compress_ratio`；V4 ratio-4 无外部 Top-K 时保留 local selection | ✅ 闭环 |
+| 12 | mutable `V41AttentionContext` | 当前仍为 per-model/per-forward mutable state | ➡️ Follow-up：扩展 PP/CP2+/compile/reentrant 前必须 functionalize |
+| 13 | 384-expert released scale | 当前 landing 仍是 16-expert resource crop | ➡️ Follow-up |
 
-## 8P Golden 验证详情（2026-09-13，a3-4-docker 16NPU 环境）
+## 当前实现边界
 
-运行命令：
+支持目标：
+- 40-layer V4.1 topology（另有 30-layer validation crop）
+- 16 routed experts resource crop / EP8
+- Single-Pass mHC
+- CSA2 source/reuse/reindex + layer-20 candidate hierarchy
+- ratio-2 compressed KV 与 ratio-1 real shared/global KV
+- vision tower + marker/scatter path
+- CP1 / PP1 / eager
+- reference/golden operator path
+- FullAC（仅当前 CP1/PP1 eager recipe）
+
+不声明支持：
+- AscendC V4.1 sparse attention
+- CP > 1
+- PP > 1
+- `torch.compile` / GraphTrainer
+- released 384-expert production scale
+- private indexer-training objective / exact VL bias update recipe
+- DSpark / Engram / quantized-training parity
+
+## 历史验证证据
+
+### FSDP lifecycle bisect
+
+旧执行路径直接调用 block sub-forward，绕过 `nn.Module.__call__`，8P FSDP+EP 下会报 mixed Tensor/DTensor。`3798b91` 改回正常 `layer(...)` 调用后触发 FSDP hooks，恢复可运行性。该 bisect 证明此前一次 Golden migration 的根因是 **FSDP lifecycle correctness fix**，而不是随机 runtime nondeterminism。
+
+### 已完成的历史验证
+
+- V4 unit suite：此前轮次已通过（最终新 refactor 后仍需重跑）。
+- V41 StateDict suite：此前 5 tests passed；round-trip test 后续已修成 strict equality。
+- V41 8P FSDP8+EP8：此前版本曾完成 deterministic 100-step trajectory，并据 FSDP lifecycle root cause 迁移过一次 Golden。
+- FullAC：此前同 HEAD 重复 100-step 轨迹 deterministic；只证明当前 recipe 的稳定性，不等价于 AC-off 数学等价性。
+
+## 最新 architecture/correctness refactor
+
+最新一轮重构完成以下结构性变化：
+
+1. V4 attention 拆为通用 `_project_q / _project_window_kv / _build_long_range_context / _apply_sparse_attention / _project_output` primitives。
+2. V41 source/reuse/reindex/candidate 调度移入 `DeepSeekV41Attention`。
+3. V4 builder 不再出现版本判断，改成 compressor/indexer ownership 与 key-source capability 参数。
+4. V41 registry 显式声明 KV source、index source、source-key indexer、external-key reindexer。
+5. ratio=1 reference metadata 由 V41 显式 materialize，成为真实 causal global-KV container；V4 ratio=1 默认语义不变。
+6. V41-only vision AC/FSDP、image-marker sharding、`bias_vl` sharding/StateDict ownership 从 V4 移出。
+7. Golden override 改成显式 `sparse_indices + active compress_ratio` contract，不再读取 `_v41_*` 动态属性。
+
+### 为什么必须重新跑 Golden
+
+这一轮并非纯代码搬家：**ratio=1 从“reference mask 中不 materialize”修正为 V4.1 的真实 shared/global-KV 语义**。因此旧冻结 loss trajectory 已被 correctness 修复主动 supersede，不能继续作为最新 HEAD 的 regression oracle，也不能通过手工修改 loss 文件来掩盖变化。
+
+## 最终 merge validation gate（最新 HEAD）
+
+在 NPU 开发环境中执行：
+
 ```bash
+# 1. Unit / static gates
+pytest tests/unit_tests/models/deepseek_v4/
+pytest tests/unit_tests/models/deepseek_v41/
+pre-commit run --all-files
+
+# 2. V41 final trajectory
 python -m tests.integration_tests.run_tests <empty_out_dir> \
     --test_suite deepseek_v41 --ngpu 8 \
     --test_name dsv41_golden_8p_ep8 --no-parallel
+
+# 3. V4 regression
+python -m tests.integration_tests.run_tests <empty_out_dir> \
+    --test_suite deepseek_v4 --ngpu 1 \
+    --test_name dsv4_golden_1rank --no-parallel
 ```
 
-结果（`assert_losses_equal` 为 bit-exact、无容差比较）：
-- **100 步全部跑通**，loss 轨迹与 golden 趋势一致（12.32 → 4.85），无崩溃、无 grad_norm 异常。
-- **step 1 精确匹配**（12.31539249420166 == golden 同值），证明初始参数下 step-1 forward loss 与冻结基线一致。
-- **step 2 起出现微小偏差**：每步 abs diff 0.0004~0.003（相对 0.003%~0.05%），且**不随训练累积发散**（steps 1-100 各区间 max rel diff 均 ≤ 0.06%），差异首次在第一次参数更新后可见。
-- 偏差来源：golden 在 `43da3cb` 冻结后，本分支后续 7 个修复 commit（Q RMS per-head 实现、FSDP `layer()` 调用路径、Indexer rotation 配置等）虽保持语义一致，但浮点运算路径（算子融合/通信归约顺序）发生变化，导致 bit-exact 轨迹漂移。
+V41 第一次运行最新 correctness implementation 时，应先记录 deterministic trajectory；确认重复运行 bit-exact 后，再以**独立 baseline-migration commit** 更新 `tests/assets/losses/dsv41_golden_8p_ep8.txt`，随后在迁移后的最终 HEAD 上要求 100/100 exact pass。
 
-### Determinism 验证（2026-09-13，a3-4-docker）
+## Merge 判定
 
-- **同一 HEAD（af79151）连续两次 8P 100-step 运行 bit-exact**：两次结果逐 step loss 完全一致。
-  → 排除了 distributed runtime nondeterminism；偏差是 **deterministic implementation-path change**。
-
-### Golden Bisect（2-step，2026-09-13）
-
-| Commit | 结果 | 结论 |
-|--------|------|------|
-| `c38e5a3`（3798b91 之前） | **8P 直接崩溃**：`RuntimeError: aten.matmul.default got mixed torch.Tensor and DTensor` | 旧执行路径（`layer.forward_with_pre_mix()` 绕过 `nn.Module.__call__`）在 FSDP8+EP8 下**根本无法运行** |
-| `3798b91`（FSDP lifecycle 修复） | 2-step 可运行，step1 与 golden 精确一致 | 修复是必要的：`layer(...)` 经 `__call__` 触发 FSDP shard/unshard hooks |
-
-**Bisect 结论**：divergence 起点是 `3798b91` 的 FSDP `__call__` lifecycle 修复——它把旧 baseline 依赖的 **broken execution path** 修正为正确的 module 调用路径。这属于"修复已知错误执行路径"，而非随机浮点漂移。
-
-**处理决定**：Golden refresh 是合理的（regression invariant 应保护 correct implementation，而非永久保护 known-broken FSDP call path）。但按 GPT maintainer 要求，golden 文件的刷新作为单独 baseline-migration commit 提交，并在 commit message 中说明迁移原因；validation 文档明确记录 migration reason（FSDP lifecycle correctness fix）。
+- **Architecture:** 当前 refactor 已完成既定收口；不再新增架构 gate，除非出现真实新回归。
+- **Validation:** 最新 ratio=1 correctness refactor 后的 8P Golden 与最终 V4 regression 尚需 NPU 环境重新执行。
+- **Merge:** 在上述最终 validation gate 完成前保持 pending；完成后可进入最终 Approve。
