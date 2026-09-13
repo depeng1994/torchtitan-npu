@@ -12,7 +12,7 @@ from torchtitan.protocols.module import Module
 
 
 def _make_identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
-    """Return the one-hot stream mix used at the input of the main stack."""
+    """Return the one-hot stream mix used at the input of a single-pass stack."""
     pre_mix = torch.zeros(
         (*x.shape[:2], hc_mult),
         device=x.device,
@@ -78,14 +78,13 @@ class HcPre(Module):
         return y.to(dtype)
 
     def forward_with_pre_mix(self, x, pre_mix=None):
-        """Collapse with a caller-supplied stream mix (V4.1 Single-Pass).
+        """Collapse with a caller-supplied stream mix for single-pass variants.
 
-        V4 classic calls the parameter-less :meth:`forward` — each sub-block
-        collapses with its own freshly-computed pre mix and the result is
-        independent of neighbouring sub-layers.  V4.1 instead carries the
-        pre mix between sub-layers (Single-Pass mHC) and calls this method.
-        ``pre_mix=None`` falls back to the V4 classic behaviour (uses the
-        mix generated from ``x`` itself).
+        The default V4 path calls :meth:`forward`: each sub-block collapses
+        with its own freshly computed pre mix.  Derived single-pass variants
+        may instead carry the pre mix between neighbouring sub-layers through
+        this narrow extension seam.  ``pre_mix=None`` falls back to the local
+        mix generated from ``x`` itself.
         """
         pre, post, comb = self._mixes(x)
         collapse_mix = pre if pre_mix is None else pre_mix
