@@ -230,12 +230,8 @@ def _make_v4_attn_config(
     compressor_cfg = None
     indexer_cfg = None
 
-    owns_compressor = (
-        compress_ratio > 1 if not v41_mode else is_kv_source
-    )
-    owns_indexer = (
-        compress_ratio == 4 if not v41_mode else is_index_source
-    )
+    owns_compressor = compress_ratio > 1 if not v41_mode else is_kv_source
+    owns_indexer = compress_ratio == 4 if not v41_mode else is_index_source
     if owns_compressor:
         coff = 2 if compress_ratio == 4 else 1
         compressor_cfg = _make_compressor_config(
@@ -444,9 +440,7 @@ def _build_v4_layers(
         v41_mode = kv_source_layers is not None
         is_kv_source = not v41_mode or layer_id in kv_source_layers
         is_index_source = (
-            cr == 4
-            if not v41_mode
-            else index_source_layers is not None and layer_id in index_source_layers
+            cr == 4 if not v41_mode else index_source_layers is not None and layer_id in index_source_layers
         )
 
         attn_cfg = _make_v4_attn_config(

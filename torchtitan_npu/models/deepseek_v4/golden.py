@@ -18,10 +18,13 @@ import os
 
 def golden_enabled() -> bool:
     """True when the reference operators are selected."""
-    return os.getenv(
-        "USE_GOLDEN",
-        os.getenv("TORCHTITAN_NPU_VISION_GOLDEN", os.getenv("TORCHTITAN_NPU_GOLDEN_TRAINING", "0")),
-    ) == "1"
+    return (
+        os.getenv(
+            "USE_GOLDEN",
+            os.getenv("TORCHTITAN_NPU_VISION_GOLDEN", os.getenv("TORCHTITAN_NPU_GOLDEN_TRAINING", "0")),
+        )
+        == "1"
+    )
 
 
 __all__ = ["golden_enabled"]

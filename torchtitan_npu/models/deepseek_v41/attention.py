@@ -8,6 +8,7 @@ from torch import nn
 # The plan/context classes below are built at class-creation time and the V4
 # decoder imports this module, so these imports have to stay at the top.
 
+
 @dataclass(frozen=True, slots=True)
 class V41CompressionSpec:
     layer_ids: tuple[int, ...]
@@ -115,6 +116,7 @@ class V41AttentionContext:
             None if index_source is None else self.topk_indices.get(index_source),
         )
 
+
 # existing definitions are kept above this implementation
 
 
@@ -156,6 +158,7 @@ class V41GoldenAttention(nn.Module):
             is_causal=is_causal and attn_mask is None,
         )
 
+
 class V41GoldenAttentionModule(nn.Module):
     """Pure Torch reference decoder attention for V4.1 integration tests."""
 
@@ -196,6 +199,7 @@ class V41GoldenAttentionModule(nn.Module):
             is_causal=attn_mask is None,
         )
         return self.o_proj(output.transpose(1, 2).reshape(batch, length, -1))
+
 
 def select_candidate_blocks(
     index_scores: torch.Tensor,

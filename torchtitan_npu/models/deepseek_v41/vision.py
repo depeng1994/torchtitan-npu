@@ -48,9 +48,7 @@ class _ReferenceRMSNorm(Module):
 
 
 def _vision_rope(n_h: int, n_w: int, rope_dim: int, theta: float, device):
-    inv_freq = 1.0 / (
-        theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)
-    )
+    inv_freq = 1.0 / (theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim))
     hpos = torch.arange(n_h, device=device).unsqueeze(1).expand(n_h, n_w)
     wpos = torch.arange(n_w, device=device).unsqueeze(0).expand(n_h, n_w)
     freqs = torch.stack([hpos, wpos], dim=-1).reshape(-1, 2, 1).float() * inv_freq
@@ -58,20 +56,12 @@ def _vision_rope(n_h: int, n_w: int, rope_dim: int, theta: float, device):
     return freqs.cos().view(1, -1, 1, rope_dim), freqs.sin().view(1, -1, 1, rope_dim)
 
 
-def _vision_rope_batch(
-    grids: torch.Tensor, max_tokens: int, rope_dim: int, theta: float, device
-):
+def _vision_rope_batch(grids: torch.Tensor, max_tokens: int, rope_dim: int, theta: float, device):
     """Build one 2D RoPE table per image instead of sharing the largest grid."""
     tables = [_vision_rope(int(h), int(w), rope_dim, theta, device) for h, w in grids.tolist()]
-    cos = torch.ones(
-        (grids.shape[0], max_tokens, 1, rope_dim), device=device, dtype=torch.float32
-    )
-    sin = torch.zeros(
-        (grids.shape[0], max_tokens, 1, rope_dim), device=device, dtype=torch.float32
-    )
-    for index, ((image_cos, image_sin), (height, width)) in enumerate(
-        zip(tables, grids.tolist(), strict=True)
-    ):
+    cos = torch.ones((grids.shape[0], max_tokens, 1, rope_dim), device=device, dtype=torch.float32)
+    sin = torch.zeros((grids.shape[0], max_tokens, 1, rope_dim), device=device, dtype=torch.float32)
+    for index, ((image_cos, image_sin), (height, width)) in enumerate(zip(tables, grids.tolist(), strict=True)):
         tokens = min(int(height) * int(width), max_tokens)
         cos[index, :tokens] = image_cos[0, :tokens]
         sin[index, :tokens] = image_sin[0, :tokens]
@@ -323,9 +313,7 @@ class DeepSeekV4VisionEncoder(Module):
         num_patches = (grids[:, 0] * grids[:, 1]).to(torch.long)
         valid = torch.arange(x.shape[1], device=x.device)[None, :] < num_patches[:, None]
         rope_dim = self.dim // self.num_heads // 2
-        cos, sin = _vision_rope_batch(
-            grids, x.shape[1], rope_dim, self.rope_theta, x.device
-        )
+        cos, sin = _vision_rope_batch(grids, x.shape[1], rope_dim, self.rope_theta, x.device)
         for block in self.blocks:
             x = block(x, cos, sin, valid)
         return self.aligner(self.norm(x), grids)

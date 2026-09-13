@@ -47,7 +47,7 @@ class _SyntheticVisionDataset(IterableDataset):
             else:
                 repeated = (text_tokens * ((self.seq_len // len(text_tokens)) + 1))[: self.seq_len]
                 tokens = torch.tensor(repeated, dtype=torch.long)
-                    # Use the full image protocol for the new index-based path. The
+                # Use the full image protocol for the new index-based path. The
             # legacy contiguous span remains in the batch for old checkpoints.
             if self.image_paths:
                 pixel_values, image_grid = ImagePatchProcessor().from_path(
@@ -55,9 +55,7 @@ class _SyntheticVisionDataset(IterableDataset):
                 )
                 grid_hw = (int(image_grid[0]), int(image_grid[1]))
             else:
-                pixel_values = torch.randn(
-                    self.patch_count, 3 * 14 * 14, dtype=torch.float32
-                )
+                pixel_values = torch.randn(self.patch_count, 3 * 14 * 14, dtype=torch.float32)
                 grid_hw = (8, 8)
             span_len = ((grid_hw[0] + 2) // 3) * ((grid_hw[1] + 2) // 3)
             layout_ids, layout_types, layout_indices = build_image_token_layout(

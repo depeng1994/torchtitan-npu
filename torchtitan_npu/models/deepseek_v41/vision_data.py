@@ -100,6 +100,7 @@ def build_shifted_labels(input_ids: torch.Tensor, token_types: torch.Tensor) -> 
         labels[..., :-1] = labels[..., :-1].masked_fill(token_types[..., 1:] >= 0, -100)
     return labels
 
+
 def scatter_image_features(
     hidden: torch.Tensor,
     visual_features: torch.Tensor,
@@ -193,10 +194,9 @@ class ImagePatchProcessor:
             )
         pixels = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8).clone()
         pixels = pixels.view(target_h, target_w, 3).permute(2, 0, 1).float() / 255.0
-        pixels = (
-            (pixels - torch.tensor(self.mean)[:, None, None])
-            / torch.tensor(self.std)[:, None, None]
-        ).to(torch.bfloat16)
+        pixels = ((pixels - torch.tensor(self.mean)[:, None, None]) / torch.tensor(self.std)[:, None, None]).to(
+            torch.bfloat16
+        )
         grid_h, grid_w = target_h // self.patch_size, target_w // self.patch_size
         patches = (
             pixels.view(3, grid_h, self.patch_size, grid_w, self.patch_size)

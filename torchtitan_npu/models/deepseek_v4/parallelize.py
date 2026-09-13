@@ -36,9 +36,7 @@ def apply_activation_checkpointing(model, ac_config, dump_folder):
     encoder = getattr(model, "vision_encoder", None)
     if encoder is not None:
         for name, block in encoder.blocks.named_children():
-            encoder.blocks.register_module(
-                name, policy._wrap_block(block, base_fqn=f"vision_encoder.blocks.{name}")
-            )
+            encoder.blocks.register_module(name, policy._wrap_block(block, base_fqn=f"vision_encoder.blocks.{name}"))
 
 
 def parallelize_deepseek_v4(

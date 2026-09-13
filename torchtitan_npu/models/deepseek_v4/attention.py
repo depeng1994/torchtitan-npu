@@ -405,11 +405,7 @@ class Attention(BaseAttention):
             q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.norm_eps)
         q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
         golden = golden_enabled()
-        q_rope = (
-            self._golden_rope(q_rope, positions)
-            if golden
-            else self.rope(q_rope, positions=positions)
-        )
+        q_rope = self._golden_rope(q_rope, positions) if golden else self.rope(q_rope, positions=positions)
         q = torch.cat([q_nope, q_rope], dim=-1)
 
         # The swa projection + RoPE run on the local rows (the sender's own
@@ -456,26 +452,16 @@ class Attention(BaseAttention):
                     cmp_k = self.token_dispatcher.select(pooled, plan)
 
         has_v41_indexer = (
-            v41_plan is not None
-            and v41_layer_id is not None
-            and v41_layer_id in v41_plan.index_source_layers
+            v41_plan is not None and v41_layer_id is not None and v41_layer_id in v41_plan.index_source_layers
         )
         if self.indexer is not None and (self.compress_ratio > 1 or has_v41_indexer):
             index_source = (
-                None
-                if v41_plan is None or v41_layer_id is None
-                else v41_plan.index_source_before(v41_layer_id)
+                None if v41_plan is None or v41_layer_id is None else v41_plan.index_source_before(v41_layer_id)
             )
-            if (
-                v41_plan is not None
-                and v41_layer_id is not None
-                and v41_layer_id in v41_plan.kv_source_layers
-            ):
+            if v41_plan is not None and v41_layer_id is not None and v41_layer_id in v41_plan.kv_source_layers:
                 index_source = None
             shared_index_k = (
-                None
-                if v41_context is None or index_source is None
-                else v41_context.index_keys.get(index_source)
+                None if v41_context is None or index_source is None else v41_context.index_keys.get(index_source)
             )
             indexer_kwargs = {
                 "positions": positions,
@@ -586,9 +572,7 @@ class Attention(BaseAttention):
             self.compressed_sparse_attention.inner_attention._v41_topk_indices = shared_topk
             kv_source = v41_plan.kv_source_for(v41_layer_id)
             self.compressed_sparse_attention.inner_attention._v41_compress_ratio = (
-                self.compress_ratio
-                if kv_source is None
-                else v41_plan.ratios[kv_source]
+                self.compress_ratio if kv_source is None else v41_plan.ratios[kv_source]
             )
 
         # Inner-attention positional contract: absent components are None.

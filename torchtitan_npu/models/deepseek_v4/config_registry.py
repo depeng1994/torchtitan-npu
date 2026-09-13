@@ -98,9 +98,8 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
             projections = ("wkv", "wgate") if layer_config.attention.compressor.wgate is not None else ("wkv",)
             for projection in projections:
                 shardings[f"{prefix}.attention.compressor.{projection}.weight"] = owned
-            if (
-                layer_config.attention.compressor.compress_ratio > 1
-                and getattr(layer_config.attention.compressor, "use_ape", True)
+            if layer_config.attention.compressor.compress_ratio > 1 and getattr(
+                layer_config.attention.compressor, "use_ape", True
             ):
                 shardings[f"{prefix}.attention.compressor.ape"] = owned
         expert_sharding = ComputeLayout(
@@ -131,10 +130,7 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
                 projections = ("wkv", "wgate") if indexer_compressor.wgate is not None else ("wkv",)
                 for projection in projections:
                     shardings[f"{prefix}.attention.indexer.compressor.{projection}.weight"] = owned
-                if (
-                    indexer_compressor.compress_ratio > 1
-                    and getattr(indexer_compressor, "use_ape", True)
-                ):
+                if indexer_compressor.compress_ratio > 1 and getattr(indexer_compressor, "use_ape", True):
                     shardings[f"{prefix}.attention.indexer.compressor.ape"] = owned
             elif indexer.wk is not None:
                 shardings[f"{prefix}.attention.indexer.wk.weight"] = owned

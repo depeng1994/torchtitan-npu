@@ -153,16 +153,24 @@ class Compressor(Module):
         golden = golden_enabled()
         if kv.ndim == 2:
             if golden:
-                rotated = _golden_complex_rope(
-                    self.rope,
-                    kv_rope.unsqueeze(0).unsqueeze(2),
-                    positions,
-                ).squeeze(0).squeeze(1)
+                rotated = (
+                    _golden_complex_rope(
+                        self.rope,
+                        kv_rope.unsqueeze(0).unsqueeze(2),
+                        positions,
+                    )
+                    .squeeze(0)
+                    .squeeze(1)
+                )
             else:
-                rotated = self.rope(
-                    kv_rope.unsqueeze(0).unsqueeze(2),
-                    positions=positions.reshape(1, -1),
-                ).squeeze(0).squeeze(1)
+                rotated = (
+                    self.rope(
+                        kv_rope.unsqueeze(0).unsqueeze(2),
+                        positions=positions.reshape(1, -1),
+                    )
+                    .squeeze(0)
+                    .squeeze(1)
+                )
         elif golden:
             rotated = _golden_complex_rope(
                 self.rope,
@@ -385,10 +393,14 @@ class Indexer(Module):
             rotated = _golden_complex_rope(self.rope, shaped, positions).reshape_as(key_rope)
             return torch.cat([key_nope, rotated], dim=-1)
         if key.ndim == 2:
-            rotated = self.rope(
-                key_rope.unsqueeze(0).unsqueeze(2),
-                positions=positions.reshape(1, -1),
-            ).squeeze(0).squeeze(1)
+            rotated = (
+                self.rope(
+                    key_rope.unsqueeze(0).unsqueeze(2),
+                    positions=positions.reshape(1, -1),
+                )
+                .squeeze(0)
+                .squeeze(1)
+            )
         else:
             rotated = self.rope(
                 key_rope.unsqueeze(2),
@@ -443,6 +455,7 @@ class Indexer(Module):
 
 class LightningIndexer(Module):
     """Reference sparse-index selector; kernel configuration is reserved for fused integration."""
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         index_topk: int

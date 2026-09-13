@@ -63,8 +63,7 @@ class V41Model(DeepSeekV4Model):
         def update_from_config(self, *, config, **kwargs):
             if config.parallelism.context_parallel_degree != 1:
                 raise NotImplementedError(
-                    "DeepSeek V4.1 currently supports CP=1 only; "
-                    f"got CP={config.parallelism.context_parallel_degree}"
+                    f"DeepSeek V4.1 currently supports CP=1 only; got CP={config.parallelism.context_parallel_degree}"
                 )
             super().update_from_config(config=config, **kwargs)
 
@@ -88,9 +87,7 @@ class V41Model(DeepSeekV4Model):
                 ratios=self.compress_ratios[: config.n_layers],
                 kv_source_layers=config.kv_source_layers,
                 index_source_layers=config.index_source_layers or (),
-                candidate_source_layer=(
-                    20 if config.candidate_source_layer is None else config.candidate_source_layer
-                ),
+                candidate_source_layer=(20 if config.candidate_source_layer is None else config.candidate_source_layer),
                 candidate_topk_blocks=config.candidate_topk_blocks,
                 candidate_block_size=config.candidate_block_size,
             )
@@ -138,10 +135,14 @@ class V41Model(DeepSeekV4Model):
                 (image_grid[:, 1].to(torch.long) + self.vision_encoder.aligner.downsample_ratio - 1)
                 // self.vision_encoder.aligner.downsample_ratio
             )
-            flat_visual = torch.cat(
-                [features[: int(count)] for features, count in zip(visual, counts.tolist(), strict=True)],
-                dim=0,
-            ) if counts.numel() else visual.new_empty((0, visual.shape[-1]))
+            flat_visual = (
+                torch.cat(
+                    [features[: int(count)] for features, count in zip(visual, counts.tolist(), strict=True)],
+                    dim=0,
+                )
+                if counts.numel()
+                else visual.new_empty((0, visual.shape[-1]))
+            )
             return scatter_image_features(hidden, flat_visual, image_feature_indices)
         if image_spans is None:
             return hidden + visual.sum() * 0
@@ -165,9 +166,7 @@ class V41Model(DeepSeekV4Model):
             return image_spans.new_empty((0, 3))
         first, last = int(positions[0]), int(positions[-1])
         if (positions[1:] - positions[:-1]).abs().max().item() != 1:
-            raise ValueError(
-                "image spans currently support contiguous or headtail CP sharding"
-            )
+            raise ValueError("image spans currently support contiguous or headtail CP sharding")
         rows = []
         for row in image_spans.tolist():
             image_id, start, length = (int(value) for value in row)
@@ -175,9 +174,7 @@ class V41Model(DeepSeekV4Model):
             if hi <= first or lo > last:
                 continue
             if not (lo >= first and hi - 1 <= last):
-                raise ValueError(
-                    "an image span is not contiguous after context-parallel sharding"
-                )
+                raise ValueError("an image span is not contiguous after context-parallel sharding")
             rows.append((image_id, lo - first, length))
         if not rows:
             return image_spans.new_empty((0, 3))
@@ -200,9 +197,7 @@ class V41Model(DeepSeekV4Model):
                 load_balancer_type=load_balancer_type,
             )
         metadata_tensors = tuple(
-            extra_kwargs[name]
-            for name in ("token_types", "image_feature_indices")
-            if name in extra_kwargs
+            extra_kwargs[name] for name in ("token_types", "image_feature_indices") if name in extra_kwargs
         )
         if metadata_tensors:
             local_metadata, _ = cp_shard(
@@ -266,11 +261,7 @@ class V41Model(DeepSeekV4Model):
         # sub-layers and collapse_pre_mix replaces the V4 decoder hc_head.
         tok_embeddings = self.tok_embeddings
         input_ids = tokens.detach().long()
-        hidden = (
-            embeds
-            if embeds is not None
-            else (tok_embeddings(tokens) if tok_embeddings is not None else tokens)
-        )
+        hidden = embeds if embeds is not None else (tok_embeddings(tokens) if tok_embeddings is not None else tokens)
         hidden = hidden.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
 
         pre_mix = None
@@ -292,9 +283,5 @@ class V41Model(DeepSeekV4Model):
         main_hidden = last_layer.collapse_pre_mix(hidden, pre_mix)
         main_hidden = self.norm(main_hidden) if self.norm is not None else main_hidden
 
-        output = (
-            main_hidden
-            if self._skip_lm_head or self.lm_head is None
-            else self.lm_head(main_hidden)
-        )
+        output = main_hidden if self._skip_lm_head or self.lm_head is None else self.lm_head(main_hidden)
         return output.float() if golden_enabled() else output

@@ -33,6 +33,7 @@ def _build_v41_trainer_config(flavor: str, crop: DeepSeekV41CropConfig) -> Train
     # The golden path replaces F.cross_entropy globally and is the only loss the
     # frozen baseline was produced with, so it is not conditional.
     from torchtitan_npu.models.deepseek_v4.data import SyntheticTokenizer
+
     model_spec = model_registry(
         flavor,
     )
@@ -68,9 +69,7 @@ def _build_v41_trainer_config(flavor: str, crop: DeepSeekV41CropConfig) -> Train
             # explicitly provided (the golden test suite points this at the
             # committed tests/assets/deepseek_v3 mini tokenizer).
             tokenizer_path=os.environ.get("DSV4_TOKENIZER_PATH"),
-            text=os.environ.get(
-                "DSV4_VISION_TEXT", "Describe the image."
-            ),
+            text=os.environ.get("DSV4_VISION_TEXT", "Describe the image."),
         ),
         optimizer=_dsv4_optimizer_config(model_spec, lr=1e-5),
         lr_scheduler=LRSchedulersContainer.Config(

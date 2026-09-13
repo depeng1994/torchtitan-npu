@@ -48,10 +48,14 @@ from torchtitan.models.common.moe import (
 # initialising and the class swaps below would never run.
 def _golden_enabled() -> bool:
     """True when the golden operator path is selected (single USE_GOLDEN switch)."""
-    return os.getenv(
-        "USE_GOLDEN",
-        os.getenv("TORCHTITAN_NPU_VISION_GOLDEN", os.getenv("TORCHTITAN_NPU_GOLDEN_TRAINING", "0")),
-    ) == "1"
+    return (
+        os.getenv(
+            "USE_GOLDEN",
+            os.getenv("TORCHTITAN_NPU_VISION_GOLDEN", os.getenv("TORCHTITAN_NPU_GOLDEN_TRAINING", "0")),
+        )
+        == "1"
+    )
+
 
 __all__ = ["HashMoE", "HashRouter"]
 
@@ -88,9 +92,7 @@ class HashRouter(TokenChoiceTopKRouter):
         self.hash = config.hash
         self.vocab_size = config.vocab_size
         self.bias_vl = (
-            torch.nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32))
-            if config.vision_enabled
-            else None
+            torch.nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32)) if config.vision_enabled else None
         )
         if self.hash:
             if config.vocab_size is None:
@@ -317,9 +319,7 @@ class HashMoE(MoE):
             )
         if self.shared_experts is not None:
             shared = self.shared_experts
-            y += self._golden_expert(
-                x, shared.w1.weight, shared.w2.weight, shared.w3.weight, None, shared.swiglu_limit
-            )
+            y += self._golden_expert(x, shared.w1.weight, shared.w2.weight, shared.w3.weight, None, shared.swiglu_limit)
         return y.type_as(x_BLD).view(shape)
 
 
@@ -423,9 +423,7 @@ class _ClampGroupedExperts(GroupedExperts):
             for axis in ("dp", "cp"):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
-        compute_dtype = (
-            x_RD.dtype if x_RD.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
-        )
+        compute_dtype = x_RD.dtype if x_RD.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
         g_RF = self._grouped_mm(
             A=x_RD.to(compute_dtype),
             B_t=w1_EFD.to(compute_dtype).transpose(-2, -1),

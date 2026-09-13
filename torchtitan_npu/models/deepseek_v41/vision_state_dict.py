@@ -28,13 +28,13 @@ class DeepSeekV41VisionStateDictAdapter:
     @staticmethod
     def _to_local_key(key: str) -> str:
         if key.startswith("vision."):
-            return "vision_encoder." + key[len("vision."):]
+            return "vision_encoder." + key[len("vision.") :]
         return key
 
     @staticmethod
     def _to_hf_key(key: str) -> str:
         if key.startswith("vision_encoder."):
-            return "vision." + key[len("vision_encoder."):]
+            return "vision." + key[len("vision_encoder.") :]
         return key
 
     def from_hf(self, state_dict: Mapping[str, Any]) -> dict[str, Any]:
@@ -59,9 +59,7 @@ class DeepSeekV41VisionStateDictAdapter:
         if expected is None or not isinstance(value, torch.Tensor):
             return
         if tuple(value.shape) != expected:
-            raise ValueError(
-                f"shape mismatch for {key}: expected {expected}, got {tuple(value.shape)}"
-            )
+            raise ValueError(f"shape mismatch for {key}: expected {expected}, got {tuple(value.shape)}")
 
 
 class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
@@ -83,4 +81,3 @@ class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
         vision_keys = self._vision_adapter.to_hf(state_dict)
         result.update(vision_keys)
         return result
-

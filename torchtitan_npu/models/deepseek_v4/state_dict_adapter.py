@@ -84,25 +84,19 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                     f"layers.{layer_id}.attn.compressor.norm.weight": (
                         f"layers.{layer_id}.attention.{comp}.norm.weight"
                     ),
-                    f"layers.{layer_id}.attn.compressor.wkv.weight": (
-                        f"layers.{layer_id}.attention.{comp}.wkv.weight"
-                    ),
+                    f"layers.{layer_id}.attn.compressor.wkv.weight": (f"layers.{layer_id}.attention.{comp}.wkv.weight"),
                 }
                 if compressor_cfg.wgate is not None:
-                    compressor_map[
-                        f"layers.{layer_id}.attn.compressor.wgate.weight"
-                    ] = f"layers.{layer_id}.attention.{comp}.wgate.weight"
+                    compressor_map[f"layers.{layer_id}.attn.compressor.wgate.weight"] = (
+                        f"layers.{layer_id}.attention.{comp}.wgate.weight"
+                    )
                 if getattr(compressor_cfg, "use_ape", True):
-                    compressor_map[
-                        f"layers.{layer_id}.attn.compressor.ape"
-                    ] = f"layers.{layer_id}.attention.{comp}.ape"
+                    compressor_map[f"layers.{layer_id}.attn.compressor.ape"] = f"layers.{layer_id}.attention.{comp}.ape"
                 self.from_hf_map.update(compressor_map)
             indexer_cfg = layer_cfg.attention.indexer
             if indexer_cfg is not None:
                 indexer_map = {
-                    f"layers.{layer_id}.attn.indexer.wq_b.weight": (
-                        f"layers.{layer_id}.attention.indexer.wq_b.weight"
-                    ),
+                    f"layers.{layer_id}.attn.indexer.wq_b.weight": (f"layers.{layer_id}.attention.indexer.wq_b.weight"),
                     f"layers.{layer_id}.attn.indexer.weights_proj.weight": (
                         f"layers.{layer_id}.attention.indexer.weights_proj.weight"
                     ),
@@ -119,21 +113,21 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                         }
                     )
                     if indexer_cfg.compressor.wgate is not None:
-                        indexer_map[
-                            f"layers.{layer_id}.attn.indexer.compressor.wgate.weight"
-                        ] = f"layers.{layer_id}.attention.indexer.compressor.wgate.weight"
+                        indexer_map[f"layers.{layer_id}.attn.indexer.compressor.wgate.weight"] = (
+                            f"layers.{layer_id}.attention.indexer.compressor.wgate.weight"
+                        )
                     if getattr(indexer_cfg.compressor, "use_ape", True):
-                        indexer_map[
-                            f"layers.{layer_id}.attn.indexer.compressor.ape"
-                        ] = f"layers.{layer_id}.attention.indexer.compressor.ape"
+                        indexer_map[f"layers.{layer_id}.attn.indexer.compressor.ape"] = (
+                            f"layers.{layer_id}.attention.indexer.compressor.ape"
+                        )
                 elif indexer_cfg.wk is not None:
-                    indexer_map[
-                        f"layers.{layer_id}.attn.indexer.wk.weight"
-                    ] = f"layers.{layer_id}.attention.indexer.wk.weight"
+                    indexer_map[f"layers.{layer_id}.attn.indexer.wk.weight"] = (
+                        f"layers.{layer_id}.attention.indexer.wk.weight"
+                    )
                     if indexer_cfg.k_norm is not None:
-                        indexer_map[
-                            f"layers.{layer_id}.attn.indexer.k_norm.weight"
-                        ] = f"layers.{layer_id}.attention.indexer.k_norm.weight"
+                        indexer_map[f"layers.{layer_id}.attn.indexer.k_norm.weight"] = (
+                            f"layers.{layer_id}.attention.indexer.k_norm.weight"
+                        )
                 self.from_hf_map.update(indexer_map)
             if layer_cfg.moe.router.hash:
                 self.from_hf_map.update(

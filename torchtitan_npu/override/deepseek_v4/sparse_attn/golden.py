@@ -92,7 +92,11 @@ def _sparse_attn(
 ):
     if golden_enabled():
         return _sparse_attn_golden(
-            q_BMHD, kv_BND, attn_sink_H, topk_idxs_BMK, softmax_scale,
+            q_BMHD,
+            kv_BND,
+            attn_sink_H,
+            topk_idxs_BMK,
+            softmax_scale,
         )
     m = q_BMHD.size(1)
     chunk = _ATTN_CHUNK if _ATTN_CHUNK > 0 else m
@@ -122,13 +126,19 @@ def _sparse_attn_golden(q_BMHD, kv_BND, attn_sink_H, topk_idxs_BMK, softmax_scal
     """Bound broadcast products along queries without changing reduction axes."""
     m = q_BMHD.size(1)
     chunk = _ATTN_CHUNK if _ATTN_CHUNK > 0 else m
-    return torch.cat([
-        _sparse_attn_golden_chunk(
-            q_BMHD[:, start : start + chunk], kv_BND, attn_sink_H,
-            topk_idxs_BMK[:, start : start + chunk], softmax_scale,
-        )
-        for start in range(0, m, chunk)
-    ], dim=1)
+    return torch.cat(
+        [
+            _sparse_attn_golden_chunk(
+                q_BMHD[:, start : start + chunk],
+                kv_BND,
+                attn_sink_H,
+                topk_idxs_BMK[:, start : start + chunk],
+                softmax_scale,
+            )
+            for start in range(0, m, chunk)
+        ],
+        dim=1,
+    )
 
 
 def _sparse_attn_golden_chunk(
@@ -142,20 +152,14 @@ def _sparse_attn_golden_chunk(
     batch, seqlen, heads, head_dim = q_BMHD.shape
     safe = topk_idxs_BMK.clamp_min(0).long()
     gathered = kv_BND[:, None].expand(batch, seqlen, kv_BND.size(1), head_dim)
-    gathered = gathered.gather(
-        2, safe.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-    )
-    score = (
-        q_BMHD.unsqueeze(2) * gathered.unsqueeze(3)
-    ).sum(dim=-1) * softmax_scale
+    gathered = gathered.gather(2, safe.unsqueeze(-1).expand(-1, -1, -1, head_dim))
+    score = (q_BMHD.unsqueeze(2) * gathered.unsqueeze(3)).sum(dim=-1) * softmax_scale
     score = score.permute(0, 1, 3, 2)
     score = score.masked_fill(topk_idxs_BMK.unsqueeze(2) < 0, -torch.inf)
     sink = attn_sink_H.view(1, 1, heads, 1).expand(batch, seqlen, heads, 1)
     score = torch.cat([score, sink], dim=-1)
     prob = score.softmax(dim=-1)
-    return (
-        prob[..., :-1].unsqueeze(-1) * gathered.unsqueeze(2)
-    ).sum(dim=3).to(q_BMHD.dtype)
+    return (prob[..., :-1].unsqueeze(-1) * gathered.unsqueeze(2)).sum(dim=3).to(q_BMHD.dtype)
 
 
 def _sequence_ranges(cu_seqlens: torch.Tensor) -> list[tuple[int, int]]:
@@ -188,9 +192,7 @@ def _localize_precomputed_indices(
     """Convert container-grid indices into the current document's local grid."""
     cu_q = metadata.varlen.cu_seq_q.to(device=topk_indices.device, dtype=torch.long)
     lengths = torch.diff(cu_q)
-    query_docs = torch.repeat_interleave(
-        torch.arange(lengths.numel(), device=topk_indices.device), lengths
-    )
+    query_docs = torch.repeat_interleave(torch.arange(lengths.numel(), device=topk_indices.device), lengths)
     if ratio > 1:
         plan = metadata.plans.get(ratio)
         if plan is None or plan.cu_seqlens_cmp_k is None:
@@ -335,9 +337,7 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
 
         index_score = None
         if precomputed_topk is not None:
-            compressed_indices = precomputed_topk.reshape(
-                -1, precomputed_topk.shape[-1]
-            )
+            compressed_indices = precomputed_topk.reshape(-1, precomputed_topk.shape[-1])
         elif self.compress_ratio == 4:
             compressed_indices, _ = self._select_topk(idx_q, idx_k, idx_w, metadata)
         elif self.compress_ratio > 1:
@@ -346,11 +346,7 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             compressed_indices = None
 
         outputs = []
-        compressed = (
-            None
-            if self.compress_ratio <= 1
-            else metadata.plans.get(self.compress_ratio)
-        )
+        compressed = None if self.compress_ratio <= 1 else metadata.plans.get(self.compress_ratio)
         block_ranges = (
             None
             if compressed is None

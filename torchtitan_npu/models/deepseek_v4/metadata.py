@@ -357,19 +357,16 @@ def build_index_dense_mask(
     seq_len = metadata.seq_len
     device = cu_q.device
     lengths = torch.diff(cu_q).to(torch.long)
-    doc_ids = torch.repeat_interleave(
-        torch.arange(lengths.numel(), device=device, dtype=torch.long), lengths
-    )
+    doc_ids = torch.repeat_interleave(torch.arange(lengths.numel(), device=device, dtype=torch.long), lengths)
     token_starts = cu_q[:-1].to(torch.long)
-    positions = torch.arange(seq_len, device=device, dtype=torch.long) - token_starts[
-        doc_ids
-    ]
+    positions = torch.arange(seq_len, device=device, dtype=torch.long) - token_starts[doc_ids]
 
     if ratio == 1:
         return (
-            (doc_ids[:, None] == doc_ids[None, :])
-            & (positions[:, None] >= positions[None, :])
-        ).unsqueeze(0).unsqueeze(1)
+            ((doc_ids[:, None] == doc_ids[None, :]) & (positions[:, None] >= positions[None, :]))
+            .unsqueeze(0)
+            .unsqueeze(1)
+        )
 
     plan = metadata.plans.get(ratio)
     if plan is None or plan.cu_seqlens_cmp_k is None:
@@ -386,18 +383,16 @@ def build_index_dense_mask(
     block_local = block_local.masked_fill(~valid, -1)
     causal_limit = (positions + 1) // ratio
     return (
-        (doc_ids[:, None] == block_doc[None, :])
-        & (block_local[None, :] < causal_limit[:, None])
-    ).unsqueeze(0).unsqueeze(1)
+        ((doc_ids[:, None] == block_doc[None, :]) & (block_local[None, :] < causal_limit[:, None]))
+        .unsqueeze(0)
+        .unsqueeze(1)
+    )
 
 
 def ensure_index_dense_masks(metadata: CompressedVarlenMetadata) -> CompressedVarlenMetadata:
     """Materialize index masks once at the eager metadata boundary."""
     if not metadata.index_dense_masks:
-        metadata.index_dense_masks = {
-            ratio: build_index_dense_mask(metadata, ratio)
-            for ratio in metadata.plans
-        }
+        metadata.index_dense_masks = {ratio: build_index_dense_mask(metadata, ratio) for ratio in metadata.plans}
     return metadata
 
 

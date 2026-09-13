@@ -14,10 +14,7 @@ from .model import V41Model
 from .vision import DeepSeekV4VisionEncoder, ImageMarkerEmbeddings
 
 # Marker embedding init mirrors the reference tower.
-_MARKER_INIT = {
-    name: partial(torch.nn.init.normal_, std=1.0)
-    for name in ("image_start", "image_newline", "image_end")
-}
+_MARKER_INIT = {name: partial(torch.nn.init.normal_, std=1.0) for name in ("image_start", "image_newline", "image_end")}
 
 if TYPE_CHECKING:
     from torchtitan.protocols.model import ModelConfigConverter
