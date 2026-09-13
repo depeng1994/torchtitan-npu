@@ -25,7 +25,7 @@ NPU_OVERRIDES = (
 # fused token-dispatcher implementation.
 GOLDEN_OVERRIDES = (
     "--override.imports",
-    "torchtitan_npu.override.common.rope.workaround",
+    "torchtitan_npu.override.common.rope.decomposed",
     "torchtitan_npu.override.deepseek_v4.sparse_attn.golden",
 )
 
@@ -141,6 +141,27 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "--compile.backend=aot_eager",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",
+            ),
+            use_golden=False,
+            check_loss=False,
+        ),
+        _build_case(
+            test_name="dsv4_smla_1rank_inductor_rope",
+            test_descr="DeepSeek-V4 SMLA 1rank inductor (decomposed RoPE + pre-AOT patterns)",
+            ngpu=1,
+            extra_args=(
+                "--training.steps=1",
+                "--compile.enable",
+                "--compile.backend=inductor",
+                "--hf-assets-path=tests/assets/deepseek_v3",
+                "--training.global-batch-size=2",
+            ),
+            extra_override_imports=(
+                # Decomposed RoPE must be imported *after* asc_complex so
+                # the last exact-match override (decomposed) wins.  This
+                # produces the canonical decomposed graph that DSV4 partial
+                # and generic interleaved patterns consume.
+                "torchtitan_npu.override.common.rope.decomposed",
             ),
             use_golden=False,
             check_loss=False,

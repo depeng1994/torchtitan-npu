@@ -9,6 +9,7 @@ from typing import Any
 from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 
+from torchtitan_npu.compile import setup_patterns
 from torchtitan_npu.config import manager as config_manager
 from torchtitan_npu.config.configs import (
     ExtensionConfig,
@@ -58,6 +59,17 @@ class TrainerEx(Trainer):
                 )
 
     def __init__(self, config: Config):
+        compile_extension = config.extension.compile
+        if (
+            config.compile.enable
+            and "model" in config.compile.components
+            and config.compile.backend == "inductor"
+        ):
+            setup_patterns(
+                enable_patterns=compile_extension.enable_patterns,
+                pattern_blacklist=compile_extension.pattern_blacklist,
+            )
+
         quantization_config = config.extension.quantization
         if quantization_config.enable_quantized_training:
             from interfaces.torchao_converter import apply_quantization_converter

@@ -3,17 +3,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Replace DeepSeek-V4 split/RoPE/cat regions before AOTAutograd."""
+"""Replace DeepSeek-V4 split/RoPE/cat regions before AOTAutograd.
+
+This module exports a ``PATTERNS`` dict.  It does NOT register itself at
+import time — use ``pattern_manager.setup_patterns()`` for registration.
+"""
 
 from __future__ import annotations
 
 import torch
 import torch_npu
 
-from torchtitan_npu.compile.pattern_replacement import (
-    PatternReplacement,
-    register_pre_aot_patterns,
-)
+from torchtitan_npu.compile.pattern_replacement import PatternReplacement
 from torchtitan_npu.ops.ascendc.inplace_partial_rotary_mul import (
     inplace_partial_rotary_mul,
 )
@@ -134,11 +135,9 @@ def _make_compressor_rope_pattern() -> PatternReplacement:
     )
 
 
-register_pre_aot_patterns(
-    {
-        "dsv4_partial_rope_wo_squeeze_inverse": _make_parent_rope_pattern(inverse=True),
-        "dsv4_partial_rope_wo_squeeze_forward": _make_parent_rope_pattern(inverse=False),
-        "dsv4_partial_rope_attention_kv_forward": _make_kv_rope_pattern(),
-        "dsv4_partial_rope_compressor_kv_forward": _make_compressor_rope_pattern(),
-    },
-)
+PATTERNS: dict[str, PatternReplacement] = {
+    "dsv4_partial_rope_wo_squeeze_inverse": _make_parent_rope_pattern(inverse=True),
+    "dsv4_partial_rope_wo_squeeze_forward": _make_parent_rope_pattern(inverse=False),
+    "dsv4_partial_rope_attention_kv_forward": _make_kv_rope_pattern(),
+    "dsv4_partial_rope_compressor_kv_forward": _make_compressor_rope_pattern(),
+}

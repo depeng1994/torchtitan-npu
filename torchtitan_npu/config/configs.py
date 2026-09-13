@@ -114,6 +114,23 @@ class QuantizationExtensionConfig:
 
 
 @dataclass(kw_only=True, slots=True)
+class CompileExtensionConfig:
+    """NPU-specific compile extension options.
+
+    Controls automatic NPU pre-AOT pattern registration and the per-pattern
+    blacklist.  ``enable_patterns`` and ``pattern_blacklist`` are CLI-settable
+    via ``--extension.compile.enable-patterns`` etc.
+    """
+
+    enable_patterns: bool = True
+    """Enable automatic NPU pre-AOT pattern registration."""
+
+    pattern_blacklist: tuple[str, ...] = ()
+    """Pattern names to skip even when available.  Use the stable pattern name
+    (e.g. ``dsv4_partial_rope_wo_squeeze_forward``), not a Python module path."""
+
+
+@dataclass(kw_only=True, slots=True)
 class ExtensionConfig:
     """Global NPU extensions without an upstream component owner.
 
@@ -135,6 +152,9 @@ class ExtensionConfig:
 
     quantization: QuantizationExtensionConfig = field(
         default_factory=QuantizationExtensionConfig,
+    )
+    compile: CompileExtensionConfig = field(
+        default_factory=CompileExtensionConfig,
     )
 
 

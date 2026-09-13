@@ -35,8 +35,6 @@ export HCCL_IF_BASE_PORT="${HCCL_IF_BASE_PORT:-30000}"
 export LOG_RANK="${LOG_RANK:-0}"  # rank to show log
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
-export TORCHTITAN_NPU_PATTERN_IMPORTS="${PATTERN_IMPORTS:-${TORCHTITAN_NPU_PATTERN_IMPORTS:-}}"
-
 LOCAL_HOST=${LOCAL_HOST:-$(ip addr show "${Network_Interface}" | grep "inet " | awk '{print $2}' | cut -d'/' -f1 | head -n1)}
 LOCAL_HOST=${LOCAL_HOST:-$(hostname -I | awk '{print $1}')}
 echo "$LOCAL_HOST"

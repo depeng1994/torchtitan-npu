@@ -17,7 +17,7 @@
 `fused_partial_rope` 分别表示原始计算片段和融合算子调用：
 
 ```python
-from torchtitan_npu.compile import PatternReplacement, register_pre_aot_patterns
+from torchtitan_npu.compile import PatternReplacement
 
 
 def make_pattern(*, inverse):
@@ -34,23 +34,14 @@ def make_pattern(*, inverse):
     )
 
 
-register_pre_aot_patterns(
-    {
-        "dsv4_parent_rope_inverse": make_pattern(inverse=True),
-        "dsv4_parent_rope_forward": make_pattern(inverse=False),
-    }
-)
+PATTERNS = {
+    "dsv4_parent_rope_inverse": make_pattern(inverse=True),
+    "dsv4_parent_rope_forward": make_pattern(inverse=False),
+}
 ```
 
-将接入代码放在独立模块中，并在模块导入时完成注册。启动训练前显式设置模块路径：
-
-```bash
-export TORCHTITAN_NPU_PATTERN_IMPORTS=\
-torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope
-```
-
-多个模块使用逗号分隔。该入口只注册编译图 pattern，不占用 `override.imports` 中的
-`Config` 节点。
+将接入代码放在独立模块中，并导出 `PATTERNS` 字典。`pattern_manager` 会在训练启动时
+自动发现、过滤并注册所有内置模块的 pattern。不再需要手工设置 Python module path。
 
 接入时只需注意：
 
@@ -67,14 +58,19 @@ torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope
 
 ## 启用和验证
 
-```bash
-# 只开启快速调试，不注册 pattern
-TORCHINDUCTOR_NPU_EXT_DEBUG=allfallback \
-COMPILE_BACKEND=inductor ./scripts/run_train.sh
+Inductor 默认自动注册所有 NPU pre-AOT patterns。如需禁用或黑名单，通过 CLI 控制：
 
-# 开启快速调试，并注册 inplace partial RoPE pattern
+```bash
+# 禁用所有 pattern（保留 decomposed Torch graph）
+--extension.compile.no-enable-patterns
+
+# 黑名单指定 pattern（仅阻止目标 pattern；其余自动注册）
+--extension.compile.pattern-blacklist dsv4_partial_rope_wo_squeeze_forward
+```
+
+```bash
+# 快速调试（不注册 pattern）
 TORCHINDUCTOR_NPU_EXT_DEBUG=allfallback \
-PATTERN_IMPORTS=torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope \
 COMPILE_BACKEND=inductor ./scripts/run_train.sh
 ```
 
@@ -83,5 +79,5 @@ COMPILE_BACKEND=inductor ./scripts/run_train.sh
 `TORCHINDUCTOR_NPU_EXT_DEBUG=allfallback`。
 
 > 注：当前 DeepSeek-V4 golden attention 不支持启用 inplace partial RoPE pattern。
-
-> 注：`torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope` 的使能依赖 `torchtitan_npu.override.common.rope.workaround`，启用 pattern 时应一并注入该 override。
+> `torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope` 的使能依赖
+> `torchtitan_npu.override.common.rope.decomposed`，启用 pattern 时应一并注入该 override。

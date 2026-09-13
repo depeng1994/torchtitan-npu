@@ -17,8 +17,11 @@ import pytest
 import torch
 from torchtitan.models.common.rope import ComplexRoPE
 
-from torchtitan_npu.compile import pattern_replacement
-from torchtitan_npu.override.common.rope import WorkaroundComplexRoPE
+from torchtitan_npu.compile.pattern_manager import setup_patterns
+from torchtitan_npu.compile.pattern_replacement import (
+    _PRE_AOT_PATTERN_PASS,
+)
+from torchtitan_npu.override.common.rope import DecomposedComplexRoPE
 
 inplace_partial_rope = importlib.import_module(
     "torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope"
@@ -34,7 +37,7 @@ class _PartialRoPEModule(torch.nn.Module):
 
     def forward(self, x, cos, sin):
         prefix, rotary = torch.split(x, [8, 8], dim=-1)
-        rotary = WorkaroundComplexRoPE.apply_rotary_emb(
+        rotary = DecomposedComplexRoPE.apply_rotary_emb(
             rotary,
             None,
             (cos, sin),
@@ -114,13 +117,23 @@ def test_partial_rope_shared_pre_aot_pass_matches_complex_reference(
         fake_op,
     )
 
+    # Register patterns through the real manager so this test verifies the
+    # actual registration path used by NPU compile setup.
+    saved_patterns = dict(_PRE_AOT_PATTERN_PASS._patterns)
+    _PRE_AOT_PATTERN_PASS._patterns.clear()
+    from torchtitan_npu.compile.pattern_replacement import register_pre_aot_patterns
+    register_pre_aot_patterns(inplace_partial_rope.PATTERNS)
+
     # Execute the real shared pass used by Inductor pre_grad_custom_pass.  A
     # zero-hit rewrite leaves the graph numerically correct, so the fake fused
     # op call count is also required as the structural oracle.
-    pattern_replacement._PRE_AOT_PATTERN_PASS(graph_module.graph)
+    _PRE_AOT_PATTERN_PASS(graph_module.graph)
     graph_module.recompile()
 
     actual = graph_module(x, cos, sin)
 
     assert calls == 1
     torch.testing.assert_close(actual, expected)
+
+    _PRE_AOT_PATTERN_PASS._patterns.clear()
+    _PRE_AOT_PATTERN_PASS._patterns.update(saved_patterns)

@@ -508,3 +508,34 @@ def test_set_allow_hf32_updates_all_backends(monkeypatch, allow_hf32):
     assert fake_torch_npu.npu.matmul.allow_hf32 is allow_hf32
     assert fake_torch_npu.npu.conv.allow_hf32 is allow_hf32
     assert fake_torch_npu.npu.aclnn.allow_hf32 is allow_hf32
+
+
+def test_compile_extension_config_defaults():
+    """CompileExtensionConfig defaults are correct."""
+    from torchtitan_npu.config.configs import CompileExtensionConfig
+
+    cfg = CompileExtensionConfig()
+    assert cfg.enable_patterns is True
+    assert cfg.pattern_blacklist == ()
+
+
+def test_compile_extension_config_explicit_values():
+    """CompileExtensionConfig can be constructed with overrides."""
+    from torchtitan_npu.config.configs import CompileExtensionConfig
+
+    cfg = CompileExtensionConfig(
+        enable_patterns=False,
+        pattern_blacklist=("dsv4_partial_rope_wo_squeeze_forward",),
+    )
+    assert cfg.enable_patterns is False
+    assert cfg.pattern_blacklist == ("dsv4_partial_rope_wo_squeeze_forward",)
+
+
+def test_extension_config_contains_compile_extension():
+    """ExtensionConfig carries a ``compile`` sub-config with correct defaults."""
+    from torchtitan_npu.config.configs import ExtensionConfig
+
+    ext = ExtensionConfig()
+    assert hasattr(ext, "compile")
+    assert ext.compile.enable_patterns is True
+    assert ext.compile.pattern_blacklist == ()

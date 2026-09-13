@@ -10,7 +10,6 @@
 #
 # Optional graph-pattern compile controls:
 #
-#   PATTERN_IMPORTS=<pattern-import-path> \
 #   COMPILE_BACKEND=inductor ./scripts/run_train.sh
 
 set -euo pipefail
@@ -35,7 +34,6 @@ CONFIG=${CONFIG:-"deepseek_v3_debugmodel"}
 TRAIN_FILE=${TRAIN_FILE:-torchtitan_npu.train}
 COMM_MODE=${COMM_MODE:-}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-}
-export TORCHTITAN_NPU_PATTERN_IMPORTS="${PATTERN_IMPORTS:-${TORCHTITAN_NPU_PATTERN_IMPORTS:-}}"
 
 ARGS=()
 
