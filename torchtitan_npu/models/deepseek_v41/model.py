@@ -79,6 +79,10 @@ class V41Model(DeepSeekV4Model):
                 )
             DeepSeekV4Model.Config.update_from_config(self, config=config, **kwargs)
 
+            from .sharding import set_deepseek_v41_sharding_extensions
+
+            set_deepseek_v41_sharding_extensions(self)
+
     def __init__(self, config: Config):
         super().__init__(config)
         self.vision_encoder = config.vision_encoder.build() if config.vision_encoder is not None else None
@@ -99,6 +103,32 @@ class V41Model(DeepSeekV4Model):
         for layer in self.layers.values():
             layer.compression_plan = self.compression_plan
             layer.attention_context = self.attention_context
+
+    def apply_activation_checkpointing_extensions(self, policy) -> None:
+        """Apply the shared AC policy to the V4.1 vision blocks."""
+        if self.vision_encoder is None:
+            return
+        for name, block in self.vision_encoder.blocks.named_children():
+            self.vision_encoder.blocks.register_module(
+                name,
+                policy._wrap_block(block, base_fqn=f"vision_encoder.blocks.{name}"),
+            )
+
+    def apply_fsdp_extensions(self, *, dp_mesh, training, parallelism, parallel_dims) -> None:
+        """FSDP-wrap the V4.1 vision tower before the shared decoder wrapper."""
+        if self.vision_encoder is None:
+            return
+        from torchtitan.config import TORCH_DTYPE_MAP
+        from torchtitan.distributed.fsdp import apply_fsdp_to_vision_encoder
+
+        apply_fsdp_to_vision_encoder(
+            self.vision_encoder,
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            pp_enabled=parallel_dims.pp_enabled,
+        )
 
     def _prepare_multimodal_embeddings(
         self,
