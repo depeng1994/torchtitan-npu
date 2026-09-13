@@ -74,6 +74,12 @@ class V41Model(DeepSeekV4Model):
                     "DeepSeek V4.1 does not support pipeline parallelism; "
                     f"got PP={pp}"
                 )
+            compile_config = getattr(config, "compile", None)
+            if compile_config is not None and getattr(compile_config, "enable", False):
+                raise NotImplementedError(
+                    "DeepSeek V4.1 does not support torch.compile yet; "
+                    "CSA2 cross-layer state is currently an eager-only runtime contract"
+                )
             # Explicit parent-class call: the slots=True dataclass copy created
             # by the configurable framework can break zero-arg super() binding.
             DeepSeekV4Model.Config.update_from_config(self, config=config, **kwargs)
