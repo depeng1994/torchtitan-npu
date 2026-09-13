@@ -46,7 +46,6 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             "layers.{}.ffn.experts.{}.w2.weight": "layers.{}.moe.routed_experts.inner_experts.w2_EDF",
             "layers.{}.ffn.gate.weight": "layers.{}.moe.router.gate.weight",
             "layers.{}.ffn.gate.bias": "layers.{}.moe.expert_bias_E",
-            "layers.{}.ffn.gate.bias_vl": "layers.{}.moe.router.bias_vl",
             "layers.{}.ffn.shared_experts.w1.weight": "layers.{}.moe.shared_experts.w1.weight",
             "layers.{}.ffn.shared_experts.w3.weight": "layers.{}.moe.shared_experts.w3.weight",
             "layers.{}.ffn.shared_experts.w2.weight": "layers.{}.moe.shared_experts.w2.weight",
@@ -84,19 +83,25 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                     f"layers.{layer_id}.attn.compressor.norm.weight": (
                         f"layers.{layer_id}.attention.{comp}.norm.weight"
                     ),
-                    f"layers.{layer_id}.attn.compressor.wkv.weight": (f"layers.{layer_id}.attention.{comp}.wkv.weight"),
+                    f"layers.{layer_id}.attn.compressor.wkv.weight": (
+                        f"layers.{layer_id}.attention.{comp}.wkv.weight"
+                    ),
                 }
                 if compressor_cfg.wgate is not None:
                     compressor_map[f"layers.{layer_id}.attn.compressor.wgate.weight"] = (
                         f"layers.{layer_id}.attention.{comp}.wgate.weight"
                     )
                 if getattr(compressor_cfg, "use_ape", True):
-                    compressor_map[f"layers.{layer_id}.attn.compressor.ape"] = f"layers.{layer_id}.attention.{comp}.ape"
+                    compressor_map[f"layers.{layer_id}.attn.compressor.ape"] = (
+                        f"layers.{layer_id}.attention.{comp}.ape"
+                    )
                 self.from_hf_map.update(compressor_map)
             indexer_cfg = layer_cfg.attention.indexer
             if indexer_cfg is not None:
                 indexer_map = {
-                    f"layers.{layer_id}.attn.indexer.wq_b.weight": (f"layers.{layer_id}.attention.indexer.wq_b.weight"),
+                    f"layers.{layer_id}.attn.indexer.wq_b.weight": (
+                        f"layers.{layer_id}.attention.indexer.wq_b.weight"
+                    ),
                     f"layers.{layer_id}.attn.indexer.weights_proj.weight": (
                         f"layers.{layer_id}.attention.indexer.weights_proj.weight"
                     ),
@@ -132,7 +137,9 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             if layer_cfg.moe.router.hash:
                 self.from_hf_map.update(
                     {
-                        f"layers.{layer_id}.ffn.gate.tid2eid": (f"layers.{layer_id}.moe.router.tid2eid"),
+                        f"layers.{layer_id}.ffn.gate.tid2eid": (
+                            f"layers.{layer_id}.moe.router.tid2eid"
+                        ),
                     }
                 )
 
