@@ -43,8 +43,6 @@ if TYPE_CHECKING:
 class DeepSeekV4TransformerBlock(TransformerBlock):
     @dataclass(kw_only=True, slots=True)
     class Config(TransformerBlock.Config):
-        # DeepSeek-V4 has no non-MoE layer; ``moe`` is required (overrides the
-        # inherited ``MoE.Config | None = None``).
         moe: MoE.Config  # pyrefly: ignore [bad-override]
         hc_attn_pre: HcPre.Config
         hc_ffn_pre: HcPre.Config
@@ -54,55 +52,15 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
     def __init__(self, config: Config):
         super().__init__()
         cfg = config
-
         self.moe_enabled = True
         self.layer_id = config.layer_id
-        self._v41_plan = None
-        self._v41_context = None
-
         self.attention = cfg.attention.build()
         self.attention_norm = cfg.attention_norm.build()
         self.ffn_norm = cfg.ffn_norm.build()
         self.moe = cfg.moe.build()
-
         self.hc_attn_pre = cfg.hc_attn_pre.build()
         self.hc_ffn_pre = cfg.hc_ffn_pre.build()
         self.hc_post = cfg.hc_post.build()
-
-    def forward_with_pre_mix(
-        self,
-        x: torch.Tensor,
-        input_ids: torch.Tensor,
-        attention_masks: AttentionMasksType | None,
-        positions: torch.Tensor | None = None,
-        *,
-        pre_mix: torch.Tensor,
-    ):
-        residual = x
-        x, post, comb, attn_pre = self.hc_attn_pre.forward_with_pre_mix(x, pre_mix)
-        attention_kwargs = {}
-        if self._v41_plan is not None:
-            attention_kwargs = {
-                "v41_layer_id": self.layer_id,
-                "v41_plan": self._v41_plan,
-                "v41_context": self._v41_context,
-            }
-        x = self.attention(
-            self.attention_norm(x),
-            attention_masks,
-            positions,
-            **attention_kwargs,
-        )
-        x = self.hc_post(x, residual, post, comb)
-        residual = x
-        x, post, comb, ffn_pre = self.hc_ffn_pre.forward_with_pre_mix(x, attn_pre)
-        x = self.moe(self.ffn_norm(x), input_ids=input_ids, image_mask=getattr(self, "_v41_image_mask", None))
-        x = self.hc_post(x, residual, post, comb)
-        return x, ffn_pre
-
-    def collapse_pre_mix(self, x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-        """Collapse the final mHC streams before the decoder norm and head."""
-        return self.hc_attn_pre.collapse(x, pre_mix)
 
     def forward(
         self,
@@ -111,14 +69,7 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ):
-        """Classic DeepSeek-V4 mHC forward.
-
-        Each sub-block (attention / FFN) collapses the multi-stream state with
-        its own ``pre`` mix inside ``HcPre``, and the decoder applies the
-        standalone ``hc_head`` collapse after all layers.  V4.1's single-pass
-        mHC (mix carried between sub-layers) goes through
-        ``forward_with_pre_mix`` instead.
-        """
+        """Classic DeepSeek-V4 mHC forward."""
         residual = x
         x, post, comb = self.hc_attn_pre(x)
         x = self.attention(self.attention_norm(x), attention_masks, positions)
@@ -139,11 +90,6 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         window_size: int
         block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
         metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
-        kv_source_layers: tuple[int, ...] | None = None
-        index_source_layers: tuple[int, ...] | None = None
-        candidate_source_layer: int | None = None
-        candidate_topk_blocks: int = 2048
-        candidate_block_size: int = 8
 
         def update_from_config(self, *, config, **kwargs):
             if hasattr(config, "training"):
@@ -165,10 +111,6 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                     if n_groups % tp != 0:
                         raise ValueError(f"n_groups ({n_groups}) must be divisible by tp ({tp})")
 
-            # Context parallel is supported on the AscendC fused path only: the
-            # model's build_attention_masks derives the per-rank dispatch
-            # plan when the trainer passes the CP mesh; the model-dir
-            # reference tier and the golden stay no-CP-only and raise there.
             from .sharding import set_deepseek_v4_sharding_config
 
             set_deepseek_v4_sharding_config(
@@ -176,12 +118,6 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                 enable_sp=parallelism.enable_sequence_parallel,
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
-
-        # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/4441
-        # Temporary backport of the upstream DeepSeek-V4 sparse FLOPs
-        # estimation, adapted to the pinned TorchTitan dependency.
-        # Remove this implementation after the TorchTitan dependency includes
-        # the PR.
 
         def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
             deepseek_v4_model = cast("DeepSeekV4Model", model)
@@ -234,20 +170,13 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
     def __init__(self, config: Config):
         super().__init__(config)
         cfg = config
-
         self.compress_ratios = tuple(cfg.compress_ratios) + tuple(
             layer.attention.compress_ratio for layer in cfg.mtp_layers
         )
         self.window_size = cfg.window_size
         self.block_size = cfg.block_size
         self.vocab_size = cfg.vocab_size
-
         self._metadata_extension = cfg.metadata_extension.build()
-        self._v41_plan = None
-        self._v41_context = None
-
-        # V41 plan/context construction is the responsibility of the
-        # V41 subclass (see V41Model.__init__).
 
     def shard_extra_kwargs_for_cp(
         self,
@@ -257,10 +186,9 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         global_seq_len: int,
         load_balancer_type: str | None,
     ) -> None:
-        """Shard batch metadata a subclass carries through the CP split.
+        """Shard optional batch metadata carried by a derived model.
 
-        The base decoder owns no such metadata, so this is a no-op; the V4.1
-        multimodality subclass shards its image spans and token-type tensors.
+        The base decoder owns no additional metadata, so this is a no-op.
         """
 
     def build_attention_masks(
@@ -272,16 +200,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         cp_mesh: DeviceMesh | None = None,
         load_balancer_type: str | None = None,
     ):
-        """The model-owned per-batch metadata construction (the single
-        overridable mask-handling seam).
-
-        One entry for both modes: the common contract
-        (``build_compressed_varlen_metadata``) is always built; under CP
-        ``_build_cp_metadata`` shards the inputs and derives the rank-local
-        plan from the global context in-frame (no plan-time communication);
-        the ``metadata_extension`` (e.g. the reference tier or the AscendC
-        kernel metadata) runs last.
-        """
+        """Build the model-owned per-batch compressed-attention metadata."""
         positions = extra_kwargs.get("positions")
         global_seq_len = None
         mtp_batch = None
@@ -336,11 +255,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         load_balancer_type,
         mtp_batch,
     ):
-        """The context-parallel metadata: shard the tensors via the generic
-        path and derive the rank-local plan from the global context (the
-        common metadata's varlen + the load-balancer permutation).
-
-        Returns ``(inputs, labels, positions, metadata, mtp_batch)``."""
+        """Shard tensors and derive the rank-local compressed-attention plan."""
         seq_len = common.seq_len
         cp_size = cp_mesh.size(0)
         if seq_len % cp_size != 0:
@@ -380,12 +295,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
 
 
 class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):
-    """DeepSeek V4 model variant for the GraphTrainer compilation path.
-
-    Wraps ``init_states`` with ``disable_active_parametrization`` so that
-    lazy-init parametrizations (e.g., RoPE freq buffers) are materialized
-    before the FX tracer records the graph.
-    """
+    """DeepSeek V4 model variant for the GraphTrainer compilation path."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV4Model.Config):
