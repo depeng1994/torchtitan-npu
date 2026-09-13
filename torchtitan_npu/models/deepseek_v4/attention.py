@@ -533,7 +533,7 @@ class Attention(BaseAttention):
                         and v41_context is not None
                         and v41_layer_id == v41_plan.candidate_source_layer
                     ):
-                        from torchtitan_npu.models.deepseek_v4_1.attention import (
+                        from torchtitan_npu.models.deepseek_v41.attention import (
                             select_candidate_blocks,
                         )
 

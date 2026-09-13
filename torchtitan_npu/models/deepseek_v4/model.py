@@ -246,7 +246,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         self._v41_plan = None
         self._v41_context = None
         if cfg.kv_source_layers is not None:
-            from torchtitan_npu.models.deepseek_v4_1.attention import (
+            from torchtitan_npu.models.deepseek_v41.attention import (
                 V41AttentionContext,
                 build_v41_compression_spec,
             )

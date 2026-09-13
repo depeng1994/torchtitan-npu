@@ -100,10 +100,10 @@ def _build_v41_trainer_config(flavor: str, crop: DeepSeekV41CropConfig) -> Train
     )
 
 
-def deepseek_v4_1_flash_30layers_16experts_vision() -> TrainerEx.Config:
+def deepseek_v41_flash_30layers_16experts_vision() -> TrainerEx.Config:
     """Thirty continuous decoder layers for fast single-node validation."""
     return _build_v41_trainer_config(
-        "deepseek_v4_1_flash_30layers_16experts_vision",
+        "deepseek_v41_flash_30layers_16experts_vision",
         DeepSeekV41CropConfig(
             hidden_size=5120,
             vision_layers=32,
@@ -111,10 +111,10 @@ def deepseek_v4_1_flash_30layers_16experts_vision() -> TrainerEx.Config:
     )
 
 
-def deepseek_v4_1_flash_40layers_16experts_vision() -> TrainerEx.Config:
+def deepseek_v41_flash_40layers_16experts_vision() -> TrainerEx.Config:
     """Full 40-layer decoder with the single-node 16-expert resource crop."""
     return _build_v41_trainer_config(
-        "deepseek_v4_1_flash_40layers_16experts_vision",
+        "deepseek_v41_flash_40layers_16experts_vision",
         DeepSeekV41FullLayerConfig(
             hidden_size=5120,
             vision_layers=32,
@@ -122,7 +122,7 @@ def deepseek_v4_1_flash_40layers_16experts_vision() -> TrainerEx.Config:
     )
 
 
-def deepseek_v4_1_debugmodel() -> TrainerEx.Config:
+def deepseek_v41_debugmodel() -> TrainerEx.Config:
     """Reduced-width full-structure V4.1 shape for the golden trajectory tests.
 
     The real 40-layer compression/source structure and vision depth with
@@ -130,7 +130,7 @@ def deepseek_v4_1_debugmodel() -> TrainerEx.Config:
     V4.1 code path quickly.
     """
     return _build_v41_trainer_config(
-        "deepseek_v4_1_debugmodel",
+        "deepseek_v41_debugmodel",
         DeepSeekV41DebugConfig(
             hidden_size=512,
             vision_layers=32,

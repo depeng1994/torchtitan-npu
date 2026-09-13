@@ -4,7 +4,7 @@ import torch
 from torch.utils.data import IterableDataset
 from torchtitan.components.dataloader import ParallelAwareDataloader
 
-from torchtitan_npu.models.deepseek_v4_1.vision_data import (
+from torchtitan_npu.models.deepseek_v41.vision_data import (
     ImagePatchProcessor,
     build_image_token_layout,
     build_shifted_labels,

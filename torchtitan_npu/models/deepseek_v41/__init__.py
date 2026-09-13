@@ -19,13 +19,13 @@ from .config import (
     DeepSeekV41FullScaleProfile,
 )
 from .config_registry import (
-    deepseek_v4_1_flash_30layers_16experts_vision,
-    deepseek_v4_1_flash_40layers_16experts_vision,
+    deepseek_v41_flash_30layers_16experts_vision,
+    deepseek_v41_flash_40layers_16experts_vision,
 )
 from .interfaces import V41DSpark, V41Engram, V41OptionalModules
 from .model_registry import (
-    deepseek_v4_1_flash_30layers_16experts_vision_config,
-    deepseek_v4_1_flash_40layers_16experts_vision_config,
+    deepseek_v41_flash_30layers_16experts_vision_config,
+    deepseek_v41_flash_40layers_16experts_vision_config,
     model_registry,
 )
 from .vision_state_dict import DeepSeekV41VisionStateDictAdapter
@@ -51,9 +51,9 @@ __all__ = [
     "V41OptionalModules",
     "V41GoldenAttention",
     "build_v41_compression_spec",
-    "deepseek_v4_1_flash_30layers_16experts_vision",
-    "deepseek_v4_1_flash_30layers_16experts_vision_config",
-    "deepseek_v4_1_flash_40layers_16experts_vision",
-    "deepseek_v4_1_flash_40layers_16experts_vision_config",
+    "deepseek_v41_flash_30layers_16experts_vision",
+    "deepseek_v41_flash_30layers_16experts_vision_config",
+    "deepseek_v41_flash_40layers_16experts_vision",
+    "deepseek_v41_flash_40layers_16experts_vision_config",
     "model_registry",
 ]

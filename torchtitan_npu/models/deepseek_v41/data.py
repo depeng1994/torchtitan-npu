@@ -1,4 +1,4 @@
-from torchtitan_npu.models.deepseek_v4_1.vision_data import (
+from torchtitan_npu.models.deepseek_v41.vision_data import (
     IMAGE,
     IMAGE_END,
     IMAGE_NEW_LINE,

@@ -58,17 +58,17 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
 
 ### 8P Flash 40 层 16 expert + ViT（V4.1 Golden）
 
-`debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh` 是 V4.1（V4 基座 + ViT 多模态）的单机 8 卡入口。
+`debug/deepseek_v41_flash_8p_cpt_4k_a3.sh` 是 V4.1（V4 基座 + ViT 多模态）的单机 8 卡入口。
 配置与模型规模复用上面的 8P Flash debug 基线，只在 CLI 上覆盖四项：`--training.seq-len 512`、
 `--training.global-batch-size 8`、`--training.steps 40`、`--lr-scheduler.total-steps 40`，
 并默认关闭编译（`COMPILE_BACKEND=""`，编译会改变被追踪的图，而 Golden 口径要求逐位复现）。
 
 ```sh
-bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh
+bash examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh
 # 覆盖步数、切到 AscendC kernel、退回编译后端：
-bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh --training.steps 5
-USE_GOLDEN=0 bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh
-COMPILE_BACKEND=aot_eager bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh
+bash examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh --training.steps 5
+USE_GOLDEN=0 bash examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh
+COMPILE_BACKEND=aot_eager bash examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh
 ```
 
 该入口默认 `--checkpoint.no-enable`（不保存也不加载）；需要 checkpoint 时用 CLI 显式打开。
@@ -83,8 +83,8 @@ COMPILE_BACKEND=aot_eager bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p
 | `USE_GOLDEN=0` | AscendC 融合算子 | 训练吞吐优先，数值不再与推理基线逐位对齐 |
 
 ```sh
-bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh                 # golden
-USE_GOLDEN=0 bash examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh    # AscendC
+bash examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh                 # golden
+USE_GOLDEN=0 bash examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh    # AscendC
 ```
 
 实现：`USE_GOLDEN=1` 时 launcher 只装入一个 override ——

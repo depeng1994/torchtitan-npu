@@ -174,7 +174,7 @@ def _make_v41_config(
     return config
 
 
-def deepseek_v4_1_flash_30layers_16experts_vision_config(
+def deepseek_v41_flash_30layers_16experts_vision_config(
     *,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
@@ -188,7 +188,7 @@ def deepseek_v4_1_flash_30layers_16experts_vision_config(
     )
 
 
-def deepseek_v4_1_flash_40layers_16experts_vision_config(
+def deepseek_v41_flash_40layers_16experts_vision_config(
     *,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
@@ -203,7 +203,7 @@ def deepseek_v4_1_flash_40layers_16experts_vision_config(
     )
 
 
-def deepseek_v4_1_debugmodel_config(
+def deepseek_v41_debugmodel_config(
     *,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
@@ -225,7 +225,7 @@ def deepseek_v4_1_debugmodel_config(
 
 
 def model_registry(
-    flavor: str = "deepseek_v4_1_flash_30layers_16experts_vision",
+    flavor: str = "deepseek_v41_flash_30layers_16experts_vision",
     *,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
@@ -233,15 +233,15 @@ def model_registry(
 ) -> ModelSpec:
     # Lazy: the V4 base package imports this package's vision module.
     from torchtitan_npu.models.deepseek_v4 import (
-        DeepSeekV4StateDictAdapter,
         _register_step_pre_hooks,
         parallelize_deepseek_v4,
     )
+    from .vision_state_dict import DeepSeekV41StateDictAdapter
 
     config_factories = {
-        "deepseek_v4_1_flash_30layers_16experts_vision": deepseek_v4_1_flash_30layers_16experts_vision_config,
-        "deepseek_v4_1_flash_40layers_16experts_vision": deepseek_v4_1_flash_40layers_16experts_vision_config,
-        "deepseek_v4_1_debugmodel": deepseek_v4_1_debugmodel_config,
+        "deepseek_v41_flash_30layers_16experts_vision": deepseek_v41_flash_30layers_16experts_vision_config,
+        "deepseek_v41_flash_40layers_16experts_vision": deepseek_v41_flash_40layers_16experts_vision_config,
+        "deepseek_v41_debugmodel": deepseek_v41_debugmodel_config,
     }
     if flavor not in config_factories:
         raise ValueError(f"Unknown DeepSeek V4.1 flavor: {flavor}")
@@ -256,11 +256,11 @@ def model_registry(
         for converter_cfg in converters:
             config = converter_cfg.build().convert(config)
     return ModelSpec(
-        name="deepseek_v4_1",
+        name="deepseek_v41",
         flavor=flavor,
         model=config,
         parallelize_fn=parallelize_deepseek_v4,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=_register_step_pre_hooks,
-        state_dict_adapter=DeepSeekV4StateDictAdapter,
+        state_dict_adapter=DeepSeekV41StateDictAdapter,
     )

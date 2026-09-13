@@ -15,7 +15,7 @@ GOLDEN_OVERRIDES = (
     "--override.imports",
     "torchtitan_npu.override.common.rope.workaround",
     "torchtitan_npu.override.deepseek_v4.sparse_attn.golden",
-    "torchtitan_npu.override.deepseek_v4_1.golden_moe.golden",
+    "torchtitan_npu.override.deepseek_v41.golden_moe.golden",
     "torchtitan_npu.override.common.optimizer.virtual",
 )
 
@@ -27,8 +27,8 @@ GOLDEN_OVERRIDES = (
 # tests/assets/deepseek_v3 mini tokenizer (the same one the DeepSeek-V4
 # golden cases use).
 GOLDEN_ENV = {
-    "MODULE": "torchtitan_npu.models.deepseek_v4_1",
-    "CONFIG": "deepseek_v4_1_debugmodel",
+    "MODULE": "torchtitan_npu.models.deepseek_v41",
+    "CONFIG": "deepseek_v41_debugmodel",
     "TORCHTITAN_NPU_VISION_GOLDEN": "1",
     "TORCHTITAN_NPU_VISION_SDPA_BASELINE": "1",
     "TORCHTITAN_NPU_GOLDEN_TRAINING": "1",
@@ -40,7 +40,7 @@ GOLDEN_ENV = {
 }
 
 
-def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
+def build_deepseek_v41_test_list() -> list[OverrideDefinitions]:
     return [
         OverrideDefinitions(
             override_args=[

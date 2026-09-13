@@ -2,6 +2,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch
+from torchtitan_npu.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 
 
 class DeepSeekV41VisionStateDictAdapter:
@@ -61,4 +62,25 @@ class DeepSeekV41VisionStateDictAdapter:
             raise ValueError(
                 f"shape mismatch for {key}: expected {expected}, got {tuple(value.shape)}"
             )
+
+
+class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
+    """V4.1 state-dict adapter composing the V4 base mapping with the vision
+    tower and image-marker embeddings."""
+
+    def __init__(self, model_config, hf_assets_path):
+        super().__init__(model_config, hf_assets_path)
+        self._vision_adapter = DeepSeekV41VisionStateDictAdapter()
+
+    def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+        result = super().from_hf(hf_state_dict)
+        vision_keys = self._vision_adapter.from_hf(hf_state_dict)
+        result.update(vision_keys)
+        return result
+
+    def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        result = super().to_hf(state_dict)
+        vision_keys = self._vision_adapter.to_hf(state_dict)
+        result.update(vision_keys)
+        return result
 

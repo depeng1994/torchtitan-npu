@@ -6,7 +6,7 @@
 
 # Run this script on a single node.
 # Append CLI arguments to override the defaults below:
-#   ./examples/deepseek_v4/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh --training.steps 5
+#   ./examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh --training.steps 5
 # USE_GOLDEN=1 (the default here) selects the Golden reference operators the
 # frozen Stage-01 baseline was produced with; USE_GOLDEN=0 selects the AscendC
 # kernels. The frozen baseline is deterministic, so --debug.seed 42 and
@@ -23,8 +23,8 @@ NGPU="${NGPU:-8}"
 WORLD_SIZE="${NGPU}"
 
 # Model
-MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4_1}"
-CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_16experts_vision}"
+MODULE="${MODULE:-torchtitan_npu.models.deepseek_v41}"
+CONFIG="${CONFIG:-deepseek_v41_flash_40layers_16experts_vision}"
 
 # Dataloader & Checkpoint
 DATASET="${DATASET:-c4_test}"
@@ -147,7 +147,7 @@ if [[ "${USE_GOLDEN}" == "1" ]]; then
     NPU_OPS_OVERRIDES=(
         torchtitan_npu.override.common.rope.workaround
         torchtitan_npu.override.deepseek_v4.sparse_attn.golden
-        torchtitan_npu.override.deepseek_v4_1.golden_moe.golden
+        torchtitan_npu.override.deepseek_v41.golden_moe.golden
     )
 else
     NPU_OPS_OVERRIDES=(

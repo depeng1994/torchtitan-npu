@@ -299,7 +299,7 @@ class HashMoE(MoE):
         if isinstance(routed.w1_EFD, DTensor) or routed.w1_EFD.shape[0] != num_experts:
             raise ValueError(
                 "_golden_forward requires plain replicated expert tensors; "
-                "enable torchtitan_npu.override.deepseek_v4_1.golden_moe.golden "
+                "enable torchtitan_npu.override.deepseek_v41.golden_moe.golden "
                 "for EP/FSDP runs"
             )
         counts = torch.bincount(indices.flatten(), minlength=num_experts).tolist()
