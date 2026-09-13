@@ -3,12 +3,14 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model_spec import ModelSpec
+
+from torchtitan_npu.models.deepseek_v4.reference import ReferenceMetadataExtension
 
 from .attention import DeepSeekV41Attention
 from .model import V41Model
@@ -162,7 +164,8 @@ def _make_v41_config(
         candidate_block_size=8,
     )
     config.hc_head = None
-    config.metadata_extension.materialized_ratios = (1,)
+    reference_config = cast("ReferenceMetadataExtension.Config", config.metadata_extension)
+    reference_config.materialized_ratios = (1,)
 
     from .block import DeepSeekV41TransformerBlock
 
