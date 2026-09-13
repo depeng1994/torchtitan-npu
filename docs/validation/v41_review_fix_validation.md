@@ -8,6 +8,9 @@
   - `3dfd4c4` - fix: P0 blockers + P1 items（mHC restore, Q RMS rescale, Indexer rotation, CP1 config）
   - `e6df959` - fix: P1 items（checkpoint adapter, directory rename）
   - `6b2f643` - fix: remaining blockers（Q RMS per-head fix, CP1 runtime guard, dependency direction）
+  - `39cb5cd` - fix: sharding getattr guard（V4 无 vision config 不报错）
+  - `c38e5a3` - fix: V41 Config update_from_config 显式 parent call（slots dataclass super 兼容）
+  - `3798b91` - fix: V41 block FSDP 兼容（layer() 经 __call__ 触发 shard/unshard hooks）
 
 ## GPT Review 闭环清单
 
@@ -36,6 +39,24 @@
 | Checkpoint adapter 注册 | model_registry 使用 DeepSeekV41StateDictAdapter | 已注册 | ✅ 通过 |
 | Ruff 静态检查 | `ruff check` 修改文件 | 1 个 RUF005 预存问题 | ✅ 通过 |
 | OAT 合规检查 | `pre-commit run oat-check` | Passed | ✅ 通过 |
-| dsv41_golden_8p_ep8 | 8卡 NPU 100-step exact loss | 需 8NPU 环境 | ⚠️ 环境限制（2 NPU 可用） |
+| dsv41_golden_8p_ep8 | 8卡 NPU 100-step exact loss | 100 步跑通；step 1 精确匹配，step 2+ 偏差 0.003%~0.05%（不累积） | ⚠️ golden 待上游刷新（见下文） |
+| dsv41 1P 冒烟 | 1卡 debugmodel 2-step（本地 a3 2NPU 环境） | loss=12.20, rc=0 | ✅ 通过 |
 | dsv4_golden_1rank | 1卡 V4 golden test | 需空闲 NPU | ⚠️ NPU 被占用 |
 | dsv4_golden_ep2_fsdp2 | 2卡 V4 golden test | 需空闲 NPU | ⚠️ NPU 被占用 |
+
+## 8P Golden 验证详情（2026-09-13，a3-4-docker 16NPU 环境）
+
+运行命令：
+```bash
+python -m tests.integration_tests.run_tests <empty_out_dir> \
+    --test_suite deepseek_v41 --ngpu 8 \
+    --test_name dsv41_golden_8p_ep8 --no-parallel
+```
+
+结果（`assert_losses_equal` 为 bit-exact、无容差比较）：
+- **100 步全部跑通**，loss 轨迹与 golden 趋势一致（12.32 → 4.85），无崩溃、无 grad_norm 异常。
+- **step 1 精确匹配**（12.31539249420166 == golden 同值），证明模型初始化、前向/反向、数据流均与冻结基线一致。
+- **step 2 起出现微小偏差**：每步 abs diff 0.0004~0.003（相对 0.003%~0.05%），且**不随训练累积发散**（steps 1-100 各区间 max rel diff 均 ≤ 0.06%），呈典型浮点累加顺序/通信非确定性特征。
+- 偏差来源：golden 在 `43da3cb` 冻结后，本分支后续 7 个修复 commit（Q RMS per-head 实现、FSDP `layer()` 调用路径、Indexer rotation 配置等）虽保持语义一致，但浮点运算路径（算子融合/通信归约顺序）发生变化，导致 bit-exact 轨迹漂移。
+
+**处理决定**：不修改 golden 文件（`tests/assets/losses/dsv41_golden_8p_ep8.txt`）来"掩盖"失败；随 PR 提交以上验证说明，由上游维护者评估并刷新 golden（若有需要）。
