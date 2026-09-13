@@ -29,16 +29,17 @@ def _vision_hf_dict() -> dict[str, torch.Tensor]:
 
 def _base_hf_dict() -> dict[str, torch.Tensor]:
     return {
-        # Text backbone
+        # Text backbone (keys match the V4 adapter's from_hf_map)
         "embed.weight": torch.randn(512, 32),
         "layers.0.attn.wq_a.weight": torch.randn(8, 32),
         "layers.0.attn.wq_b.weight": torch.randn(16, 8),
-        "layers.0.ffn.gate.weight": torch.randn(8, 32),
-        "layers.0.moe.gate.weight": torch.randn(4, 32),
-        "layers.0.moe.gate.bias": torch.randn(4),
+        "layers.0.ffn.gate.weight": torch.randn(4, 32),
+        "layers.0.ffn.gate.bias": torch.randn(4),
         "layers.0.ffn.gate.bias_vl": torch.randn(4),
         # Decoder-level hc_head (V4 classic)
         "hc_head_base": torch.randn(12),
+        "hc_head_fn": torch.randn(12, 16),
+        "hc_head_scale": torch.randn(3),
     }
 
 
@@ -103,7 +104,7 @@ class TestComposedAdapterPartition:
         assert "vision.patch_embed.proj.weight" not in local, "raw HF vision key leaked"
 
         # Every key in local has the expected prefix.
-        expected_prefixes = ("tok_embeddings", "layers.", "vision_encoder.", "image_marker_embeddings.")
+        expected_prefixes = ("tok_embeddings", "layers.", "vision_encoder.", "image_marker_embeddings.", "hc_head.")
         for lk in local:
             assert any(lk.startswith(p) for p in expected_prefixes), \
                 f"unexpected local key {lk}"
