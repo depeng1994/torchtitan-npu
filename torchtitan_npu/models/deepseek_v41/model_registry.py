@@ -10,10 +10,10 @@ from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model_spec import ModelSpec
 
+from .attention import DeepSeekV41Attention
 from .model import V41Model
 from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings
 
-# Marker embedding init mirrors the reference tower.
 _MARKER_INIT = {name: partial(torch.nn.init.normal_, std=1.0) for name in ("image_start", "image_newline", "image_end")}
 
 if TYPE_CHECKING:
@@ -30,13 +30,7 @@ from .config import (
 
 @dataclass(frozen=True, slots=True)
 class _V41Widths:
-    """Per-flavor width set.
-
-    The debug widths keep the real 40-layer compression/source structure
-    while scaling only the widths (and the selection knobs that only make
-    sense at the 512-token debug sequence length, so the sparse index and
-    candidate selections stay active rather than clamping to dense).
-    """
+    """Per-flavor width set."""
 
     dim: int
     n_heads: int
@@ -104,14 +98,17 @@ def _make_v41_config(
     non_blocking_capacity_factor: float | None,
     widths: _V41Widths = _FLASH_WIDTHS,
 ):
-    # Imported lazily: the V4 base package builds this package's vision
-    # module, so a module-level import would form a cycle.
-    from torchtitan_npu.models.deepseek_v4 import (
-        _make_v4_config,
-    )
+    from torchtitan_npu.models.deepseek_v4 import _make_v4_config
 
     vocab_size = 129280
-    config = _make_v4_config(
+    source_key_indexer_layers = tuple(
+        layer_id for layer_id in index_source_layers if layer_id in V41_KV_SOURCE_LAYERS
+    )
+    external_key_indexer_layers = tuple(
+        layer_id for layer_id in index_source_layers if layer_id not in V41_KV_SOURCE_LAYERS
+    )
+
+    base_config = _make_v4_config(
         dim=widths.dim,
         n_layers=n_layers,
         vocab_size=vocab_size,
@@ -122,11 +119,6 @@ def _make_v41_config(
         o_lora_rank=widths.o_lora_rank,
         n_groups=widths.n_groups,
         compress_ratios=compress_ratios,
-        kv_source_layers=V41_KV_SOURCE_LAYERS,
-        index_source_layers=index_source_layers,
-        candidate_source_layer=20,
-        candidate_topk_blocks=widths.candidate_topk_blocks,
-        candidate_block_size=8,
         window_size=128,
         norm_eps=1e-20,
         index_n_heads=widths.index_n_heads,
@@ -150,26 +142,40 @@ def _make_v41_config(
         rope_factor=16.0,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
+        compressor_owner_layers=V41_KV_SOURCE_LAYERS,
+        indexer_owner_layers=index_source_layers,
+        source_key_indexer_layers=source_key_indexer_layers,
+        external_key_indexer_layers=external_key_indexer_layers,
+        compressor_use_ape=False,
+        indexer_coff=1,
+        use_compress_rope_for_ratio_one=True,
         post_q_rms_norm=False,
         rotation="none",
     )
 
-    # The V4 base builder is decoder-only, so promote its config to the V4.1
-    # multimodal config (which carries the vision fields) before injecting the
-    # ViT and marker embeddings.
-    config = V41Model.Config(**{f.name: getattr(config, f.name) for f in dataclasses.fields(config)})
-    # V4.1 uses collapse_pre_mix instead of the V4 classic hc_head.
+    config = V41Model.Config(
+        **{f.name: getattr(base_config, f.name) for f in dataclasses.fields(base_config)},
+        kv_source_layers=V41_KV_SOURCE_LAYERS,
+        index_source_layers=index_source_layers,
+        candidate_source_layer=20,
+        candidate_topk_blocks=widths.candidate_topk_blocks,
+        candidate_block_size=8,
+    )
     config.hc_head = None
-    # Promote each layer to the V4.1 block type so the Single-Pass mHC
-    # forward (through __call__ / FSDP hooks) is used at runtime.
+    config.metadata_extension.materialized_ratios = (1,)
+
     from .block import DeepSeekV41TransformerBlock
 
-    config.layers = [
-        DeepSeekV41TransformerBlock.Config(
-            **{f.name: getattr(layer_cfg, f.name) for f in dataclasses.fields(layer_cfg)}
+    layers = []
+    for layer_cfg in config.layers:
+        attention_cfg = DeepSeekV41Attention.Config(
+            **{f.name: getattr(layer_cfg.attention, f.name) for f in dataclasses.fields(layer_cfg.attention)}
         )
-        for layer_cfg in config.layers
-    ]
+        block_kwargs = {f.name: getattr(layer_cfg, f.name) for f in dataclasses.fields(layer_cfg)}
+        block_kwargs["attention"] = attention_cfg
+        layers.append(DeepSeekV41TransformerBlock.Config(**block_kwargs))
+    config.layers = layers
+
     config.vision_encoder = DeepSeekV41VisionEncoder.Config(
         dim=widths.vision_dim,
         num_layers=32,
@@ -217,12 +223,7 @@ def deepseek_v41_debugmodel_config(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
 ):
-    """Reduced-width V4.1 shape for the deterministic golden-trajectory tests.
-
-    The real 40-layer structure (compression ratios, KV/index sources,
-    16 experts, vision depth, real vocabulary) with debug widths, so the
-    golden loss guard exercises every V4.1 code path quickly.
-    """
+    """Reduced-width shape retaining the real 40-layer compression topology."""
     return _make_v41_config(
         n_layers=40,
         compress_ratios=V41_FULL_COMPRESS_RATIOS,
@@ -240,7 +241,6 @@ def model_registry(
     non_blocking_capacity_factor: float | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
-    # Lazy: the V4 base package imports this package's vision module.
     from torchtitan_npu.models.deepseek_v4 import (
         _register_step_pre_hooks,
         parallelize_deepseek_v4,
