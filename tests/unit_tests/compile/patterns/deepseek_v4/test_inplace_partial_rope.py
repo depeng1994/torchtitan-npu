@@ -10,16 +10,19 @@ import torch
 from torch.fx.subgraph_rewriter import replace_pattern_with_filters
 
 _previous_pre_grad_pass = torch._inductor.config.pre_grad_custom_pass
-inplace_partial_rope = importlib.import_module("torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope")
 partial_interleaved_rope = importlib.import_module(
     "torchtitan_npu.compile.patterns.common.partial_interleaved_rope"
 )
 
-_make_parent_rope_pattern = lambda *, inverse: partial_interleaved_rope.PATTERNS[
+_get_generic_partial_pattern = lambda *, inverse: partial_interleaved_rope.PATTERNS[
     "partial_rope_wo_squeeze_forward" if not inverse else "partial_rope_wo_squeeze_inverse"
 ]
-_make_kv_rope_pattern = inplace_partial_rope._make_kv_rope_pattern
-_make_compressor_rope_pattern = inplace_partial_rope._make_compressor_rope_pattern
+_make_kv_rope_pattern = lambda: partial_interleaved_rope.PATTERNS[
+    "partial_rope_attention_kv_forward"
+]
+_make_compressor_rope_pattern = lambda: partial_interleaved_rope.PATTERNS[
+    "partial_rope_compressor_kv_forward"
+]
 
 
 def teardown_module():
@@ -27,13 +30,11 @@ def teardown_module():
 
 
 def _patch_inplace_rotary(monkeypatch, fake_op):
-    """Patch ``inplace_partial_rotary_mul`` in both enclosing modules.
+    """Patch ``inplace_partial_rotary_mul`` in the enclosing module.
 
-    Patterns created by ``make_partial_rope_pattern`` (``partial_interleaved_rope``
-    module) reference the name from *that* module's globals, while the compressor
-    pattern (``inplace_partial_rope`` module) references its own import.
+    All patterns now live in the ``partial_interleaved_rope`` module, so their
+    replacement closures reference the name from that module's globals.
     """
-    monkeypatch.setattr(inplace_partial_rope, "inplace_partial_rotary_mul", fake_op)
     monkeypatch.setattr(partial_interleaved_rope, "inplace_partial_rotary_mul", fake_op)
 
 
@@ -135,7 +136,7 @@ def test_partial_rope_replacement_matches_search_fragment(
     rotary_width,
 ):
     _patch_inplace_rotary(monkeypatch, _fake_inplace_partial_rotary_mul)
-    pattern = _make_parent_rope_pattern(
+    pattern = _get_generic_partial_pattern(
         inverse=inverse,
     )
     x = torch.randn(2, 3, 2, 4 + rotary_width, dtype=torch.bfloat16)
@@ -160,7 +161,7 @@ def test_replacement_calls_inplace_partial_rotary_mul(monkeypatch):
     x = torch.zeros(2, 3, 2, 8)
     cos = torch.ones(2, 3, 1, 4)
     sin = torch.zeros_like(cos)
-    pattern = _make_parent_rope_pattern(inverse=False)
+    pattern = _get_generic_partial_pattern(inverse=False)
 
     actual = pattern.replacement_fn(x, cos, sin)
 
@@ -178,7 +179,7 @@ def test_replacement_calls_inplace_partial_rotary_mul(monkeypatch):
 
 def test_search_pattern_ignores_shape_literals():
     _assert_pattern_matches(
-        _make_parent_rope_pattern(inverse=False),
+        _get_generic_partial_pattern(inverse=False),
         _partial_rope_with_different_literals,
     )
 
@@ -228,7 +229,7 @@ def test_compressor_replacement_matches_search_numerically(monkeypatch):
 
 
 def test_replacement_does_not_repeat_rope_cache():
-    pattern = _make_parent_rope_pattern(inverse=False)
+    pattern = _get_generic_partial_pattern(inverse=False)
 
     graph_module = torch.fx.symbolic_trace(pattern.replacement_fn)
 

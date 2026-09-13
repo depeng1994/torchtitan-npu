@@ -6,8 +6,9 @@
 """Generic interleaved partial-RoPE patterns (model-agnostic).
 
 Matches the canonical ``split -> decomposed interleaved RoPE -> cat`` fragment
-that appears in any model using partial RoPE (e.g. DeepSeek-V3 Q and
-DeepSeek-V4), and replaces it with ``inplace_partial_rotary_mul``.
+that appears in any model using partial RoPE (e.g. DeepSeek-V3 Q, DeepSeek-V4
+and DeepSeek-V4.1 which reuses the V4 attention/compressor layout), and
+replaces it with ``inplace_partial_rotary_mul``.
 
 This module exports a ``PATTERNS`` dict.  It does NOT register itself at
 import time — use ``pattern_manager.setup_patterns()`` for registration.
@@ -86,6 +87,39 @@ def make_partial_rope_pattern(
     )
 
 
+def _make_compressor_rope_pattern() -> PatternReplacement:
+    """Match compressor RoPE after its input shape is already materialized.
+
+    The broadcast-cache helper also reads the dynamic query shape. Keep that
+    producer-side metadata outside the matched subgraph so extra size users do
+    not make the pattern fail containment checks.
+    """
+
+    def search_fn(prefix, rotary_u, cos, sin):
+        rotary_float = rotary_u.float()
+        rotated = rotate_interleaved(rotary_float)
+        rotated = (rotary_float * cos + rotated * sin).type_as(rotary_u)
+        rotated = rotated.squeeze(0).squeeze(1)
+        return torch.cat([prefix, rotated], dim=-1)
+
+    def replacement_fn(prefix, rotary_u, cos, sin):
+        output = rotary_u.clone()
+        inplace_partial_rotary_mul(
+            output,
+            cos,
+            sin,
+            rotary_mode="interleave",
+            partial_slice=[0, cos.shape[-1]],
+        )
+        output = output.squeeze(0).squeeze(1)
+        return torch.cat([prefix, output], dim=-1)
+
+    return PatternReplacement(
+        search_fn=search_fn,
+        replacement_fn=replacement_fn,
+    )
+
+
 PATTERNS: dict[str, PatternReplacement] = {
     "partial_rope_wo_squeeze_forward": make_partial_rope_pattern(
         inverse=False,
@@ -97,4 +131,10 @@ PATTERNS: dict[str, PatternReplacement] = {
         unsqueeze_dims=(),
         squeeze_dims=(),
     ),
+    "partial_rope_attention_kv_forward": make_partial_rope_pattern(
+        inverse=False,
+        unsqueeze_dims=(2,),
+        squeeze_dims=(2,),
+    ),
+    "partial_rope_compressor_kv_forward": _make_compressor_rope_pattern(),
 }

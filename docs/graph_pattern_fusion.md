@@ -35,8 +35,8 @@ def make_pattern(*, inverse):
 
 
 PATTERNS = {
-    "dsv4_parent_rope_inverse": make_pattern(inverse=True),
-    "dsv4_parent_rope_forward": make_pattern(inverse=False),
+    "partial_rope_wo_squeeze_inverse": make_pattern(inverse=True),
+    "partial_rope_wo_squeeze_forward": make_pattern(inverse=False),
 }
 ```
 
@@ -54,7 +54,7 @@ PATTERNS = {
 - 多个结构变体用一个 factory 生成多个 `PatternReplacement`，然后一次注册。
 
 完整实现参考
-`torchtitan_npu/compile/patterns/deepseek_v4/inplace_partial_rope.py`。
+`torchtitan_npu/compile/patterns/common/partial_interleaved_rope.py`。
 
 ## 启用和验证
 

@@ -107,11 +107,7 @@ class TrainerEx(Trainer):
 
     def __init__(self, config: Config):
         compile_extension = config.compile.extension
-        if (
-            config.compile.enable
-            and "model" in config.compile.components
-            and config.compile.backend == "inductor"
-        ):
+        if config.compile.enable and "model" in config.compile.components and config.compile.backend == "inductor":
             self._ensure_decomposed_rope(config)
             setup_patterns(
                 enable_patterns=compile_extension.enable_patterns,

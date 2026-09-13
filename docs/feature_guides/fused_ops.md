@@ -9,7 +9,7 @@
 | --- | --- | --- | --- |
 | 融合算子对应完整可配置组件 | `override` + `ops` | 整体替换组件；已有设备算子可由 replacement 直接调用 | [`torch_npu.npu_rms_norm`](../../torchtitan_npu/override/common/rms_norm.py) |
 | 融合算子是可配置组件的一部分 | `override` + `ops` | 只替换组件中的对应逻辑，其余逻辑沿用上游实现 | [`npu_moe_token_unpermute`](../../torchtitan_npu/ops/ascendc/moe_token_unpermute.py)（接入：[`torchtitan_npu.override.common.token_dispatcher.asc`](../../torchtitan_npu/override/common/token_dispatcher.py)） |
-| 融合算子是一段可被 `torch.compile` 捕获的连续计算 | pre-AOT pattern | 在 `compile/patterns/` 中替换编译图中的片段 | [`inplace_partial_rotary_mul`](../../torchtitan_npu/compile/patterns/deepseek_v4/inplace_partial_rope.py) |
+| 融合算子是一段可被 `torch.compile` 捕获的连续计算 | pre-AOT pattern | 在 `compile/patterns/` 中替换编译图中的片段 | [`inplace_partial_rotary_mul`](../../torchtitan_npu/compile/patterns/common/partial_interleaved_rope.py) |
 
 `torch.library.custom_op` 只是 `ops` 实现需要进入 `torch.compile` 图时的兼容封装，不改变上述两种
 组件替换方式。仅替换编译图片段时，使用 pre-AOT pattern。

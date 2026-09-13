@@ -140,7 +140,7 @@ flowchart TD
 | FX tracer/replay | `torchtitan/experiments/graph_trainer/make_fx_tracer.py`、`torchtitan/experiments/graph_trainer/trainer.py` |
 | SimpleFSDP | `torchtitan/experiments/graph_trainer/simple_fsdp.py` |
 | 函数式 compressor | `torchtitan_npu/models/deepseek_v4/compressor.py` |
-| RoPE compiler pattern | `torchtitan_npu/compile/patterns/deepseek_v4/inplace_partial_rope.py` |
+| RoPE compiler pattern | `torchtitan_npu/compile/patterns/common/partial_interleaved_rope.py` |
 | 重算单测 | `tests/unit_tests/compile/patterns/deepseek_v4/test_recompute_policy.py` |
 
 ## 7. 结论

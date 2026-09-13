@@ -24,9 +24,6 @@ from torchtitan_npu.compile.pattern_replacement import (
 )
 from torchtitan_npu.override.common.rope import DecomposedComplexRoPE
 
-inplace_partial_rope = importlib.import_module(
-    "torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope"
-)
 partial_interleaved_rope = importlib.import_module(
     "torchtitan_npu.compile.patterns.common.partial_interleaved_rope"
 )
@@ -36,8 +33,7 @@ interleaved_rope = importlib.import_module(
 
 
 def _patch_inplace_rotary(monkeypatch, fake_op):
-    """Patch ``inplace_partial_rotary_mul`` in both enclosing modules."""
-    monkeypatch.setattr(inplace_partial_rope, "inplace_partial_rotary_mul", fake_op)
+    """Patch ``inplace_partial_rotary_mul`` in the enclosing module."""
     monkeypatch.setattr(partial_interleaved_rope, "inplace_partial_rotary_mul", fake_op)
 
 
@@ -182,8 +178,8 @@ def test_partial_blacklisted_generic_takes_over(monkeypatch):
         pattern_blacklist=(
             "partial_rope_wo_squeeze_forward",
             "partial_rope_wo_squeeze_inverse",
-            "dsv4_partial_rope_attention_kv_forward",
-            "dsv4_partial_rope_compressor_kv_forward",
+            "partial_rope_attention_kv_forward",
+            "partial_rope_compressor_kv_forward",
         ),
     )
 

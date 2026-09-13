@@ -39,7 +39,8 @@ def test_setup_patterns_registers_builtin_patterns(isolated_pass):
     pattern_manager.setup_patterns(enable_patterns=True)
 
     assert "partial_rope_wo_squeeze_forward" in isolated_pass._patterns
-    assert "npu_interleaved_rope" in isolated_pass._patterns
+    assert "partial_rope_attention_kv_forward" in isolated_pass._patterns
+    assert "partial_rope_compressor_kv_forward" in isolated_pass._patterns
     installed = get_custom_graph_passes(torch._inductor.config.pre_grad_custom_pass)
     assert isolated_pass in installed
 
@@ -66,8 +67,8 @@ def test_setup_patterns_blacklist_all_keeps_decomposed_graph(isolated_pass):
         pattern_blacklist=(
             "partial_rope_wo_squeeze_forward",
             "partial_rope_wo_squeeze_inverse",
-            "dsv4_partial_rope_attention_kv_forward",
-            "dsv4_partial_rope_compressor_kv_forward",
+            "partial_rope_attention_kv_forward",
+            "partial_rope_compressor_kv_forward",
             "npu_interleaved_rope",
         ),
     )
@@ -92,11 +93,11 @@ def test_setup_patterns_policy_transitions_replace_patterns(isolated_pass):
     all_names = {
         "partial_rope_wo_squeeze_forward",
         "partial_rope_wo_squeeze_inverse",
-        "dsv4_partial_rope_attention_kv_forward",
-        "dsv4_partial_rope_compressor_kv_forward",
+        "partial_rope_attention_kv_forward",
+        "partial_rope_compressor_kv_forward",
         "npu_interleaved_rope",
     }
-    dsv4_names = all_names - {"npu_interleaved_rope"}
+    partial_only_names = all_names - {"npu_interleaved_rope"}
 
     # all -> disabled
     pattern_manager.setup_patterns(enable_patterns=True)
@@ -107,7 +108,7 @@ def test_setup_patterns_policy_transitions_replace_patterns(isolated_pass):
     # disabled -> blacklist (DSV4 patterns only)
     pattern_manager.setup_patterns(
         enable_patterns=True,
-        pattern_blacklist=tuple(sorted(dsv4_names)),
+        pattern_blacklist=tuple(sorted(partial_only_names)),
     )
     assert set(isolated_pass._patterns) == {"npu_interleaved_rope"}
 
@@ -163,15 +164,15 @@ def test_common_partial_interleaved_module_exports_named_patterns():
     assert set(module.PATTERNS) == {
         "partial_rope_wo_squeeze_forward",
         "partial_rope_wo_squeeze_inverse",
+        "partial_rope_attention_kv_forward",
+        "partial_rope_compressor_kv_forward",
     }
 
 
-def test_dsv4_pattern_module_exports_named_patterns():
+def test_common_partial_interleaved_module_exports_attention_kv_and_compressor():
     module = importlib.import_module(
-        "torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope"
+        "torchtitan_npu.compile.patterns.common.partial_interleaved_rope"
     )
 
-    assert set(module.PATTERNS) == {
-        "dsv4_partial_rope_attention_kv_forward",
-        "dsv4_partial_rope_compressor_kv_forward",
-    }
+    assert "partial_rope_attention_kv_forward" in module.PATTERNS
+    assert "partial_rope_compressor_kv_forward" in module.PATTERNS

@@ -36,9 +36,7 @@ def _search_interleaved_rope(x, cos, sin):
 
 def _replace_interleaved_rope(x, cos, sin):
     """Replace with a single npu_rotary_mul call."""
-    return torch_npu.npu_rotary_mul(
-        x.float(), cos, sin, rotary_mode="interleave"
-    ).type_as(x)
+    return torch_npu.npu_rotary_mul(x.float(), cos, sin, rotary_mode="interleave").type_as(x)
 
 
 PATTERNS: dict[str, PatternReplacement] = {

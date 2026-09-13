@@ -4,14 +4,17 @@
 [片段融合算子接入](../../../docs/graph_pattern_fusion.md)。
 
 Pattern 在训练启动时由 `torchtitan_npu.compile.pattern_manager` 自动发现并注册，
-不需要手工设置 Python module path。通用 partial RoPE 模式（shape-agnostic split →
-interleaved RoPE → cat）先于 DSV4 特有 shape（KV/compressor unsqueeze/squeeze）
-注册，generic full-tensor fallback 最后注册。
+不需要手工设置 Python module path。通用 partial RoPE 模式全部位于
+`common/partial_interleaved_rope.py`（shape-agnostic split → interleaved RoPE →
+cat，以及 attention-KV / compressor 的 unsqueeze/squeeze 变体），
+generic full-tensor fallback 在 `common/interleaved_rope.py` 最后注册。
 
-## DeepSeek-V4 Inplace Partial RoPE
+## Partial Interleaved RoPE
 
-该 pattern 将 DeepSeek-V4 中的 interleaved RoPE 小算子片段替换为
-`inplace_partial_rotary_mul`。
+该 pattern 将模型中的 interleaved RoPE 小算子片段替换为
+`inplace_partial_rotary_mul`。匹配逻辑与模型无关：任何采用
+`split -> decomposed interleaved RoPE -> cat` 结构的模型（如 DeepSeek-V3 Q、
+DeepSeek-V4 / V4.1）都会命中。
 
 ### 启用
 

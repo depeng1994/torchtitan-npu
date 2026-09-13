@@ -23,11 +23,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Stable registration order: model-generic partial fusion before model-specific
-# shape variants, before the generic full-tensor fallback.
+# Stable registration order: generic partial fusion patterns (including the
+# attention-KV and compressor variants shared across the V4 model family)
+# before the generic full-tensor fallback.
 _BUILTIN_PATTERN_MODULES: tuple[str, ...] = (
     "torchtitan_npu.compile.patterns.common.partial_interleaved_rope",
-    "torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope",
     "torchtitan_npu.compile.patterns.common.interleaved_rope",
 )
 
@@ -53,8 +53,7 @@ def _discover_builtin_patterns() -> dict[str, PatternReplacement]:
         duplicates = sorted(set(patterns) & set(module_patterns))
         if duplicates:
             raise ValueError(
-                "Duplicate NPU pattern name(s) across pattern modules: "
-                f"{duplicates} (module {module_path})"
+                f"Duplicate NPU pattern name(s) across pattern modules: {duplicates} (module {module_path})"
             )
         patterns.update(module_patterns)
     return patterns
@@ -82,16 +81,12 @@ def setup_patterns(
     skipped: list[str] = []
     if blacklist:
         skipped = [name for name in all_patterns if name in blacklist]
-        selected = {
-            name: p for name, p in all_patterns.items() if name not in blacklist
-        }
+        selected = {name: p for name, p in all_patterns.items() if name not in blacklist}
         unknown = sorted(blacklist - set(all_patterns))
         for name in skipped:
             logger.info("NPU pattern %s skipped (blacklisted)", name)
         for name in unknown:
-            logger.warning(
-                "NPU pattern %s blacklisted but not registered (typo?)", name
-            )
+            logger.warning("NPU pattern %s blacklisted but not registered (typo?)", name)
     else:
         selected = all_patterns
 
