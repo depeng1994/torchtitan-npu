@@ -44,18 +44,14 @@ def test_ratio_one_materialization_is_explicit_policy() -> None:
     )
     expected = torch.tensor(
         [
-            [
-                [
-                    [True, False, False, False, False],
-                    [True, True, False, False, False],
-                    [False, False, True, False, False],
-                    [False, False, True, True, False],
-                    [False, False, True, True, True],
-                ]
-            ]
+            [True, False, False, False, False],
+            [True, True, False, False, False],
+            [False, False, True, False, False],
+            [False, False, True, True, False],
+            [False, False, True, True, True],
         ],
         dtype=torch.bool,
-    )
+    ).unsqueeze(0).unsqueeze(0)
     torch.testing.assert_close(ratio_one.dense_mask, expected, rtol=0, atol=0)
 
 
