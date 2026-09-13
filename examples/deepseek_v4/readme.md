@@ -73,19 +73,12 @@ COMPILE_BACKEND=aot_eager bash examples/deepseek_v4/debug/deepseek_v41_flash_8p_
 
 该入口默认 `--checkpoint.no-enable`（不保存也不加载）；需要 checkpoint 时用 CLI 显式打开。
 
-#### V4.1 Golden 开关
+#### V4.1 支持矩阵
 
-只有一个开关：**`USE_GOLDEN`**（默认 `1`）。
-
-| 值 | 走哪条路 | 什么时候用 |
+| 路径 | 状态 | 说明 |
 |---|---|---|
-| `USE_GOLDEN=1`（默认） | 参考算子：纯 Torch 的 RoPE / 稀疏注意力 / 逐专家 MoE，与推理基线逐位对齐 | 复现冻结 Stage-01 基线、对拍、比赛验收 |
-| `USE_GOLDEN=0` | AscendC 融合算子 | 训练吞吐优先，数值不再与推理基线逐位对齐 |
-
-```sh
-bash examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh                 # golden
-USE_GOLDEN=0 bash examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh    # AscendC
-```
+| reference/golden (`USE_GOLDEN=1`) | ✅ **支持** | 与冻结基线逐位对齐（stage-01 golden） |
+| AscendC 融合算子 (`USE_GOLDEN=0`) | ❌ **暂不支持** | V4.1 的 CSA2 ratio-1 shared global KV 尚未在 AscendC 稀疏注意力核中实现 |
 
 实现：`USE_GOLDEN=1` 时 launcher 只装入一个 override ——
 `torchtitan_npu.override.common.golden`，它一次性装好 RoPE workaround、纯 Torch 稀疏注意力与

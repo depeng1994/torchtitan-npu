@@ -129,8 +129,7 @@ class V41Model(DeepSeekV4Model):
             image_spans = None
         elif image_spans.ndim == 3:
             image_spans = image_spans.flatten(0, 1)
-        safe_tokens = tokens.clamp_max(self.vocab_size - 1)
-        hidden = self.tok_embeddings(safe_tokens)
+        hidden = self.tok_embeddings(tokens)
         # Under CP, a rank can own no image-token slots while the visual
         # parameters remain replicated. Run the same ViT graph on every rank so
         # replicated vision weights receive identical gradients; scattering is

@@ -49,10 +49,17 @@ GBS=8
 STEPS=40
 
 # Debug
-# USE_GOLDEN is the only switch this entry needs: it selects the reference
-# operators (the exact arithmetic the frozen Stage-01 baseline uses) in place
-# of the AscendC kernels.  USE_GOLDEN=0 runs the AscendC path instead.
+# DeepSeek-V4.1 uses the golden/reference path only: its ratio-1 CSA2 shared
+# global KV contract is not yet supported by the AscendC sparse-attention
+# kernels.  USE_GOLDEN=0 (the AscendC path) is rejected below.
 export USE_GOLDEN="${USE_GOLDEN:-1}"
+if [[ "${USE_GOLDEN}" != "1" ]]; then
+    echo "FATAL: DeepSeek-V4.1 currently supports the golden/reference path only."
+    echo "The AscendC sparse-attention path does not yet accept the V4.1"
+    echo "ratio-1 shared global KV contract (CSA2 layer 20-39)."
+    echo "Set USE_GOLDEN=1 (default) or unset USE_GOLDEN."
+    exit 2
+fi
 DEBUG_ARGS="
     --debug.no-moe-force-load-balance
     --debug.print-config
@@ -141,28 +148,12 @@ OPTIMIZER_OVERRIDES="
     torchtitan_npu.override.common.optimizer.virtual
 "
 
-if [[ "${USE_GOLDEN}" == "1" ]]; then
-    # Three modules make up the golden stack; each one is registered in the
-    # override registry, so all three have to be named here.
-    NPU_OPS_OVERRIDES=(
-        torchtitan_npu.override.common.rope.workaround
-        torchtitan_npu.override.deepseek_v4.sparse_attn.golden
-        torchtitan_npu.override.deepseek_v41.golden_moe.golden
-    )
-else
-    NPU_OPS_OVERRIDES=(
-        # Attention / DSA
-        torchtitan_npu.override.common.rms_norm.asc
-        torchtitan_npu.override.common.rope.asc_complex
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc
-        # MHC
-        torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre
-        torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post
-        # MoE token dispatcher
-        torchtitan_npu.override.common.token_dispatcher.asc
-    )
-fi
+# Only the golden/reference path is supported (see the USE_GOLDEN guard above).
+NPU_OPS_OVERRIDES=(
+    torchtitan_npu.override.common.rope.workaround
+    torchtitan_npu.override.deepseek_v4.sparse_attn.golden
+    torchtitan_npu.override.deepseek_v41.golden_moe.golden
+)
 
 MODULE="${MODULE}" \
 CONFIG="${CONFIG}" \
