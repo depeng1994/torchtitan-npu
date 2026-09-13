@@ -217,12 +217,16 @@ def _make_v4_attn_config(
     index_head_dim: int,
     index_topk: int,
     rope: RoPE.Config,
-    v41_mode: bool = False,
-    is_kv_source: bool = True,
-    is_index_source: bool = False,
+    owns_compressor: bool | None = None,
+    owns_indexer: bool | None = None,
+    compressor_use_ape: bool = True,
+    indexer_coff: int = 2,
+    indexer_source_key: bool = False,
+    indexer_external_key: bool = False,
     post_q_rms_norm: bool = True,
     rotation: str = "hadamard",
 ) -> Attention.Config:
+    """Build attention from version-neutral ownership and key-source policy."""
     hd = head_dim
     per_group_in = (n_heads * hd) // n_groups
     per_group_out = n_groups * o_lora_rank
@@ -230,8 +234,13 @@ def _make_v4_attn_config(
     compressor_cfg = None
     indexer_cfg = None
 
-    owns_compressor = compress_ratio > 1 if not v41_mode else is_kv_source
-    owns_indexer = compress_ratio == 4 if not v41_mode else is_index_source
+    if owns_compressor is None:
+        owns_compressor = compress_ratio > 1
+    if owns_indexer is None:
+        owns_indexer = compress_ratio == 4
+    if indexer_source_key and indexer_external_key:
+        raise ValueError("an indexer cannot own its source-key projection and consume an external key at the same time")
+
     if owns_compressor:
         coff = 2 if compress_ratio == 4 else 1
         compressor_cfg = _make_compressor_config(
@@ -242,7 +251,7 @@ def _make_v4_attn_config(
             norm_eps=norm_eps,
             coff=coff,
             rope=rope,
-            use_ape=not v41_mode,
+            use_ape=compressor_use_ape,
         )
     if owns_indexer:
         indexer_cfg = _make_indexer_config(
@@ -254,9 +263,9 @@ def _make_v4_attn_config(
             compress_ratio=compress_ratio,
             norm_eps=norm_eps,
             rope=rope,
-            coff=1 if v41_mode else 2,
-            source_key=v41_mode and is_kv_source,
-            source_head_dim=hd if v41_mode else None,
+            coff=indexer_coff,
+            source_key=indexer_source_key,
+            source_head_dim=hd if (indexer_source_key or indexer_external_key) else None,
             rotation=rotation,
         )
     inner_attention_cfg = CompressedSparseInnerAttention.Config(
@@ -322,17 +331,12 @@ def _make_v4_attn_config(
             bias=False,
             param_init=_LINEAR_INIT,
         ),
-        # ``attn_sink`` is a bare ``[n_heads]`` fp32 parameter on the
-        # attention module, initialized via the config-side param_init.
         param_init=_SINK_INIT,
         compressor=compressor_cfg,
         indexer=indexer_cfg,
     )
 
 
-# SwiGLU gate/up clamp shared by all DSV4 flavors; 10.0 is the transformers
-# config default (``swiglu_limit: float = 10.0``) and the inference repo's
-# ``config.json`` value. Zero disables the clamp.
 _SWIGLU_LIMIT = 10.0
 
 
@@ -427,8 +431,13 @@ def _build_v4_layers(
     hc_mult: int = 4,
     sinkhorn_iters: int = 20,
     hc_eps: float = 1e-6,
-    kv_source_layers: tuple[int, ...] | None = None,
-    index_source_layers: tuple[int, ...] | None = None,
+    compressor_owner_layers: tuple[int, ...] | None = None,
+    indexer_owner_layers: tuple[int, ...] | None = None,
+    source_key_indexer_layers: tuple[int, ...] = (),
+    external_key_indexer_layers: tuple[int, ...] = (),
+    compressor_use_ape: bool = True,
+    indexer_coff: int = 2,
+    use_compress_rope_for_ratio_one: bool = False,
     post_q_rms_norm: bool = True,
     rotation: str = "hadamard",
 ) -> list[DeepSeekV4TransformerBlock.Config]:
@@ -437,11 +446,8 @@ def _build_v4_layers(
     layers = []
     for layer_id in range(n_layers):
         cr = compress_ratios[layer_id]
-        v41_mode = kv_source_layers is not None
-        is_kv_source = not v41_mode or layer_id in kv_source_layers
-        is_index_source = (
-            cr == 4 if not v41_mode else index_source_layers is not None and layer_id in index_source_layers
-        )
+        owns_compressor = cr > 1 if compressor_owner_layers is None else layer_id in compressor_owner_layers
+        owns_indexer = cr == 4 if indexer_owner_layers is None else layer_id in indexer_owner_layers
 
         attn_cfg = _make_v4_attn_config(
             dim=dim,
@@ -457,10 +463,13 @@ def _build_v4_layers(
             index_n_heads=index_n_heads,
             index_head_dim=index_head_dim,
             index_topk=index_topk,
-            rope=rope_compress if cr > 1 or (v41_mode and cr == 1) else rope,
-            v41_mode=v41_mode,
-            is_kv_source=is_kv_source,
-            is_index_source=is_index_source,
+            rope=rope_compress if cr > 1 or (use_compress_rope_for_ratio_one and cr == 1) else rope,
+            owns_compressor=owns_compressor,
+            owns_indexer=owns_indexer,
+            compressor_use_ape=compressor_use_ape,
+            indexer_coff=indexer_coff,
+            indexer_source_key=layer_id in source_key_indexer_layers,
+            indexer_external_key=layer_id in external_key_indexer_layers,
             post_q_rms_norm=post_q_rms_norm,
             rotation=rotation,
         )
@@ -628,11 +637,13 @@ def _make_v4_config(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     num_mtp_layers: int = 0,
-    kv_source_layers: tuple[int, ...] | None = None,
-    index_source_layers: tuple[int, ...] | None = None,
-    candidate_source_layer: int | None = None,
-    candidate_topk_blocks: int = 2048,
-    candidate_block_size: int = 8,
+    compressor_owner_layers: tuple[int, ...] | None = None,
+    indexer_owner_layers: tuple[int, ...] | None = None,
+    source_key_indexer_layers: tuple[int, ...] = (),
+    external_key_indexer_layers: tuple[int, ...] = (),
+    compressor_use_ape: bool = True,
+    indexer_coff: int = 2,
+    use_compress_rope_for_ratio_one: bool = False,
     post_q_rms_norm: bool = True,
     rotation: str = "hadamard",
 ) -> DeepSeekV4Model.Config:
@@ -686,8 +697,13 @@ def _make_v4_config(
         hc_mult=hc_mult,
         sinkhorn_iters=sinkhorn_iters,
         hc_eps=hc_eps,
-        kv_source_layers=kv_source_layers,
-        index_source_layers=index_source_layers,
+        compressor_owner_layers=compressor_owner_layers,
+        indexer_owner_layers=indexer_owner_layers,
+        source_key_indexer_layers=source_key_indexer_layers,
+        external_key_indexer_layers=external_key_indexer_layers,
+        compressor_use_ape=compressor_use_ape,
+        indexer_coff=indexer_coff,
+        use_compress_rope_for_ratio_one=use_compress_rope_for_ratio_one,
         post_q_rms_norm=post_q_rms_norm,
         rotation=rotation,
     )
@@ -738,11 +754,6 @@ def _make_v4_config(
             param_init=_HC_PARAM_INIT,
         ),
         mtp_layers=mtp_layers,
-        kv_source_layers=kv_source_layers,
-        index_source_layers=index_source_layers,
-        candidate_source_layer=candidate_source_layer,
-        candidate_topk_blocks=candidate_topk_blocks,
-        candidate_block_size=candidate_block_size,
     )
 
 
