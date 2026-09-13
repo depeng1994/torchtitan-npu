@@ -12,7 +12,11 @@ from torchtitan_npu.config import TrainingConfig
 from torchtitan_npu.extensions.profiler import CANNProfiler
 from torchtitan_npu.extensions.trainer import TrainerEx
 
-from .config import DeepSeekV41CropConfig, DeepSeekV41FullLayerConfig
+from .config import (
+    DeepSeekV41CropConfig,
+    DeepSeekV41DebugConfig,
+    DeepSeekV41FullLayerConfig,
+)
 from .model_registry import model_registry
 
 # Imported lazily: `deepseek_v4.config_registry` and this package must not
@@ -60,9 +64,10 @@ def _build_v41_trainer_config(flavor: str, crop: DeepSeekV41CropConfig) -> Train
             patch_count=64,
             image_span_start=8,
             image_paths=DEFAULT_VISION_IMAGE_PATHS,
-            tokenizer_path=os.environ.get(
-                "DSV4_TOKENIZER_PATH", "/data/tokenizer/dsv4_tokenizer"
-            ),
+            # Deterministic synthetic token stream unless a tokenizer is
+            # explicitly provided (the golden test suite points this at the
+            # committed tests/assets/deepseek_v3 mini tokenizer).
+            tokenizer_path=os.environ.get("DSV4_TOKENIZER_PATH"),
             text=os.environ.get(
                 "DSV4_VISION_TEXT", "Describe the image."
             ),
@@ -112,6 +117,22 @@ def deepseek_v4_1_flash_40layers_16experts_vision() -> TrainerEx.Config:
         "deepseek_v4_1_flash_40layers_16experts_vision",
         DeepSeekV41FullLayerConfig(
             hidden_size=5120,
+            vision_layers=32,
+        ),
+    )
+
+
+def deepseek_v4_1_debugmodel() -> TrainerEx.Config:
+    """Reduced-width full-structure V4.1 shape for the golden trajectory tests.
+
+    The real 40-layer compression/source structure and vision depth with
+    debug widths, so the deterministic golden loss guard exercises every
+    V4.1 code path quickly.
+    """
+    return _build_v41_trainer_config(
+        "deepseek_v4_1_debugmodel",
+        DeepSeekV41DebugConfig(
+            hidden_size=512,
             vision_layers=32,
         ),
     )

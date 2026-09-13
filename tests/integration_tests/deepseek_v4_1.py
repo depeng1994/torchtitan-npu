@@ -5,11 +5,12 @@
 
 from tests.integration_tests import OverrideDefinitions
 
-# DeepSeek-V4.1 golden reference recipe: the 8p FSDP8+EP8 baseline whose
-# forward was verified boundary-by-boundary (torch.equal + SHA256) against
-# the ds-code inference implementation.  The checked-in loss trajectory
-# (tests/assets/losses/dsv41_golden_8p_ep8.txt) pins the deterministic
-# 100-step run of exactly this recipe.
+# DeepSeek-V4.1 golden reference recipe: the same operator overrides the
+# real-width baseline was verified with (forward verified boundary-by-boundary
+# against the ds-code inference implementation).  The case runs the
+# reduced-width full-structure debug model (real 40-layer compression/source
+# layout, debug widths) and pins its deterministic 100-step loss trajectory
+# in tests/assets/losses/dsv41_golden_8p_ep8.txt.
 GOLDEN_OVERRIDES = (
     "--override.imports",
     "torchtitan_npu.override.common.rope.workaround",
@@ -19,16 +20,19 @@ GOLDEN_OVERRIDES = (
 )
 
 # Environment of the frozen baseline.  MODULE/CONFIG route the trainer to
-# the V4.1 multimodal model regardless of the runner's CLI defaults (per-case
-# env vars take precedence); the golden vision switches select the SDPA
-# baseline attention and golden training path; the fixture image is the
-# committed tests/assets copy.
+# the V4.1 multimodal debug model regardless of the runner's CLI defaults
+# (per-case env vars take precedence); the golden vision switches select the
+# SDPA baseline attention and golden training path; the fixture image is the
+# committed tests/assets copy; the dataloader tokenizer is the committed
+# tests/assets/deepseek_v3 mini tokenizer (the same one the DeepSeek-V4
+# golden cases use).
 GOLDEN_ENV = {
     "MODULE": "torchtitan_npu.models.deepseek_v4_1",
-    "CONFIG": "deepseek_v4_1_flash_40layers_16experts_vision",
+    "CONFIG": "deepseek_v4_1_debugmodel",
     "TORCHTITAN_NPU_VISION_GOLDEN": "1",
     "TORCHTITAN_NPU_VISION_SDPA_BASELINE": "1",
     "TORCHTITAN_NPU_GOLDEN_TRAINING": "1",
+    "DSV4_TOKENIZER_PATH": "tests/assets/deepseek_v3",
     "DSV4_VISION_IMAGE_PATHS": "tests/assets/dsv4_vit_test.jpeg",
     "DSV4_VISION_LAYERS": "32",
     "DSV4_TRAIN_GOLDEN_REDUCED": "0",
@@ -55,7 +59,7 @@ def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
                     "--parallelism.pipeline-parallel-degree=1",
                     "--parallelism.context-parallel-load-balancer=None",
                     "--debug.no-moe-force-load-balance",
-                    "--hf-assets-path=tests/assets/deepseek_v4_1",
+                    "--hf-assets-path=tests/assets/deepseek_v3",
                     "--optimizer.implementation=fused",
                     "--optimizer.param-groups.0.optimizer-name=AdamW",
                     "--optimizer.param-groups.0.optimizer-kwargs.lr=1e-5",
@@ -75,7 +79,7 @@ def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
                     "--metrics.disable-color-printing",
                 )
             ],
-            test_descr="DeepSeek-V4.1 golden 8p fsdp8 ep8 exact loss",
+            test_descr="DeepSeek-V4.1 golden debugmodel 8p fsdp8 ep8 exact loss",
             test_name="dsv41_golden_8p_ep8",
             ngpu=8,
             env_vars=GOLDEN_ENV,

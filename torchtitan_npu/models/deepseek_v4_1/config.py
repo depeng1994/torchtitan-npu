@@ -81,6 +81,20 @@ class DeepSeekV41FullLayerConfig(DeepSeekV41CropConfig):
 
 
 @dataclass(frozen=True, slots=True)
+class DeepSeekV41DebugConfig(DeepSeekV41FullLayerConfig):
+    """Reduced-width full-structure shape for deterministic golden trajectories.
+
+    Identical 40-layer decoder, compression ratios, KV/index sources,
+    vision depth and expert layout to the full shape; only the hidden
+    width (and the candidate selection budget, which only makes sense
+    relative to the sequence length) is scaled down.
+    """
+
+    hidden_size: int = 512
+    candidate_topk_blocks: int = 4
+
+
+@dataclass(frozen=True, slots=True)
 class DeepSeekV41FullScaleProfile:
     """Reference-scale shape metadata; never selected by the 8-card launcher."""
 
