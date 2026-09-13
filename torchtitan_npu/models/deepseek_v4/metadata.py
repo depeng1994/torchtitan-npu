@@ -265,8 +265,6 @@ def build_kernel_layout(
                 gather_indices=None,
             )
             continue
-        if ratio <= 1:
-            raise ValueError(f"invalid compressed ratio={ratio}")
         c_lens = [length // ratio for length in lengths]
         cu_seqs = torch.cat(
             [

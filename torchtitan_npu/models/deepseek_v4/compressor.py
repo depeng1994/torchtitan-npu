@@ -233,8 +233,6 @@ class Compressor(Module):
                 f"got {type(attention_masks)}."
             )
         ratio = self.compress_ratio
-        if ratio == 1:
-            return self.norm(self.wkv(x))
         plan = attention_masks.plans.get(ratio)
         if plan is None or plan.gather_indices is None:
             raise ValueError(f"No compressor plan for ratio={ratio}")
