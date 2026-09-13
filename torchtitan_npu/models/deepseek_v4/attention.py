@@ -411,7 +411,10 @@ class Attention(BaseAttention):
             index_q=idx_q,
             index_k=idx_k,
             index_weight=idx_w,
-            compress_ratio=self.compress_ratio,
+            # None means "use the core's own configured ratio".  This keeps
+            # the default V4 ratio-4 path responsible for its local Top-K;
+            # derived cross-layer policies set an explicit active ratio.
+            compress_ratio=None,
         )
 
     def _apply_sparse_attention(
