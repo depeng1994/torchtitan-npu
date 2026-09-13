@@ -65,7 +65,7 @@ Inductor 默认自动注册所有 NPU pre-AOT patterns。如需禁用或黑名�
 --compile.extension.no-enable-patterns
 
 # 黑名单指定 pattern（仅阻止目标 pattern；其余自动注册）
---compile.extension.pattern-blacklist dsv4_partial_rope_wo_squeeze_forward
+--compile.extension.pattern-blacklist partial_rope_wo_squeeze_forward
 ```
 
 验证时确认 pattern 匹配数量、正反向数值、loss/grad norm，并通过 profiling 检查融合算子

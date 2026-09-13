@@ -161,8 +161,8 @@ pattern module 不再在 import 时直接调用 `register_pre_aot_patterns()`。
 
 ```python
 PATTERNS = {
-    "dsv4_partial_rope_wo_squeeze_inverse": ...,
-    "dsv4_partial_rope_wo_squeeze_forward": ...,
+    "partial_rope_wo_squeeze_inverse": ...,
+    "partial_rope_wo_squeeze_forward": ...,
     "dsv4_partial_rope_attention_kv_forward": ...,
     "dsv4_partial_rope_compressor_kv_forward": ...,
 }

@@ -11,14 +11,30 @@ from torch.fx.subgraph_rewriter import replace_pattern_with_filters
 
 _previous_pre_grad_pass = torch._inductor.config.pre_grad_custom_pass
 inplace_partial_rope = importlib.import_module("torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope")
+partial_interleaved_rope = importlib.import_module(
+    "torchtitan_npu.compile.patterns.common.partial_interleaved_rope"
+)
 
-_make_parent_rope_pattern = inplace_partial_rope._make_parent_rope_pattern
+_make_parent_rope_pattern = lambda *, inverse: partial_interleaved_rope.PATTERNS[
+    "partial_rope_wo_squeeze_forward" if not inverse else "partial_rope_wo_squeeze_inverse"
+]
 _make_kv_rope_pattern = inplace_partial_rope._make_kv_rope_pattern
 _make_compressor_rope_pattern = inplace_partial_rope._make_compressor_rope_pattern
 
 
 def teardown_module():
     torch._inductor.config.pre_grad_custom_pass = _previous_pre_grad_pass
+
+
+def _patch_inplace_rotary(monkeypatch, fake_op):
+    """Patch ``inplace_partial_rotary_mul`` in both enclosing modules.
+
+    Patterns created by ``make_partial_rope_pattern`` (``partial_interleaved_rope``
+    module) reference the name from *that* module's globals, while the compressor
+    pattern (``inplace_partial_rope`` module) references its own import.
+    """
+    monkeypatch.setattr(inplace_partial_rope, "inplace_partial_rotary_mul", fake_op)
+    monkeypatch.setattr(partial_interleaved_rope, "inplace_partial_rotary_mul", fake_op)
 
 
 def _fake_inplace_partial_rotary_mul(
@@ -118,11 +134,7 @@ def test_partial_rope_replacement_matches_search_fragment(
     inverse,
     rotary_width,
 ):
-    monkeypatch.setattr(
-        inplace_partial_rope,
-        "inplace_partial_rotary_mul",
-        _fake_inplace_partial_rotary_mul,
-    )
+    _patch_inplace_rotary(monkeypatch, _fake_inplace_partial_rotary_mul)
     pattern = _make_parent_rope_pattern(
         inverse=inverse,
     )
@@ -144,11 +156,7 @@ def test_replacement_calls_inplace_partial_rotary_mul(monkeypatch):
         calls.append((x, cos, sin, rotary_mode, partial_slice))
         x.add_(1)
 
-    monkeypatch.setattr(
-        inplace_partial_rope,
-        "inplace_partial_rotary_mul",
-        fake_op,
-    )
+    _patch_inplace_rotary(monkeypatch, fake_op)
     x = torch.zeros(2, 3, 2, 8)
     cos = torch.ones(2, 3, 1, 4)
     sin = torch.zeros_like(cos)
@@ -183,11 +191,7 @@ def test_kv_rope_pattern_matches_layout():
 
 
 def test_kv_replacement_matches_search_numerically(monkeypatch):
-    monkeypatch.setattr(
-        inplace_partial_rope,
-        "inplace_partial_rotary_mul",
-        _fake_inplace_partial_rotary_mul,
-    )
+    _patch_inplace_rotary(monkeypatch, _fake_inplace_partial_rotary_mul)
     pattern = _make_kv_rope_pattern()
     x = torch.randn(2, 3, 4, 4, dtype=torch.bfloat16)
     angles = torch.randn(2, 3, 1, 4, 1)
@@ -208,11 +212,7 @@ def test_compressor_pattern_ignores_external_shape_consumers():
 
 
 def test_compressor_replacement_matches_search_numerically(monkeypatch):
-    monkeypatch.setattr(
-        inplace_partial_rope,
-        "inplace_partial_rotary_mul",
-        _fake_inplace_partial_rotary_mul,
-    )
+    _patch_inplace_rotary(monkeypatch, _fake_inplace_partial_rotary_mul)
     pattern = _make_compressor_rope_pattern()
     x = torch.randn(2, 3, 4, 4, dtype=torch.bfloat16)
     prefix, rotary = torch.split(x, [2, 2], dim=-1)

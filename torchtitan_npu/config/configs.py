@@ -128,7 +128,7 @@ class CompileExtensionConfig:
 
     pattern_blacklist: tuple[str, ...] = ()
     """Pattern names to skip even when available.  Use the stable pattern name
-    (e.g. ``dsv4_partial_rope_wo_squeeze_forward``), not a Python module path."""
+    (e.g. ``partial_rope_wo_squeeze_forward``), not a Python module path."""
 
 
 @dataclass(kw_only=True, slots=True)

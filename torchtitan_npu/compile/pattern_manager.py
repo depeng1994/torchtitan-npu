@@ -23,8 +23,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Stable registration order: model-specific large fusion before generic fallback.
+# Stable registration order: model-generic partial fusion before model-specific
+# shape variants, before the generic full-tensor fallback.
 _BUILTIN_PATTERN_MODULES: tuple[str, ...] = (
+    "torchtitan_npu.compile.patterns.common.partial_interleaved_rope",
     "torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope",
     "torchtitan_npu.compile.patterns.common.interleaved_rope",
 )

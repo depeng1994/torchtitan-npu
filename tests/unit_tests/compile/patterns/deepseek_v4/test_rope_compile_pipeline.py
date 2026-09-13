@@ -27,9 +27,18 @@ from torchtitan_npu.override.common.rope import DecomposedComplexRoPE
 inplace_partial_rope = importlib.import_module(
     "torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope"
 )
+partial_interleaved_rope = importlib.import_module(
+    "torchtitan_npu.compile.patterns.common.partial_interleaved_rope"
+)
 interleaved_rope = importlib.import_module(
     "torchtitan_npu.compile.patterns.common.interleaved_rope"
 )
+
+
+def _patch_inplace_rotary(monkeypatch, fake_op):
+    """Patch ``inplace_partial_rotary_mul`` in both enclosing modules."""
+    monkeypatch.setattr(inplace_partial_rope, "inplace_partial_rotary_mul", fake_op)
+    monkeypatch.setattr(partial_interleaved_rope, "inplace_partial_rotary_mul", fake_op)
 
 
 class _PartialRoPEModule(torch.nn.Module):
@@ -123,11 +132,7 @@ def test_partial_rope_via_real_manager(monkeypatch, inverse):
             x, cos, sin, rotary_mode=rotary_mode, partial_slice=partial_slice
         )
 
-    monkeypatch.setattr(
-        inplace_partial_rope,
-        "inplace_partial_rotary_mul",
-        fake_op,
-    )
+    _patch_inplace_rotary(monkeypatch, fake_op)
 
     # Phase B: Register through the real manager (not register_pre_aot_patterns)
     setup_patterns(enable_patterns=True)
@@ -157,11 +162,7 @@ def test_partial_blacklisted_generic_takes_over(monkeypatch):
         assert rotary_mode == "interleave"
         return _decomposed_rope_arith(x, cos, sin)
 
-    monkeypatch.setattr(
-        inplace_partial_rope,
-        "inplace_partial_rotary_mul",
-        fake_inplace_partial_rotary_mul,
-    )
+    _patch_inplace_rotary(monkeypatch, fake_inplace_partial_rotary_mul)
     monkeypatch.setattr(
         interleaved_rope.torch_npu,
         "npu_rotary_mul",
@@ -179,8 +180,8 @@ def test_partial_blacklisted_generic_takes_over(monkeypatch):
     setup_patterns(
         enable_patterns=True,
         pattern_blacklist=(
-            "dsv4_partial_rope_wo_squeeze_forward",
-            "dsv4_partial_rope_wo_squeeze_inverse",
+            "partial_rope_wo_squeeze_forward",
+            "partial_rope_wo_squeeze_inverse",
             "dsv4_partial_rope_attention_kv_forward",
             "dsv4_partial_rope_compressor_kv_forward",
         ),
@@ -216,11 +217,7 @@ def test_all_patterns_disabled_keeps_decomposed_graph(monkeypatch):
     monkeypatch.setattr(
         interleaved_rope.torch_npu, "npu_rotary_mul", never_called,
     )
-    monkeypatch.setattr(
-        inplace_partial_rope,
-        "inplace_partial_rotary_mul",
-        never_called,
-    )
+    _patch_inplace_rotary(monkeypatch, never_called)
 
     setup_patterns(enable_patterns=False)
     graph_module = torch.fx.symbolic_trace(_decomposed_rope_arith)

@@ -4,8 +4,9 @@
 [片段融合算子接入](../../../docs/graph_pattern_fusion.md)。
 
 Pattern 在训练启动时由 `torchtitan_npu.compile.pattern_manager` 自动发现并注册，
-不需要手工设置 Python module path。DSV4 partial 融合（specific）先于
-generic interleaved RoPE（fallback）注册。
+不需要手工设置 Python module path。通用 partial RoPE 模式（shape-agnostic split →
+interleaved RoPE → cat）先于 DSV4 特有 shape（KV/compressor unsqueeze/squeeze）
+注册，generic full-tensor fallback 最后注册。
 
 ## DeepSeek-V4 Inplace Partial RoPE
 

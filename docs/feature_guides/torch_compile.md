@@ -97,7 +97,7 @@ NPU pre-AOT patterns（`pattern_manager`），无需手工设置 Python module p
 --compile.extension.no-enable-patterns
 
 # 黑名单指定 pattern（仅阻止目标 pattern；其余自动注册）
---compile.extension.pattern-blacklist dsv4_partial_rope_wo_squeeze_forward
+--compile.extension.pattern-blacklist partial_rope_wo_squeeze_forward
 ```
 
 pattern 修改编译图，`override.imports` 修改配置树和组件，两者是独立入口。

@@ -540,10 +540,10 @@ def test_compile_extension_config_explicit_values():
 
     cfg = CompileExtensionConfig(
         enable_patterns=False,
-        pattern_blacklist=("dsv4_partial_rope_wo_squeeze_forward",),
+        pattern_blacklist=("partial_rope_wo_squeeze_forward",),
     )
     assert cfg.enable_patterns is False
-    assert cfg.pattern_blacklist == ("dsv4_partial_rope_wo_squeeze_forward",)
+    assert cfg.pattern_blacklist == ("partial_rope_wo_squeeze_forward",)
 
 
 def test_extension_config_has_no_compile_extension():
@@ -569,13 +569,13 @@ def test_npu_compile_config_carries_extension():
         enable=True,
         extension=CompileExtensionConfig(
             enable_patterns=False,
-            pattern_blacklist=("dsv4_partial_rope_wo_squeeze_forward",),
+            pattern_blacklist=("partial_rope_wo_squeeze_forward",),
         ),
     )
     assert explicit.enable is True
     assert explicit.extension.enable_patterns is False
     assert explicit.extension.pattern_blacklist == (
-        "dsv4_partial_rope_wo_squeeze_forward",
+        "partial_rope_wo_squeeze_forward",
     )
 
 
@@ -692,7 +692,7 @@ def test_config_manager_parses_compile_extension_via_cli(
             "--compile.enable",
             "--compile.extension.no-enable-patterns",
             "--compile.extension.pattern-blacklist",
-            "dsv4_partial_rope_wo_squeeze_forward",
+            "partial_rope_wo_squeeze_forward",
         ]
     )
 
@@ -700,5 +700,5 @@ def test_config_manager_parses_compile_extension_via_cli(
     assert config.compile.enable is True
     assert config.compile.extension.enable_patterns is False
     assert config.compile.extension.pattern_blacklist == (
-        "dsv4_partial_rope_wo_squeeze_forward",
+        "partial_rope_wo_squeeze_forward",
     )
