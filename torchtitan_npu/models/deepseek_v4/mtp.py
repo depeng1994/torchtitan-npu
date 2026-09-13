@@ -378,10 +378,9 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         """Classic DeepSeek-V4 main stack forward.
 
         Each block collapses within itself (no cross-sublayer mix), and
-        ``hc_head`` collapses the multi-stream state after all layers.
-        V4.1's single-pass path bypasses this via a separate loop that
-        uses ``forward_with_pre_mix`` on every block and
-        ``collapse_pre_mix`` at the decoder exit.
+        ``hc_head`` collapses the multi-stream state after all layers.  Derived
+        decoders with different mixing semantics should override their main
+        stack loop rather than changing this V4 path.
         """
         tok_embeddings = self.tok_embeddings
         input_ids = tokens.detach().long()
