@@ -110,6 +110,7 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         input_ids: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        **kwargs,
     ):
         """Classic DeepSeek-V4 mHC forward.
 

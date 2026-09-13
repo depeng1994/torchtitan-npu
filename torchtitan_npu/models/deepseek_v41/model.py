@@ -272,7 +272,9 @@ class V41Model(DeepSeekV4Model):
         for layer in self.layers.values():
             if pre_mix is None:
                 pre_mix = _make_identity_pre_mix(hidden, self.hc_mult)
-            hidden, pre_mix = layer.forward_with_pre_mix(
+            # Call through __call__ so FSDP hooks fire (the V41 block forward
+            # dispatches to forward_with_pre_mix internally).
+            hidden, pre_mix = layer(
                 hidden,
                 input_ids,
                 attention_masks,

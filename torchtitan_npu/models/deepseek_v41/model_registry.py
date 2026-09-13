@@ -158,6 +158,16 @@ def _make_v41_config(
     # multimodal config (which carries the vision fields) before injecting the
     # ViT and marker embeddings.
     config = V41Model.Config(**{f.name: getattr(config, f.name) for f in dataclasses.fields(config)})
+    # Promote each layer to the V4.1 block type so the Single-Pass mHC
+    # forward (through __call__ / FSDP hooks) is used at runtime.
+    from .block import DeepSeekV41TransformerBlock
+
+    config.layers = [
+        DeepSeekV41TransformerBlock.Config(
+            **{f.name: getattr(layer_cfg, f.name) for f in dataclasses.fields(layer_cfg)}
+        )
+        for layer_cfg in config.layers
+    ]
     config.vision_encoder = DeepSeekV4VisionEncoder.Config(
         dim=widths.vision_dim,
         num_layers=32,
