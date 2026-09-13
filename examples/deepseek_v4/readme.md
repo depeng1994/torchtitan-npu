@@ -59,15 +59,12 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
 ### 8P Flash 40 层 16 expert + ViT（V4.1 Golden）
 
 `debug/deepseek_v41_flash_8p_cpt_4k_a3.sh` 是 V4.1（V4 基座 + ViT 多模态）的单机 8 卡入口。
-配置与模型规模复用上面的 8P Flash debug 基线，只在 CLI 上覆盖四项：`--training.seq-len 512`、
-`--training.global-batch-size 8`、`--training.steps 40`、`--lr-scheduler.total-steps 40`，
-并默认关闭编译（`COMPILE_BACKEND=""`，编译会改变被追踪的图，而 Golden 口径要求逐位复现）。
+当前支持范围固定为 **CP1 / PP1 / eager / reference-golden**；V4.1 配置会拒绝 `torch.compile`，launcher 也会拒绝 `USE_GOLDEN=0`。
 
 ```sh
 bash examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh
-# 覆盖步数、退回编译后端：
+# 可覆盖训练步数：
 bash examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh --training.steps 5
-COMPILE_BACKEND=aot_eager bash examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh
 ```
 
 V4.1 当前仅支持 reference/golden operator 路径；`USE_GOLDEN=0`（AscendC）会在 launcher 阶段直接拒绝。
@@ -79,16 +76,17 @@ AscendC 支持将在 ratio-1 shared global KV kernel contract 完成后开放。
 
 | 路径 | 状态 | 说明 |
 |---|---|---|
-| reference/golden (`USE_GOLDEN=1`) | ✅ **支持** | 与冻结基线逐位对齐（stage-01 golden） |
+| reference/golden (`USE_GOLDEN=1`) | ✅ **实现支持 / 待最终轨迹复验** | ratio-1 已按真实 shared/global-KV 语义 materialize；该 correctness refactor 改变了旧冻结轨迹，需在最终 HEAD 上重新跑 8P 100-step 后迁移 Golden |
 | AscendC 融合算子 (`USE_GOLDEN=0`) | ❌ **暂不支持**（fail-fast） | V4.1 的 CSA2 ratio-1 shared global KV 尚未在 AscendC 稀疏注意力核中实现 |
+| `torch.compile` / GraphTrainer | ❌ **暂不支持**（fail-fast） | 当前 CSA2 cross-layer state 仍是 eager-only contract |
+| CP > 1 / PP > 1 | ❌ **暂不支持**（fail-fast） | 当前 landing scope 为 CP1 / PP1 |
 
-实现：`USE_GOLDEN=1` 时 launcher 装入三个 golden overrides ——
+`USE_GOLDEN=1` 时 launcher 装入三个 operator overrides：
 `torchtitan_npu.override.common.rope.workaround`、`torchtitan_npu.override.deepseek_v4.sparse_attn.golden`、
 `torchtitan_npu.override.deepseek_v41.golden_moe.golden`，外加 virtual optimizer override。
-模型侧统一通过 `torchtitan_npu.models.deepseek_v4.golden.golden_enabled()` 读取，不再散落 `os.getenv`。
+模型侧统一通过 `torchtitan_npu.models.deepseek_v4.golden.golden_enabled()` 读取开关。
 
-模型的宽度、层数、专家数、视觉层数与图片路径现在都由 config（`DeepSeekV41CropConfig`）决定，
-不再通过环境变量注入；稀疏注意力的分块长度固定为冻结基线使用的 32。
+模型宽度、层数、专家数和视觉层数由 config 决定；V4.1 的 compressor/indexer ownership、CSA2 source/reuse/reindex policy 与 ratio-1 materialization 由 `deepseek_v41` 侧显式组装，V4 基座只保留版本中性的 primitive / extension seams。
 
 ### 32P Pro 32-expert Debug
 
