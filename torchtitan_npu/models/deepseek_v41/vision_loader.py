@@ -84,7 +84,7 @@ class _SyntheticVisionDataset(IterableDataset):
             step += 1
 
 
-class DeepSeekV4SyntheticVisionDataLoader(ParallelAwareDataloader):
+class DeepSeekV41SyntheticVisionDataLoader(ParallelAwareDataloader):
     @dataclass(kw_only=True, slots=True)
     class Config(ParallelAwareDataloader.Config):
         vocab_size: int = 129280

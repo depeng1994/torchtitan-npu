@@ -22,7 +22,6 @@ from .config_registry import (
     deepseek_v41_flash_30layers_16experts_vision,
     deepseek_v41_flash_40layers_16experts_vision,
 )
-from .interfaces import V41DSpark, V41Engram, V41OptionalModules
 from .model_registry import (
     deepseek_v41_flash_30layers_16experts_vision_config,
     deepseek_v41_flash_40layers_16experts_vision_config,
@@ -46,9 +45,6 @@ __all__ = [
     "V41AttentionContext",
     "V41GoldenAttentionModule",
     "V41CompressionSpec",
-    "V41DSpark",
-    "V41Engram",
-    "V41OptionalModules",
     "V41GoldenAttention",
     "build_v41_compression_spec",
     "deepseek_v41_flash_30layers_16experts_vision",

@@ -255,7 +255,7 @@ class ImageAligner(Module):
         return result
 
 
-class DeepSeekV4VisionEncoder(Module):
+class DeepSeekV41VisionEncoder(Module):
     block_type = VisionBlock
 
     @dataclass(kw_only=True, slots=True)
@@ -319,4 +319,4 @@ class DeepSeekV4VisionEncoder(Module):
         return self.aligner(self.norm(x), grids)
 
 
-__all__ = ["DeepSeekV4VisionEncoder"]
+__all__ = ["DeepSeekV41VisionEncoder"]

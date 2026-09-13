@@ -11,7 +11,7 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import V41Model
-from .vision import DeepSeekV4VisionEncoder, ImageMarkerEmbeddings
+from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings
 
 # Marker embedding init mirrors the reference tower.
 _MARKER_INIT = {name: partial(torch.nn.init.normal_, std=1.0) for name in ("image_start", "image_newline", "image_end")}
@@ -168,7 +168,7 @@ def _make_v41_config(
         )
         for layer_cfg in config.layers
     ]
-    config.vision_encoder = DeepSeekV4VisionEncoder.Config(
+    config.vision_encoder = DeepSeekV41VisionEncoder.Config(
         dim=widths.vision_dim,
         num_layers=32,
         num_heads=widths.vision_heads,

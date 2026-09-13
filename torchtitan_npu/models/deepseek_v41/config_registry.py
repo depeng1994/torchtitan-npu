@@ -21,7 +21,7 @@ from .model_registry import model_registry
 
 # Imported lazily: `deepseek_v4.config_registry` and this package must not
 # form an import cycle through the V4 test list.
-from .vision_loader import DeepSeekV4SyntheticVisionDataLoader
+from .vision_loader import DeepSeekV41SyntheticVisionDataLoader
 
 # The Golden fixture image; override it via a config entry when training on real data.
 DEFAULT_VISION_IMAGE_PATHS = ("tests/assets/dsv4_vit_test.jpeg",)
@@ -60,7 +60,7 @@ def _build_v41_trainer_config(flavor: str, crop: DeepSeekV41CropConfig) -> Train
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_spec,
         tokenizer=SyntheticTokenizer.Config(vocab_size=129280),
-        dataloader=DeepSeekV4SyntheticVisionDataLoader.Config(
+        dataloader=DeepSeekV41SyntheticVisionDataLoader.Config(
             vocab_size=129280,
             patch_count=64,
             image_span_start=8,

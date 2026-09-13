@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Any
 
 V41_LAYER_IDS = tuple(range(30))
 V41_COMPRESS_RATIOS = (0, 0) + (2,) * 18 + (1,) * 10
@@ -32,8 +31,6 @@ class DeepSeekV41CropConfig:
     candidate_source_layer: int = V41_CANDIDATE_SOURCE_LAYER
     candidate_topk_blocks: int = 2048
     candidate_block_size: int = 8
-    engram: Any | None = None
-    dspark: Any | None = None
 
     def __post_init__(self) -> None:
         if self.vision_layers < 4:

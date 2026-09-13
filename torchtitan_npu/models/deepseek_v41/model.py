@@ -21,7 +21,7 @@ from torchtitan_npu.models.deepseek_v4.mhc import _make_identity_pre_mix
 # Annotation-only names, kept importable at runtime on purpose: the trainer
 # resolves ``Model.Config`` fields by name, so moving them behind TYPE_CHECKING
 # would break introspection for no runtime gain.
-from .vision import DeepSeekV4VisionEncoder, ImageMarkerEmbeddings  # noqa: TC001
+from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings  # noqa: TC001
 from .vision_data import scatter_image_features
 
 
@@ -57,7 +57,7 @@ class V41Model(DeepSeekV4Model):
 
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV4Model.Config):
-        vision_encoder: DeepSeekV4VisionEncoder.Config | None = None
+        vision_encoder: DeepSeekV41VisionEncoder.Config | None = None
         image_marker_embeddings: ImageMarkerEmbeddings.Config | None = None
 
         def update_from_config(self, *, config, **kwargs):
