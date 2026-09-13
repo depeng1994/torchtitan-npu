@@ -29,13 +29,15 @@ def _vision_hf_dict() -> dict[str, torch.Tensor]:
 
 def _base_hf_dict() -> dict[str, torch.Tensor]:
     return {
-        # Text backbone (keys match the V4 adapter's from_hf_map)
+        # Text backbone (keys match the V4 adapter's from_hf_map).
+        # Layer 3 is a non-hash layer (N_HASH_LAYERS=3 in the shared config),
+        # so its expert-bias round-trip is symmetric.
         "embed.weight": torch.randn(512, 32),
-        "layers.0.attn.wq_a.weight": torch.randn(8, 32),
-        "layers.0.attn.wq_b.weight": torch.randn(16, 8),
-        "layers.0.ffn.gate.weight": torch.randn(4, 32),
-        "layers.0.ffn.gate.bias": torch.randn(4),
-        "layers.0.ffn.gate.bias_vl": torch.randn(4),
+        "layers.3.attn.wq_a.weight": torch.randn(8, 32),
+        "layers.3.attn.wq_b.weight": torch.randn(16, 8),
+        "layers.3.ffn.gate.weight": torch.randn(4, 32),
+        "layers.3.ffn.gate.bias": torch.randn(4),
+        "layers.3.ffn.gate.bias_vl": torch.randn(4),
         # Decoder-level hc_head (V4 classic)
         "hc_head_base": torch.randn(12),
         "hc_head_fn": torch.randn(12, 16),
@@ -109,13 +111,15 @@ class TestComposedAdapterPartition:
             assert any(lk.startswith(p) for p in expected_prefixes), \
                 f"unexpected local key {lk}"
 
-        # Round-trip: local → HF preserves the original HF key set.
+        # Round-trip: local → HF must reproduce the original HF key set
+        # with bit-identical values (strict contract, no tautology).
         hf_out = adapter.to_hf(local)
-        for hf_key in hf_in:
-            assert hf_key in hf_out or any(
-                adapter._vision_adapter.owns_hf_key(hf_key) or not adapter._vision_adapter.owns_hf_key(hf_key)
-                for _ in [1]
-            )
+        assert set(hf_out) == set(hf_in), (
+            f"HF round-trip key set mismatch: missing={set(hf_in) - set(hf_out)}, "
+            f"extra={set(hf_out) - set(hf_in)}"
+        )
+        for key in hf_in:
+            assert torch.equal(hf_out[key], hf_in[key]), f"HF round-trip value mismatch for {key}"
 
     def test_round_trip_deterministic(self):
         adapter = DeepSeekV41StateDictAdapter(

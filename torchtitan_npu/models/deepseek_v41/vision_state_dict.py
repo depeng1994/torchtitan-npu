@@ -27,7 +27,8 @@ class DeepSeekV41VisionStateDictAdapter:
         "image_end": "image_marker_embeddings.image_end",
     }
 
-    _HF_PREFIXES = ("vision.", "aligner.", "image_start", "image_newline", "image_end")
+    _HF_PREFIXES = ("vision.", "aligner.")
+    _HF_EXACT = {"image_start", "image_newline", "image_end"}
     _LOCAL_PREFIXES = ("vision_encoder.", "image_marker_embeddings.")
 
     def __init__(self, *, expected_shapes: Mapping[str, tuple[int, ...]] | None = None):
@@ -35,7 +36,7 @@ class DeepSeekV41VisionStateDictAdapter:
 
     @classmethod
     def owns_hf_key(cls, key: str) -> bool:
-        return any(key.startswith(p) for p in cls._HF_PREFIXES)
+        return key in cls._HF_EXACT or any(key.startswith(p) for p in cls._HF_PREFIXES)
 
     @classmethod
     def owns_local_key(cls, key: str) -> bool:
@@ -45,12 +46,16 @@ class DeepSeekV41VisionStateDictAdapter:
     def _to_local_key(key: str) -> str:
         if key.startswith("vision."):
             return "vision_encoder." + key[len("vision.") :]
+        if key.startswith("aligner."):
+            return "vision_encoder." + key
         if key in ("image_start", "image_newline", "image_end"):
             return "image_marker_embeddings." + key
         return key
 
     @staticmethod
     def _to_hf_key(key: str) -> str:
+        if key.startswith("vision_encoder.aligner."):
+            return "aligner." + key[len("vision_encoder."):]
         if key.startswith("vision_encoder."):
             return "vision." + key[len("vision_encoder.") :]
         if key.startswith("image_marker_embeddings."):
