@@ -29,6 +29,19 @@ DEFAULT_VISION_IMAGE_PATHS = ("tests/assets/dsv4_vit_test.jpeg",)
 
 def _build_v41_trainer_config(flavor: str, crop: DeepSeekV41CropConfig) -> TrainerEx.Config:
     from torchtitan_npu.models.deepseek_v4.config_registry import _dsv4_optimizer_config
+    from torchtitan_npu.models.deepseek_v4.golden import golden_enabled
+
+    # The V4.1 layer-20+ ratio-1 layers produce a real shared/global KV, which
+    # the AscendC sparse-attention path still rejects ("ratio-1 asc must not
+    # receive compressed KV").  Until that kernel path is adapted, V4.1 is
+    # golden/reference-only: fail fast instead of silently mis-selecting the
+    # AscendC kernels.
+    if not golden_enabled():
+        raise NotImplementedError(
+            "DeepSeek V4.1 currently supports the golden/reference path only "
+            "(USE_GOLDEN=1). The AscendC fused kernels do not yet accept the "
+            "V4.1 ratio-1 shared-KV contract."
+        )
 
     # The golden path replaces F.cross_entropy globally and is the only loss the
     # frozen baseline was produced with, so it is not conditional.

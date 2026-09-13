@@ -235,7 +235,7 @@ class DeepSeekV4MTPTransformerBlock(TransformerBlock):
         e_proj: Linear.Config
         h_proj: Linear.Config
         mtp_norm: RMSNorm.Config
-        hc_head: HcHead.Config | None = None
+        hc_head: HcHead.Config
 
     def __init__(self, config: Config):
         super().__init__()
@@ -252,7 +252,7 @@ class DeepSeekV4MTPTransformerBlock(TransformerBlock):
         self.e_proj = config.e_proj.build()
         self.h_proj = config.h_proj.build()
         self.mtp_norm = config.mtp_norm.build()
-        self.hc_head = config.hc_head.build() if config.hc_head is not None else None
+        self.hc_head = config.hc_head.build()
 
     def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
