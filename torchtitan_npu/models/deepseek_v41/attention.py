@@ -5,8 +5,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-# The plan/context classes below are built at class-creation time and shared
-# across the V4.1 model, so these imports have to stay at the top.
+from torchtitan_npu.models.deepseek_v4.attention import Attention as DeepSeekV4Attention
+from torchtitan_npu.models.deepseek_v4.attention import LongRangeContext
+from torchtitan_npu.models.deepseek_v4.compressor import Indexer
+from torchtitan_npu.models.deepseek_v4.metadata import build_index_dense_mask
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +85,6 @@ class V41AttentionContext:
         return cls(compressed_kv={}, index_keys={}, topk_indices={})
 
     def reset(self) -> None:
-        """Drop tensors from the previous forward before starting a new one."""
         self.compressed_kv.clear()
         self.index_keys.clear()
         self.topk_indices.clear()
@@ -114,14 +115,7 @@ class V41AttentionContext:
         topk_blocks: int,
         block_size: int,
     ) -> None:
-        """Select and store the level-one candidate block mask.
-
-        Kept inside the V4.1 context so the V4 decoder only needs the seam
-        (``put_candidates`` / ``candidates``) and never imports this package.
-        """
-        self.put_candidates(
-            select_candidate_blocks(index_scores, compress_lens, topk_blocks, block_size)
-        )
+        self.put_candidates(select_candidate_blocks(index_scores, compress_lens, topk_blocks, block_size))
 
     def resolve(self, plan: V41CompressionSpec, layer_id: int) -> tuple[Any | None, Any | None, Any | None]:
         kv_source = plan.kv_source_for(layer_id)
@@ -133,7 +127,149 @@ class V41AttentionContext:
         )
 
 
-# existing definitions are kept above this implementation
+class DeepSeekV41Attention(DeepSeekV4Attention):
+    """V4.1 attention specialization that owns CSA2 source/reuse/reindex semantics."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(DeepSeekV4Attention.Config):
+        pass
+
+    def _build_v41_long_range_context(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        attention_masks,
+        positions: torch.Tensor,
+        *,
+        layer_id: int,
+        plan: V41CompressionSpec,
+        context: V41AttentionContext,
+    ) -> LongRangeContext:
+        cmp_k = None
+        compressor_latent = None
+        idx_q = idx_k = idx_w = None
+        shared_topk = None
+
+        is_kv_source = layer_id in plan.kv_source_layers
+        if not is_kv_source:
+            shared_kv, _, shared_topk = context.resolve(plan, layer_id)
+            if shared_kv is not None:
+                cmp_k = shared_kv[0]
+
+        if is_kv_source:
+            if self.compressor is None:
+                raise ValueError("V4.1 KV source requires a compressor")
+            pooled, compressor_latent = self.compressor(
+                x,
+                attention_masks,
+                positions=positions,
+                return_pre_rope=True,
+            )
+            if self.compress_ratio == 1:
+                cmp_k = pooled
+            else:
+                cmp_k = self.token_dispatcher.select(pooled, attention_masks.plans[self.compress_ratio])
+
+        if self.indexer is not None and layer_id in plan.index_source_layers:
+            index_source = None if is_kv_source else plan.index_source_before(layer_id)
+            shared_index_k = None if index_source is None else context.index_keys.get(index_source)
+            indexer_kwargs = {
+                "positions": positions,
+                "attention_masks": attention_masks,
+            }
+            if shared_index_k is not None:
+                indexer_kwargs["key_override"] = shared_index_k
+            if compressor_latent is not None:
+                indexer_kwargs["latent"] = compressor_latent
+            idx_q, idx_k, idx_w = self.indexer(
+                x.detach(),
+                qr.detach(),
+                **indexer_kwargs,
+            )
+
+            index_ratio = self.compress_ratio if index_source is None else plan.ratios[index_source]
+            index_plan = attention_masks.plans[index_ratio]
+            if index_plan.gather_indices is not None and shared_index_k is None:
+                idx_k = self.token_dispatcher.select(idx_k, index_plan)
+
+            reference = getattr(attention_masks, "reference", None)
+            dense_mask = getattr(attention_masks, "index_dense_masks", {}).get(index_ratio)
+            if dense_mask is None and reference is not None:
+                ratio_layout = reference.ratios.get(index_ratio)
+                dense_mask = None if ratio_layout is None else ratio_layout.dense_mask
+            if dense_mask is None:
+                dense_mask = build_index_dense_mask(attention_masks, index_ratio)
+
+            candidate_mask = context.candidates if layer_id > plan.candidate_source_layer else None
+            shared_topk, index_scores = Indexer.select(
+                idx_q,
+                idx_k,
+                idx_w,
+                dense_mask,
+                getattr(self.compressed_sparse_attention.inner_attention, "index_topk", 512),
+                candidate_mask=candidate_mask,
+            )
+            if layer_id == plan.candidate_source_layer:
+                compress_lens = dense_mask.squeeze(1).sum(dim=-1)
+                context.build_candidates(
+                    index_scores,
+                    compress_lens,
+                    plan.candidate_topk_blocks,
+                    plan.candidate_block_size,
+                )
+            context.put_source(
+                layer_id,
+                index_key=idx_k,
+                topk_indices=shared_topk,
+            )
+
+        if is_kv_source and cmp_k is None:
+            if self.compressor is None:
+                raise ValueError("V4.1 KV source requires a compressor")
+            pooled = self.compressor(x, attention_masks, positions=positions)
+            cmp_k = (
+                pooled
+                if self.compress_ratio == 1
+                else self.token_dispatcher.select(pooled, attention_masks.plans[self.compress_ratio])
+            )
+
+        if is_kv_source:
+            context.put_source(layer_id, compressed_kv=(cmp_k, cmp_k))
+
+        kv_source = plan.kv_source_for(layer_id)
+        active_ratio = self.compress_ratio if kv_source is None else plan.ratios[kv_source]
+        return LongRangeContext(
+            compressed_kv=cmp_k,
+            index_q=idx_q,
+            index_k=idx_k,
+            index_weight=idx_w,
+            sparse_indices=shared_topk,
+            compress_ratio=active_ratio,
+        )
+
+    def forward(
+        self,
+        x,
+        attention_masks,
+        positions,
+        *,
+        layer_id: int,
+        plan: V41CompressionSpec,
+        context: V41AttentionContext,
+    ):
+        qr, q = self._project_q(x, positions)
+        swa_k = self._project_window_kv(x, attention_masks, positions)
+        long_range = self._build_v41_long_range_context(
+            x,
+            qr,
+            attention_masks,
+            positions,
+            layer_id=layer_id,
+            plan=plan,
+            context=context,
+        )
+        o = self._apply_sparse_attention(q, swa_k, long_range, attention_masks)
+        return self._project_output(o, positions)
 
 
 class V41GoldenAttention(nn.Module):
@@ -161,8 +297,6 @@ class V41GoldenAttention(nn.Module):
             source_key, source_value = source_kv
             key, value = source_key, source_value
         elif layer_id in plan.kv_source_layers:
-            # Store tensors, not detached copies, so source gradients flow to
-            # consumers in the reference implementation.
             context.put_source(layer_id, compressed_kv=(key, value))
 
         return F.scaled_dot_product_attention(
