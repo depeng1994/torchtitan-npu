@@ -281,7 +281,7 @@ def set_deepseek_v4_sharding_config(
             "hc_scale": _dense_param_rep,
         },
     )
-    if config.image_marker_embeddings is not None:
+    if getattr(config, "image_marker_embeddings", None) is not None:
         config.image_marker_embeddings.sharding_config = ShardingConfig(
             state_shardings=dict.fromkeys(("image_start", "image_newline", "image_end"), _dense_param_rep)
         )
