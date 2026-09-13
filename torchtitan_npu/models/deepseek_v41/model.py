@@ -61,11 +61,14 @@ class V41Model(DeepSeekV4Model):
         image_marker_embeddings: ImageMarkerEmbeddings.Config | None = None
 
         def update_from_config(self, *, config, **kwargs):
+            # Explicit parent-class call: the slots=True dataclass copy created
+            # by the configurable framework can break zero-arg super() binding.
+            DeepSeekV4Model.Config.update_from_config(self, config=config, **kwargs)
             if config.parallelism.context_parallel_degree != 1:
                 raise NotImplementedError(
-                    f"DeepSeek V4.1 currently supports CP=1 only; got CP={config.parallelism.context_parallel_degree}"
+                    "DeepSeek V4.1 currently supports CP=1 only; "
+                    f"got CP={config.parallelism.context_parallel_degree}"
                 )
-            super().update_from_config(config=config, **kwargs)
 
     def __init__(self, config: Config):
         super().__init__(config)
