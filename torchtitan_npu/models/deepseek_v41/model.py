@@ -1,9 +1,4 @@
-"""V4.1 model layer: the multimodal forward and the ViT on top of the V4 base.
-
-The V4 base decoder stays decoder-only; everything V4.1 adds -- the image
-tower, the marker embeddings, the image scatter and the context-parallel
-splitting of image metadata -- lives here.
-"""
+"""V4.1 model layer: multimodal input handling and CSA2 topology policy."""
 
 from __future__ import annotations
 
@@ -18,9 +13,7 @@ from torchtitan_npu.models.deepseek_v4.golden import golden_enabled
 from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
 from torchtitan_npu.models.deepseek_v4.mhc import _make_identity_pre_mix
 
-# Annotation-only names, kept importable at runtime on purpose: the trainer
-# resolves ``Model.Config`` fields by name, so moving them behind TYPE_CHECKING
-# would break introspection for no runtime gain.
+from .attention import V41AttentionContext, build_v41_compression_spec
 from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings  # noqa: TC001
 from .vision_data import scatter_image_features
 
@@ -53,15 +46,19 @@ def scatter_image_embeddings(
 
 
 class V41Model(DeepSeekV4Model):
-    """DeepSeek-V4.1 backbone with the vision tower wired in."""
+    """DeepSeek-V4.1 backbone with CSA2 policy and the vision tower wired in."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV4Model.Config):
+        kv_source_layers: tuple[int, ...] = ()
+        index_source_layers: tuple[int, ...] = ()
+        candidate_source_layer: int = 20
+        candidate_topk_blocks: int = 2048
+        candidate_block_size: int = 8
         vision_encoder: DeepSeekV41VisionEncoder.Config | None = None
         image_marker_embeddings: ImageMarkerEmbeddings.Config | None = None
 
         def update_from_config(self, *, config, **kwargs):
-            # Fail-fast capability guards before any parent-side mutation.
             cp = config.parallelism.context_parallel_degree
             pp = config.parallelism.pipeline_parallel_degree
             if cp != 1:
@@ -80,8 +77,6 @@ class V41Model(DeepSeekV4Model):
                     "DeepSeek V4.1 does not support torch.compile yet; "
                     "CSA2 cross-layer state is currently an eager-only runtime contract"
                 )
-            # Explicit parent-class call: the slots=True dataclass copy created
-            # by the configurable framework can break zero-arg super() binding.
             DeepSeekV4Model.Config.update_from_config(self, config=config, **kwargs)
 
     def __init__(self, config: Config):
@@ -90,28 +85,20 @@ class V41Model(DeepSeekV4Model):
         self.image_marker_embeddings = (
             config.image_marker_embeddings.build() if config.image_marker_embeddings is not None else None
         )
-        # V4.1-specific CSA2 plan/context construction lives here (not in the
-        # V4 base) so deepseek_v41 never becomes an upstream dependency of
-        # deepseek_v4. The V4 base only exposes the generic seam.
-        if config.kv_source_layers is not None:
-            from .attention import (
-                V41AttentionContext,
-                build_v41_compression_spec,
-            )
 
-            self._v41_plan = build_v41_compression_spec(
-                layer_ids=tuple(range(config.n_layers)),
-                ratios=self.compress_ratios[: config.n_layers],
-                kv_source_layers=config.kv_source_layers,
-                index_source_layers=config.index_source_layers or (),
-                candidate_source_layer=(20 if config.candidate_source_layer is None else config.candidate_source_layer),
-                candidate_topk_blocks=config.candidate_topk_blocks,
-                candidate_block_size=config.candidate_block_size,
-            )
-            self._v41_context = V41AttentionContext.empty()
-            for layer in self.layers.values():
-                layer._v41_plan = self._v41_plan
-                layer._v41_context = self._v41_context
+        self.compression_plan = build_v41_compression_spec(
+            layer_ids=tuple(range(config.n_layers)),
+            ratios=self.compress_ratios[: config.n_layers],
+            kv_source_layers=config.kv_source_layers,
+            index_source_layers=config.index_source_layers,
+            candidate_source_layer=config.candidate_source_layer,
+            candidate_topk_blocks=config.candidate_topk_blocks,
+            candidate_block_size=config.candidate_block_size,
+        )
+        self.attention_context = V41AttentionContext.empty()
+        for layer in self.layers.values():
+            layer.compression_plan = self.compression_plan
+            layer.attention_context = self.attention_context
 
     def _prepare_multimodal_embeddings(
         self,
@@ -129,17 +116,11 @@ class V41Model(DeepSeekV4Model):
             pixel_values = pixel_values.flatten(0, 1)
         if image_grid.ndim == 3:
             image_grid = image_grid.flatten(0, 1)
-        # The caller allows image_spans to be absent when image_feature_indices is
-        # given, so the empty check must come before the shape handling.
         if image_spans is None or image_spans.numel() == 0:
             image_spans = None
         elif image_spans.ndim == 3:
             image_spans = image_spans.flatten(0, 1)
         hidden = self.tok_embeddings(tokens)
-        # Under CP, a rank can own no image-token slots while the visual
-        # parameters remain replicated. Run the same ViT graph on every rank so
-        # replicated vision weights receive identical gradients; scattering is
-        # a no-op on ranks without local image slots.
         visual = self.vision_encoder(pixel_values, image_grid)
         if self.image_marker_embeddings is not None and token_types is not None:
             hidden = self.image_marker_embeddings(hidden, token_types)
@@ -204,7 +185,7 @@ class V41Model(DeepSeekV4Model):
         global_seq_len: int,
         load_balancer_type: str | None,
     ) -> None:
-        """Shard the image spans and token-type tensors along the CP axis."""
+        """Shard image spans and token-type tensors along the CP axis."""
         if "image_spans" in extra_kwargs:
             extra_kwargs["image_spans"] = self._shard_image_spans_for_cp(
                 extra_kwargs["image_spans"],
@@ -243,27 +224,19 @@ class V41Model(DeepSeekV4Model):
         token_types: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
     ):
-        """V4.1 forward with Single-Pass mHC for vision and text-only batches.
-
-        V4.1 runs all layers via ``forward_with_pre_mix`` — the pre_mix flows
-        between sub-layers — and collapses at the decoder exit with
-        ``collapse_pre_mix`` rather than the V4 classic ``hc_head``.
-        """
-        if self._v41_context is not None:
-            self._v41_context.reset()
+        """V4.1 forward with Single-Pass mHC for vision and text-only batches."""
+        self.attention_context.reset()
 
         if pixel_values is None:
-            # A text-only batch must not inherit the image mask left on the
-            # layers by a previous multimodal batch in the same process.
             for layer in self.layers.values():
-                layer._v41_image_mask = None
+                layer.image_mask = None
             embeds = input_embeds
         else:
             if image_grid is None or (image_spans is None and image_feature_indices is None):
                 raise ValueError("pixel_values requires image_grid and image_spans or image_feature_indices")
             image_mask = token_types.ge(0) if token_types is not None else None
             for layer in self.layers.values():
-                layer._v41_image_mask = image_mask
+                layer.image_mask = image_mask
             embeds = self._prepare_multimodal_embeddings(
                 tokens,
                 pixel_values=pixel_values,
@@ -273,8 +246,6 @@ class V41Model(DeepSeekV4Model):
                 token_types=token_types,
             )
 
-        # Single-Pass mHC main stack (V4.1): the pre_mix flows between
-        # sub-layers and collapse_pre_mix replaces the V4 decoder hc_head.
         tok_embeddings = self.tok_embeddings
         input_ids = tokens.detach().long()
         hidden = embeds if embeds is not None else (tok_embeddings(tokens) if tok_embeddings is not None else tokens)
@@ -285,8 +256,6 @@ class V41Model(DeepSeekV4Model):
         for layer in self.layers.values():
             if pre_mix is None:
                 pre_mix = _make_identity_pre_mix(hidden, self.hc_mult)
-            # Call through __call__ so FSDP hooks fire (the V41 block forward
-            # dispatches to forward_with_pre_mix internally).
             hidden, pre_mix = layer(
                 hidden,
                 input_ids,
