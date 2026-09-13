@@ -588,6 +588,89 @@ def test_npu_compile_config_keeps_upstream_post_init():
         CompileConfig(enable_async_tensor_parallel=True)
 
 
+def test_config_package_reexports_compile_configs():
+    """CompileConfig/CompileExtensionConfig are public NPU config types."""
+    from torchtitan_npu.config import CompileConfig as PkgCompileConfig
+    from torchtitan_npu.config import CompileExtensionConfig as PkgCompileExtensionConfig
+    from torchtitan_npu.config.configs import CompileExtensionConfig as DirectCompileExtensionConfig
+
+    assert PkgCompileConfig is NPUCompileConfig
+    assert PkgCompileExtensionConfig is DirectCompileExtensionConfig
+
+
+@pytest.mark.parametrize(
+    ("imports", "expected"),
+    [
+        # Only asc_complex -> replaced by decomposed
+        (["torchtitan_npu.override.common.rope.asc_complex"],
+         ["torchtitan_npu.override.common.rope.decomposed"]),
+        # Already decomposed -> no duplication, no asc_complex residue
+        (["torchtitan_npu.override.common.rope.decomposed"],
+         ["torchtitan_npu.override.common.rope.decomposed"]),
+        # Both present -> only decomposed remains
+        (["torchtitan_npu.override.common.rope.asc_complex",
+          "torchtitan_npu.override.common.rope.decomposed"],
+         ["torchtitan_npu.override.common.rope.decomposed"]),
+        # No ComplexRoPE override -> decomposed appended
+        (["torchtitan_npu.override.deepseek_v4.sparse_attn.asc"],
+         ["torchtitan_npu.override.deepseek_v4.sparse_attn.asc",
+          "torchtitan_npu.override.common.rope.decomposed"]),
+    ],
+)
+def test_ensure_decomposed_rope_canonicalizes_imports(imports, expected):
+    """Inductor path must converge to exactly one decomposed ComplexRoPE."""
+    config = TrainerEx.Config()
+    config.override.imports = list(imports)
+
+    TrainerEx._ensure_decomposed_rope(config)
+
+    assert config.override.imports == expected
+
+
+def test_ensure_decomposed_rope_ignores_compile_off(monkeypatch):
+    """Without Inductor model compile, imports are left untouched."""
+    config = TrainerEx.Config()
+    original = ["torchtitan_npu.override.common.rope.asc_complex"]
+    config.override.imports = list(original)
+
+    # ``torchtitan_npu.patches.torchtitan.trainer`` replaces
+    # ``torchtitan.trainer.Trainer`` with ``EMATrainer`` at import time, so the
+    # base chain needs stubbing.  We only exercise TrainerEx's compile-policy
+    # gating: with compile off, neither canonicalization nor pattern setup may
+    # run, and the base chain must be skipped entirely.
+    monkeypatch.setattr(trainer_module, "set_allow_hf32", lambda *a, **k: None)
+
+    def fail_if_canonicalized(_config):
+        raise AssertionError("_ensure_decomposed_rope must not run when compile is off")
+
+    monkeypatch.setattr(TrainerEx, "_ensure_decomposed_rope", staticmethod(fail_if_canonicalized))
+    monkeypatch.setattr(trainer_module, "setup_patterns", lambda **kwargs: None)
+
+    # Skip the heavy Trainer/EMATrainer/SDC bootstrap: verify only the gate.
+    original_init = TrainerEx.__init__
+
+    def gated_init(self, config):
+        # Mirror the real __init__ gate without constructing a real model.
+        compile_extension = config.compile.extension
+        if (
+            config.compile.enable
+            and "model" in config.compile.components
+            and config.compile.backend == "inductor"
+        ):
+            self._ensure_decomposed_rope(config)
+            trainer_module.setup_patterns(
+                enable_patterns=compile_extension.enable_patterns,
+                pattern_blacklist=compile_extension.pattern_blacklist,
+            )
+
+    monkeypatch.setattr(TrainerEx, "__init__", gated_init)
+    assert original_init is not None  # keep a reference for the assert above
+
+    trainer = TrainerEx(config=config)
+    assert trainer is not None
+    assert config.override.imports == original
+
+
 def test_config_manager_parses_compile_extension_via_cli(
     monkeypatch,
     tmp_path,

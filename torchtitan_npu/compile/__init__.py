@@ -3,9 +3,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Compile-time extensions for NPU models."""
+"""Compile-time extensions for NPU models.
 
-__all__ = ["PatternReplacement", "register_pre_aot_patterns", "setup_patterns"]
+Public contract: ``PatternReplacement`` (pattern definition) and
+``setup_patterns`` (the single policy entry point).  The additive
+``register_pre_aot_patterns`` helper is intentionally NOT part of the public
+API — pattern policy ownership belongs to ``pattern_manager`` alone.
+"""
+
+__all__ = ["PatternReplacement", "setup_patterns"]
 
 from .pattern_manager import setup_patterns
-from .pattern_replacement import PatternReplacement, register_pre_aot_patterns
+from .pattern_replacement import PatternReplacement

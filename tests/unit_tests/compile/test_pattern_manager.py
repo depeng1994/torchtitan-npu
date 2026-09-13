@@ -87,6 +87,35 @@ def test_setup_patterns_idempotent_repeated_call(isolated_pass):
     assert installed_after_second.count(isolated_pass) == installed_after_first.count(isolated_pass)
 
 
+def test_setup_patterns_policy_transitions_replace_patterns(isolated_pass):
+    """Policy change must fully replace the pattern set (no additive residue)."""
+    all_names = {
+        "dsv4_partial_rope_wo_squeeze_forward",
+        "dsv4_partial_rope_wo_squeeze_inverse",
+        "dsv4_partial_rope_attention_kv_forward",
+        "dsv4_partial_rope_compressor_kv_forward",
+        "npu_interleaved_rope",
+    }
+    dsv4_names = all_names - {"npu_interleaved_rope"}
+
+    # all -> disabled
+    pattern_manager.setup_patterns(enable_patterns=True)
+    assert set(isolated_pass._patterns) == all_names
+    pattern_manager.setup_patterns(enable_patterns=False)
+    assert isolated_pass._patterns == {}
+
+    # disabled -> blacklist (DSV4 patterns only)
+    pattern_manager.setup_patterns(
+        enable_patterns=True,
+        pattern_blacklist=tuple(sorted(dsv4_names)),
+    )
+    assert set(isolated_pass._patterns) == {"npu_interleaved_rope"}
+
+    # blacklist -> all
+    pattern_manager.setup_patterns(enable_patterns=True)
+    assert set(isolated_pass._patterns) == all_names
+
+
 def test_discover_skips_missing_module(monkeypatch, isolated_pass):
     monkeypatch.setattr(
         pattern_manager,
@@ -97,6 +126,26 @@ def test_discover_skips_missing_module(monkeypatch, isolated_pass):
     patterns = pattern_manager._discover_builtin_patterns()
 
     assert "npu_interleaved_rope" in patterns
+
+
+def test_discover_rejects_duplicate_pattern_names(monkeypatch, isolated_pass):
+    """Two modules exporting the same pattern name must raise, not silently shadow."""
+    dup_module = importlib.import_module(
+        "torchtitan_npu.compile.patterns.common.interleaved_rope"
+    )
+    monkeypatch.setattr(
+        pattern_manager,
+        "_BUILTIN_PATTERN_MODULES",
+        (
+            "torchtitan_npu.compile.patterns.common.interleaved_rope",
+            "torchtitan_npu.compile.patterns.common.interleaved_rope",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Duplicate NPU pattern name"):
+        pattern_manager._discover_builtin_patterns()
+
+    assert dup_module  # keep reference to avoid unused-import lint
 
 
 def test_common_pattern_module_exports_named_patterns():

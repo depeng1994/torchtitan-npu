@@ -31,7 +31,13 @@ _BUILTIN_PATTERN_MODULES: tuple[str, ...] = (
 
 
 def _discover_builtin_patterns() -> dict[str, PatternReplacement]:
-    """Import builtin pattern modules and collect their PATTERNS dicts."""
+    """Import builtin pattern modules and collect their PATTERNS dicts.
+
+    Pattern names are stable, user-facing identifiers: two modules exporting
+    the same name is a registry invariant violation (a later module would
+    silently shadow an earlier one and corrupt policy semantics), so it raises
+    instead of silently overwriting.
+    """
     patterns: dict[str, PatternReplacement] = {}
     for module_path in _BUILTIN_PATTERN_MODULES:
         try:
@@ -42,6 +48,12 @@ def _discover_builtin_patterns() -> dict[str, PatternReplacement]:
         module_patterns = getattr(module, "PATTERNS", None)
         if not module_patterns:
             continue
+        duplicates = sorted(set(patterns) & set(module_patterns))
+        if duplicates:
+            raise ValueError(
+                "Duplicate NPU pattern name(s) across pattern modules: "
+                f"{duplicates} (module {module_path})"
+            )
         patterns.update(module_patterns)
     return patterns
 
