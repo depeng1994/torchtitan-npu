@@ -245,27 +245,9 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         self._metadata_extension = cfg.metadata_extension.build()
         self._v41_plan = None
         self._v41_context = None
-        if cfg.kv_source_layers is not None:
-            from torchtitan_npu.models.deepseek_v41.attention import (
-                V41AttentionContext,
-                build_v41_compression_spec,
-            )
 
-            self._v41_plan = build_v41_compression_spec(
-                layer_ids=tuple(range(cfg.n_layers)),
-                ratios=self.compress_ratios[: cfg.n_layers],
-                kv_source_layers=cfg.kv_source_layers,
-                index_source_layers=cfg.index_source_layers or (),
-                candidate_source_layer=(
-                    20 if cfg.candidate_source_layer is None else cfg.candidate_source_layer
-                ),
-                candidate_topk_blocks=cfg.candidate_topk_blocks,
-                candidate_block_size=cfg.candidate_block_size,
-            )
-            self._v41_context = V41AttentionContext.empty()
-            for layer in self.layers.values():
-                layer._v41_plan = self._v41_plan
-                layer._v41_context = self._v41_context
+        # V41 plan/context construction is the responsibility of the
+        # V41 subclass (see V41Model.__init__).
 
     def shard_extra_kwargs_for_cp(
         self,

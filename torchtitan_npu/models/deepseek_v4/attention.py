@@ -400,9 +400,9 @@ class Attention(BaseAttention):
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr)
+        q = q.view(bsz, seqlen, -1, self.head_dim)
         if self.post_q_rms_norm:
             q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.norm_eps)
-        q = q.view(bsz, seqlen, -1, self.head_dim)
         q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
         golden = golden_enabled()
         q_rope = (

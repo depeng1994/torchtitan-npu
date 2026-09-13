@@ -60,12 +60,44 @@ class V41Model(DeepSeekV4Model):
         vision_encoder: DeepSeekV4VisionEncoder.Config | None = None
         image_marker_embeddings: ImageMarkerEmbeddings.Config | None = None
 
+        def update_from_config(self, *, config, **kwargs):
+            if config.parallelism.context_parallel_degree != 1:
+                raise NotImplementedError(
+                    "DeepSeek V4.1 currently supports CP=1 only; "
+                    f"got CP={config.parallelism.context_parallel_degree}"
+                )
+            super().update_from_config(config=config, **kwargs)
+
     def __init__(self, config: Config):
         super().__init__(config)
         self.vision_encoder = config.vision_encoder.build() if config.vision_encoder is not None else None
         self.image_marker_embeddings = (
             config.image_marker_embeddings.build() if config.image_marker_embeddings is not None else None
         )
+        # V4.1-specific CSA2 plan/context construction lives here (not in the
+        # V4 base) so deepseek_v41 never becomes an upstream dependency of
+        # deepseek_v4. The V4 base only exposes the generic seam.
+        if config.kv_source_layers is not None:
+            from .attention import (
+                V41AttentionContext,
+                build_v41_compression_spec,
+            )
+
+            self._v41_plan = build_v41_compression_spec(
+                layer_ids=tuple(range(config.n_layers)),
+                ratios=self.compress_ratios[: config.n_layers],
+                kv_source_layers=config.kv_source_layers,
+                index_source_layers=config.index_source_layers or (),
+                candidate_source_layer=(
+                    20 if config.candidate_source_layer is None else config.candidate_source_layer
+                ),
+                candidate_topk_blocks=config.candidate_topk_blocks,
+                candidate_block_size=config.candidate_block_size,
+            )
+            self._v41_context = V41AttentionContext.empty()
+            for layer in self.layers.values():
+                layer._v41_plan = self._v41_plan
+                layer._v41_context = self._v41_context
 
     def _prepare_multimodal_embeddings(
         self,
