@@ -628,43 +628,35 @@ def test_ensure_decomposed_rope_canonicalizes_imports(imports, expected):
 
 
 def test_ensure_decomposed_rope_ignores_compile_off(monkeypatch):
-    """Without Inductor model compile, imports are left untouched."""
+    """Without Inductor model compile, imports are left untouched.
+
+    Uses the *real* ``TrainerEx.__init__`` gate (not a copied stub) by
+    monkeypatching the heavy base-initialisation chain so only the compile-
+    policy gating is exercised.
+    """
     config = TrainerEx.Config()
     original = ["torchtitan_npu.override.common.rope.asc_complex"]
     config.override.imports = list(original)
 
-    # ``torchtitan_npu.patches.torchtitan.trainer`` replaces
-    # ``torchtitan.trainer.Trainer`` with ``EMATrainer`` at import time, so the
-    # base chain needs stubbing.  We only exercise TrainerEx's compile-policy
-    # gating: with compile off, neither canonicalization nor pattern setup may
-    # run, and the base chain must be skipped entirely.
+    import torchtitan_npu.patches.torchtitan.trainer as trainer_patch
+
+    def base_init_stub(self, c):
+        self.config = c
+        self.model_parts = []
+        self.gradient_accumulation_steps = 1
+
+    monkeypatch.setattr(Trainer, "__init__", base_init_stub)
+    monkeypatch.setattr(trainer_patch.EMATrainer, "__init__", base_init_stub)
     monkeypatch.setattr(trainer_module, "set_allow_hf32", lambda *a, **k: None)
+    from torchtitan.config.configurable import Configurable
+
+    monkeypatch.setattr(Configurable.Config, "build", lambda self, **kw: None)
 
     def fail_if_canonicalized(_config):
         raise AssertionError("_ensure_decomposed_rope must not run when compile is off")
 
     monkeypatch.setattr(TrainerEx, "_ensure_decomposed_rope", staticmethod(fail_if_canonicalized))
     monkeypatch.setattr(trainer_module, "setup_patterns", lambda **kwargs: None)
-
-    # Skip the heavy Trainer/EMATrainer/SDC bootstrap: verify only the gate.
-    original_init = TrainerEx.__init__
-
-    def gated_init(self, config):
-        # Mirror the real __init__ gate without constructing a real model.
-        compile_extension = config.compile.extension
-        if (
-            config.compile.enable
-            and "model" in config.compile.components
-            and config.compile.backend == "inductor"
-        ):
-            self._ensure_decomposed_rope(config)
-            trainer_module.setup_patterns(
-                enable_patterns=compile_extension.enable_patterns,
-                pattern_blacklist=compile_extension.pattern_blacklist,
-            )
-
-    monkeypatch.setattr(TrainerEx, "__init__", gated_init)
-    assert original_init is not None  # keep a reference for the assert above
 
     trainer = TrainerEx(config=config)
     assert trainer is not None

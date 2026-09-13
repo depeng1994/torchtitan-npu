@@ -149,38 +149,27 @@ class TrainerEx(Trainer):
         return result
 
 
+_trainer_config_converter = TrainerConfigConverter(
+    target_type=TrainerEx.Config,
+    component_types={
+        "compile": CompileConfig,
+        "optimizer": OptimizerConfig,
+        "checkpoint": CheckpointManager.Config,
+        "profiler": CANNProfiler.Config,
+        "training": TrainingConfig,
+    },
+)
 config_manager.register_config_converter(
     Trainer.Config,
-    TrainerConfigConverter(
-        target_type=TrainerEx.Config,
-        component_types={
-            "compile": CompileConfig,
-            "optimizer": OptimizerConfig,
-            "checkpoint": CheckpointManager.Config,
-            "profiler": CANNProfiler.Config,
-            "training": TrainingConfig,
-        },
-    ),
+    _trainer_config_converter,
 )
 
 # Also register for the original Trainer.Config in case the EMATrainer
 # monkeypatch (patches/torchtitan/trainer.py) created a class-identity split.
 # EMATrainer.__bases__[0] is the original Trainer captured before the patch.
-try:
-    _orig_trainer_config = Trainer.__bases__[0].Config
-    if _orig_trainer_config is not Trainer.Config:
-        config_manager.register_config_converter(
-            _orig_trainer_config,
-            TrainerConfigConverter(
-                target_type=TrainerEx.Config,
-                component_types={
-                    "compile": CompileConfig,
-                    "optimizer": OptimizerConfig,
-                    "checkpoint": CheckpointManager.Config,
-                    "profiler": CANNProfiler.Config,
-                    "training": TrainingConfig,
-                },
-            ),
-        )
-except (IndexError, AttributeError):
-    pass
+_orig_trainer_config = Trainer.__bases__[0].Config
+if _orig_trainer_config is not Trainer.Config:
+    config_manager.register_config_converter(
+        _orig_trainer_config,
+        _trainer_config_converter,
+    )
