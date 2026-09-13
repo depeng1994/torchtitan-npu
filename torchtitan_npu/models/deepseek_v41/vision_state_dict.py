@@ -10,8 +10,9 @@ class DeepSeekV41VisionStateDictAdapter:
 
     Owns keys under ``vision.*`` / ``vision_encoder.*`` and the special
     markers ``image_start`` / ``image_newline`` / ``image_end`` /
-    ``image_marker_embeddings.*``.  Everything else (text backbone, per-layer
-    MoE router bias) is handled by the V4 base adapter.
+    ``image_marker_embeddings.*``.  Text-backbone keys are delegated to the
+    inherited V4 adapter; V4.1-only text-side mappings are registered by the
+    composed adapter below.
     """
 
     _FROM_HF = {
@@ -55,11 +56,11 @@ class DeepSeekV41VisionStateDictAdapter:
     @staticmethod
     def _to_hf_key(key: str) -> str:
         if key.startswith("vision_encoder.aligner."):
-            return "aligner." + key[len("vision_encoder."):]
+            return "aligner." + key[len("vision_encoder.") :]
         if key.startswith("vision_encoder."):
             return "vision." + key[len("vision_encoder.") :]
         if key.startswith("image_marker_embeddings."):
-            return key[len("image_marker_embeddings."):]
+            return key[len("image_marker_embeddings.") :]
         return key
 
     def from_hf(self, state_dict: Mapping[str, Any]) -> dict[str, Any]:
@@ -88,17 +89,11 @@ class DeepSeekV41VisionStateDictAdapter:
 
 
 class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
-    """V4.1 state-dict adapter composing the V4 base mapping with the vision
-    tower and image-marker embeddings.
-
-    Keys are partitioned by ownership before conversion so that neither
-    adapter ever sees (or echoes back) keys owned by the other — otherwise
-    the base mapping's local keys would be contaminated by the raw HF keys
-    the vision adapter passes through unchanged.
-    """
+    """V4.1 adapter composing the V4 text mapping with V4.1-owned additions."""
 
     def __init__(self, model_config, hf_assets_path):
         super().__init__(model_config, hf_assets_path)
+        self.from_hf_map["layers.{}.ffn.gate.bias_vl"] = "layers.{}.moe.router.bias_vl"
         self._vision_adapter = DeepSeekV41VisionStateDictAdapter()
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
