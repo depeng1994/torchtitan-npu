@@ -22,6 +22,10 @@ generic interleaved RoPE（fallback）注册。
 --compile.backend inductor
 ```
 
+`TrainerEx` 在 `--compile.backend=inductor` 且 `--compile.components` 包含 `"model"`
+时自动将 RoPE canonicalization 收敛为 `decomposed` 路径（若 `asc_complex` 存在则替换之），
+因此无需手动指定 RoPE override。
+
 快速调试时使用：
 
 ```text
@@ -33,29 +37,9 @@ TORCHINDUCTOR_NPU_EXT_DEBUG=allfallback
 
 性能验证时不设置 `TORCHINDUCTOR_NPU_EXT_DEBUG=allfallback`。
 
-模型 override 必须包含：
-
-```text
-torchtitan_npu.override.common.rope.decomposed
-torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata
-torchtitan_npu.override.deepseek_v4.sparse_attn.asc
-```
-
-完整 wrapper 调用示例（示意；需按下文“约束”把 wrapper 默认的
-`rope.asc_complex` 调整为 `rope.decomposed`）：
-
-```bash
-bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh \
-  --compile.enable \
-  --compile.components model \
-  --compile.backend inductor
-```
-
 ### 约束
 
 - 算子当前只在 A5 上可用；
-- 不能同时启用 `torchtitan_npu.override.common.rope.asc_complex`，否则原始小算子
-  片段会提前变成 `torch_npu.npu_rotary_mul`，pattern 无法命中；
+- `--compile.extension.no-enable-patterns` 可禁用所有 pattern，保留 decomposed Torch graph；
 - 当前不支持 DeepSeek-V4 golden attention，整网验证使用 `sparse_attn.asc`；
-- `examples/deepseek_v4/*.sh` 的默认测试组合使用 `rope.asc_complex`；验证该 pattern
-  前需要把 wrapper 里的 attention override 切到 `rope.decomposed`。
+- 完整验证入口使用 `tests/integration_tests` 中的 `dsv4_smla_1rank_inductor_rope` 用例。

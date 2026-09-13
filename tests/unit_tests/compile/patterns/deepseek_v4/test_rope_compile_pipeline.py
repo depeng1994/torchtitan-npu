@@ -144,7 +144,12 @@ def test_partial_rope_via_real_manager(monkeypatch, inverse):
 
 def test_partial_blacklisted_generic_takes_over(monkeypatch):
     """Blacklist DSV4 partial patterns; generic interleaved must consume the graph."""
+    partial_calls = 0
     generic_calls = 0
+
+    def fake_inplace_partial_rotary_mul(x, cos, sin, *, rotary_mode, partial_slice):
+        nonlocal partial_calls
+        partial_calls += 1
 
     def fake_npu_rotary_mul(x, cos, sin, *, rotary_mode):
         nonlocal generic_calls
@@ -153,6 +158,11 @@ def test_partial_blacklisted_generic_takes_over(monkeypatch):
         return _decomposed_rope_arith(x, cos, sin)
 
     monkeypatch.setattr(
+        inplace_partial_rope,
+        "inplace_partial_rotary_mul",
+        fake_inplace_partial_rotary_mul,
+    )
+    monkeypatch.setattr(
         interleaved_rope.torch_npu,
         "npu_rotary_mul",
         fake_npu_rotary_mul,
@@ -160,12 +170,12 @@ def test_partial_blacklisted_generic_takes_over(monkeypatch):
 
     torch.manual_seed(0)
     x = torch.randn(2, 4, 2, 16, dtype=torch.bfloat16)
-    angles = torch.randn(2, 4, 1, 8)
+    angles = torch.randn(2, 4, 1, 4)
     cos = angles.cos().repeat_interleave(2, dim=-1)
     sin = angles.sin().repeat_interleave(2, dim=-1)
-    expected = _decomposed_rope_arith(x, cos, sin)
+    expected = _complex_reference(x, cos, sin, inverse=False)
 
-    # Only register the GENERIC pattern (blacklist all DSV4 patterns)
+    # Register ONLY the generic pattern (blacklist all DSV4 patterns)
     setup_patterns(
         enable_patterns=True,
         pattern_blacklist=(
@@ -176,13 +186,15 @@ def test_partial_blacklisted_generic_takes_over(monkeypatch):
         ),
     )
 
-    graph_module = torch.fx.symbolic_trace(_decomposed_rope_arith)
+    # Same DSV4 split -> rope -> cat graph as the specific-pattern test
+    graph_module = torch.fx.symbolic_trace(_PartialRoPEModule(inverse=False))
     _PRE_AOT_PATTERN_PASS(graph_module.graph)
     graph_module.recompile()
 
     actual = graph_module(x, cos, sin)
 
-    assert generic_calls == 1, "generic pattern must be matched exactly once"
+    assert partial_calls == 0, "DSV4 partial patterns must be blacklisted"
+    assert generic_calls == 1, "generic pattern must take over the rotary fragment"
     torch.testing.assert_close(actual, expected)
 
 

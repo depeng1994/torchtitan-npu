@@ -73,5 +73,5 @@ Inductor 默认自动注册所有 NPU pre-AOT patterns。如需禁用或黑名�
 `TORCHINDUCTOR_NPU_EXT_DEBUG=allfallback`。
 
 > 注：当前 DeepSeek-V4 golden attention 不支持启用 inplace partial RoPE pattern。
-> `torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope` 的使能依赖
-> `torchtitan_npu.override.common.rope.decomposed`，启用 pattern 时应一并注入该 override。
+> `TrainerEx` 在 `--compile.backend=inductor` 且 `--compile.components` 包含 `"model"` 时自动将
+> RoPE canonicalization 收敛为 `decomposed`，无需手动指定 override。

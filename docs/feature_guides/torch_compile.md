@@ -105,7 +105,7 @@ pattern 的开发与验证方法见[片段融合算子接入](../graph_pattern_f
 
 ### 2.4 配置和环境变量
 
-本仓直接复用上游 `torchtitan.config.CompileConfig`：
+`torchtitan-npu` 的 `CompileConfig` 继承上游 `torchtitan.config.CompileConfig` 并追加 `extension` 字段：
 
 | 字段 | 当前默认值 | 作用 |
 | --- | --- | --- |
@@ -113,6 +113,8 @@ pattern 的开发与验证方法见[片段融合算子接入](../graph_pattern_f
 | `components` | `["model", "loss"]` | 选择标准训练路径中的编译组件 |
 | `backend` | `"inductor"` | 传给 `torch.compile` 的 Dynamo backend |
 | `enable_async_tensor_parallel` | `False` | 是否启用 Inductor Async TP |
+| `extension.enable_patterns` | `True` | 是否注册 NPU pre-AOT graph patterns |
+| `extension.pattern_blacklist` | `()` | 阻止注册的 pattern 名称元组 |
 
 当前固定的上游基线实际消费 `model` 和 `loss`。配置中写入其他名称，不代表对应组件已经编译。
 `COMPILE_BACKEND` 便捷入口会显式选择 `model`；需要同时编译 loss 时，在脚本末尾追加

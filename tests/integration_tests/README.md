@@ -50,10 +50,11 @@ python -m tests.integration_tests.run_tests /tmp/checkpoint_resume_output \
   --test_suite models --test_name dsv4_checkpoint_resume_ep2_fsdp2 --ngpu 2
 ```
 
-四个 SMLA case 都设置 `check_loss=False`，因此不会启用 `--debug.deterministic`，也不会
+五个 SMLA case 都设置 `check_loss=False`，因此不会启用 `--debug.deterministic`，也不会
 读取 golden loss。它们用于覆盖 SMLA/NPU override 在单卡、EP+FSDP、CP+EP+FSDP 以及
-MTP+CP 场景下的实际构图、编译和训练执行路径；单卡、EP2 和 CP2+EP2 场景均使用
-`aot_eager`，并默认覆盖 fused MoE token dispatcher。MTP+CP 用例固定使用
+MTP+CP 场景下的实际构图、编译和训练执行路径；单卡 `aot_eager`、单卡 `inductor`（含 pre-AOT
+pattern 验证）、EP2 和 CP2+EP2 场景均使用 `aot_eager`，并默认覆盖 fused MoE token dispatcher。
+MTP+CP 用例固定使用
 `deepseek_v4_debugmodel`、CP2 和 headtail，在 C4 packed sequence 上执行完整的
 MTP forward、chunked loss 和 backward。
 

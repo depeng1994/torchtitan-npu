@@ -24,6 +24,7 @@ from torchtitan_npu.config import (
 )
 from torchtitan_npu.config import TrainingConfig as NPUTrainingConfig
 from torchtitan_npu.config import manager as config_manager
+from torchtitan_npu.config.configs import CompileConfig as NPUCompileConfig
 from torchtitan_npu.config.converters import TrainerConfigConverter
 from torchtitan_npu.distributed import utils as distributed_utils
 from torchtitan_npu.extensions.profiler import CANNProfiler
@@ -72,9 +73,23 @@ def test_config_manager_adapts_standard_component_configs_without_changing_value
     assert isinstance(config.optimizer, OptimizerConfig)
     assert config.optimizer.name == "native"
     for config_field in fields(Trainer.Config):
-        if config_field.name in ("optimizer", "profiler", "training", "checkpoint"):
+        if config_field.name in (
+            "optimizer",
+            "profiler",
+            "training",
+            "checkpoint",
+            "compile",
+        ):
             continue
         assert getattr(config, config_field.name) == getattr(source, config_field.name)
+    # NPU CompileConfig extends upstream with an extension field; verify the
+    # upstream fields pass through unchanged.
+    assert isinstance(config.compile, NPUCompileConfig)
+    for config_field in fields(source.compile):
+        assert getattr(config.compile, config_field.name) == getattr(
+            source.compile,
+            config_field.name,
+        )
     assert isinstance(config.profiler, CANNProfiler.Config)
     assert isinstance(config.profiler.build(), CANNProfiler)
     for config_field in fields(source.profiler):
@@ -571,3 +586,36 @@ def test_npu_compile_config_keeps_upstream_post_init():
     # Async TP without model compile must raise exactly like upstream.
     with pytest.raises(ValueError, match="Async TP requires"):
         CompileConfig(enable_async_tensor_parallel=True)
+
+
+def test_config_manager_parses_compile_extension_via_cli(
+    monkeypatch,
+    tmp_path,
+):
+    """``--compile.extension.*`` CLI flags reach ``TrainerEx.Config.compile.extension``."""
+    module_name = "_torchtitan_npu_compile_extension_registry"
+
+    def test_config() -> Trainer.Config:
+        return Trainer.Config(hf_assets_path=str(tmp_path))
+
+    _install_config_registry(monkeypatch, module_name, test_config)
+
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            module_name,
+            "--config",
+            "test_config",
+            "--compile.enable",
+            "--compile.extension.no-enable-patterns",
+            "--compile.extension.pattern-blacklist",
+            "dsv4_partial_rope_wo_squeeze_forward",
+        ]
+    )
+
+    assert isinstance(config, TrainerEx.Config)
+    assert config.compile.enable is True
+    assert config.compile.extension.enable_patterns is False
+    assert config.compile.extension.pattern_blacklist == (
+        "dsv4_partial_rope_wo_squeeze_forward",
+    )
