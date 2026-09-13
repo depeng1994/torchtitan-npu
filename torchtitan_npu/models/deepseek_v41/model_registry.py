@@ -158,6 +158,8 @@ def _make_v41_config(
     # multimodal config (which carries the vision fields) before injecting the
     # ViT and marker embeddings.
     config = V41Model.Config(**{f.name: getattr(config, f.name) for f in dataclasses.fields(config)})
+    # V4.1 uses collapse_pre_mix instead of the V4 classic hc_head.
+    config.hc_head = None
     # Promote each layer to the V4.1 block type so the Single-Pass mHC
     # forward (through __call__ / FSDP hooks) is used at runtime.
     from .block import DeepSeekV41TransformerBlock

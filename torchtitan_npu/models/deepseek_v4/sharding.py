@@ -274,13 +274,14 @@ def set_deepseek_v4_sharding_config(
 ) -> None:
     set_decoder_sharding_config(config, enable_sp=enable_sp)
 
-    config.hc_head.sharding_config = ShardingConfig(
-        state_shardings={
-            "hc_fn": _dense_param_rep,
-            "hc_base": _dense_param_rep,
-            "hc_scale": _dense_param_rep,
-        },
-    )
+    if config.hc_head is not None:
+        config.hc_head.sharding_config = ShardingConfig(
+            state_shardings={
+                "hc_fn": _dense_param_rep,
+                "hc_base": _dense_param_rep,
+                "hc_scale": _dense_param_rep,
+            },
+        )
     if getattr(config, "image_marker_embeddings", None) is not None:
         config.image_marker_embeddings.sharding_config = ShardingConfig(
             state_shardings=dict.fromkeys(("image_start", "image_newline", "image_end"), _dense_param_rep)
@@ -330,13 +331,14 @@ def _set_deepseek_v4_mtp_sharding(
             block_sharding.in_dst_shardings["mtp_input_valid_mask"] = activation
         mtp_layer_cfg.sharding_config = block_sharding
 
-        mtp_layer_cfg.hc_head.sharding_config = ShardingConfig(
-            state_shardings={
-                "hc_fn": _dense_param_rep,
-                "hc_base": _dense_param_rep,
-                "hc_scale": _dense_param_rep,
-            },
-        )
+        if mtp_layer_cfg.hc_head is not None:
+            mtp_layer_cfg.hc_head.sharding_config = ShardingConfig(
+                state_shardings={
+                    "hc_fn": _dense_param_rep,
+                    "hc_base": _dense_param_rep,
+                    "hc_scale": _dense_param_rep,
+                },
+            )
 
         mtp_layer_cfg.enorm.sharding_config = norm
         mtp_layer_cfg.hnorm.sharding_config = norm
