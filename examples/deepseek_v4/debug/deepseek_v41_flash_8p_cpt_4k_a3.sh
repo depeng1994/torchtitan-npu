@@ -7,17 +7,14 @@
 # Run this script on a single node.
 # Append CLI arguments to override the defaults below:
 #   ./examples/deepseek_v4/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh --training.steps 5
-# USE_GOLDEN=1 (the default here) selects the Golden reference operators the
-# frozen Stage-01 baseline was produced with; USE_GOLDEN=0 selects the AscendC
-# kernels. The frozen baseline is deterministic, so --debug.seed 42 and
-# --debug.deterministic are on by default (DETERMINISTIC=0 to drop them).
+# USE_GOLDEN=1 is the only currently supported operator path. USE_GOLDEN=0
+# (AscendC) is rejected until the ratio-1 shared/global-KV contract is
+# implemented by the fused sparse-attention kernels.
 
 set -euo pipefail
 
-# Enable model compilation by default; callers can override the backend.
-# V4.1 Golden leaves this empty: the frozen baseline was produced without
-# compilation, and --compile.enable would change the traced graph.
-export COMPILE_BACKEND="${COMPILE_BACKEND:-}"
+# V4.1 currently supports eager execution only; keep compile disabled.
+export COMPILE_BACKEND=""
 
 NGPU="${NGPU:-8}"
 WORLD_SIZE="${NGPU}"
@@ -41,17 +38,14 @@ DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
 SPMD_BACKEND="spmd_types"
 
 # Training
-# V4.1 ratio=2 has no CANN SparseFlashMla metadata kernel yet; the verified
-# reference fallback is sized at 512.
+# The reference fallback is intentionally kept at seq_len=512 for the 8-card
+# validation recipe.
 SEQ_LEN=512
 MBS=1
 GBS=8
 STEPS=40
 
 # Debug
-# DeepSeek-V4.1 uses the golden/reference path only: its ratio-1 CSA2 shared
-# global KV contract is not yet supported by the AscendC sparse-attention
-# kernels.  USE_GOLDEN=0 (the AscendC path) is rejected below.
 export USE_GOLDEN="${USE_GOLDEN:-1}"
 if [[ "${USE_GOLDEN}" != "1" ]]; then
     echo "FATAL: DeepSeek-V4.1 currently supports the golden/reference path only."
@@ -103,8 +97,6 @@ TRAINING_ARGS="
 "
 
 # Checkpoint
-# The frozen Stage-01 recipe does no checkpoint I/O, so this entry keeps
-# `--checkpoint.no-enable` and passes no folder; override on the CLI if needed.
 CHECKPOINT_ARGS="
     --checkpoint.no-enable
 "
@@ -143,12 +135,11 @@ OPTIMIZER_ARGS="
 "
 # The upstream scheduler clamps warmup to training.steps, so a short comparison
 # run would silently get a different LR curve; total-steps above pins the
-# schedule length to the baseline recipe instead.
+# schedule length to the validation recipe instead.
 OPTIMIZER_OVERRIDES="
     torchtitan_npu.override.common.optimizer.virtual
 "
 
-# Only the golden/reference path is supported (see the USE_GOLDEN guard above).
 NPU_OPS_OVERRIDES=(
     torchtitan_npu.override.common.rope.workaround
     torchtitan_npu.override.deepseek_v4.sparse_attn.golden
