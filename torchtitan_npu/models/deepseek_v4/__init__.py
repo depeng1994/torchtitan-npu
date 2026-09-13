@@ -150,6 +150,7 @@ def _make_indexer_config(
     coff: int = 2,
     source_key: bool = False,
     source_head_dim: int | None = None,
+    rotation: str = "hadamard",
 ) -> Indexer.Config:
     config_kwargs = dict(
         rope=dataclasses.replace(rope),
@@ -157,6 +158,7 @@ def _make_indexer_config(
         index_head_dim=index_head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
+        rotation=rotation,
         wq_b=Linear.Config(
             in_features=q_lora_rank,
             out_features=num_index_heads * index_head_dim,
@@ -218,6 +220,8 @@ def _make_v4_attn_config(
     v41_mode: bool = False,
     is_kv_source: bool = True,
     is_index_source: bool = False,
+    post_q_rms_norm: bool = True,
+    rotation: str = "hadamard",
 ) -> Attention.Config:
     hd = head_dim
     per_group_in = (n_heads * hd) // n_groups
@@ -257,6 +261,7 @@ def _make_v4_attn_config(
             coff=1 if v41_mode else 2,
             source_key=v41_mode and is_kv_source,
             source_head_dim=hd if v41_mode else None,
+            rotation=rotation,
         )
     inner_attention_cfg = CompressedSparseInnerAttention.Config(
         window_size=window_size,
@@ -277,6 +282,7 @@ def _make_v4_attn_config(
         n_groups=n_groups,
         compress_ratio=compress_ratio,
         norm_eps=norm_eps,
+        post_q_rms_norm=post_q_rms_norm,
         inner_attention=inner_attention_cfg,
         compressed_sparse_attention=compressed_sparse_attention_cfg,
         rope=dataclasses.replace(rope),
@@ -427,6 +433,8 @@ def _build_v4_layers(
     hc_eps: float = 1e-6,
     kv_source_layers: tuple[int, ...] | None = None,
     index_source_layers: tuple[int, ...] | None = None,
+    post_q_rms_norm: bool = True,
+    rotation: str = "hadamard",
 ) -> list[DeepSeekV4TransformerBlock.Config]:
     if len(compress_ratios) != n_layers:
         raise ValueError(f"compress_ratios ({len(compress_ratios)} entries) must cover n_layers ({n_layers}).")
@@ -459,6 +467,8 @@ def _build_v4_layers(
             v41_mode=v41_mode,
             is_kv_source=is_kv_source,
             is_index_source=is_index_source,
+            post_q_rms_norm=post_q_rms_norm,
+            rotation=rotation,
         )
 
         moe_cfg = _make_v4_moe_config(
@@ -629,6 +639,8 @@ def _make_v4_config(
     candidate_source_layer: int | None = None,
     candidate_topk_blocks: int = 2048,
     candidate_block_size: int = 8,
+    post_q_rms_norm: bool = True,
+    rotation: str = "hadamard",
 ) -> DeepSeekV4Model.Config:
     """Build a DSV4 model config from the flavor constants."""
 
@@ -682,6 +694,8 @@ def _make_v4_config(
         hc_eps=hc_eps,
         kv_source_layers=kv_source_layers,
         index_source_layers=index_source_layers,
+        post_q_rms_norm=post_q_rms_norm,
+        rotation=rotation,
     )
 
     mtp_layers = []

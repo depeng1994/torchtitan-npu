@@ -16,6 +16,7 @@ from torchtitan.models.common.attention import AttentionMasksType  # noqa: TC002
 
 from torchtitan_npu.models.deepseek_v4.golden import golden_enabled
 from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
+from torchtitan_npu.models.deepseek_v4.mtp import _make_identity_pre_mix
 
 # Annotation-only names, kept importable at runtime on purpose: the trainer
 # resolves ``Model.Config`` fields by name, so moving them behind TYPE_CHECKING
@@ -199,40 +200,69 @@ class V41Model(DeepSeekV4Model):
         token_types: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
     ):
+        """V4.1 forward with Single-Pass mHC for vision and text-only batches.
 
+        V4.1 runs all layers via ``forward_with_pre_mix`` — the pre_mix flows
+        between sub-layers — and collapses at the decoder exit with
+        ``collapse_pre_mix`` rather than the V4 classic ``hc_head``.
+        """
         if self._v41_context is not None:
             self._v41_context.reset()
+
         if pixel_values is None:
             # A text-only batch must not inherit the image mask left on the
             # layers by a previous multimodal batch in the same process.
             for layer in self.layers.values():
                 layer._v41_image_mask = None
-            output = super().forward(
+            embeds = input_embeds
+        else:
+            if image_grid is None or (image_spans is None and image_feature_indices is None):
+                raise ValueError("pixel_values requires image_grid and image_spans or image_feature_indices")
+            image_mask = token_types.ge(0) if token_types is not None else None
+            for layer in self.layers.values():
+                layer._v41_image_mask = image_mask
+            embeds = self._prepare_multimodal_embeddings(
                 tokens,
-                positions=positions,
-                attention_masks=attention_masks,
-                mtp_batch=mtp_batch,
-                input_embeds=input_embeds,
+                pixel_values=pixel_values,
+                image_grid=image_grid,
+                image_spans=image_spans,
+                image_feature_indices=image_feature_indices,
+                token_types=token_types,
             )
-            return output.float() if golden_enabled() else output
-        if image_grid is None or (image_spans is None and image_feature_indices is None):
-            raise ValueError("pixel_values requires image_grid and image_spans or image_feature_indices")
-        image_mask = token_types.ge(0) if token_types is not None else None
-        for layer in self.layers.values():
-            layer._v41_image_mask = image_mask
-        embeds = self._prepare_multimodal_embeddings(
-            tokens,
-            pixel_values=pixel_values,
-            image_grid=image_grid,
-            image_spans=image_spans,
-            image_feature_indices=image_feature_indices,
-            token_types=token_types,
+
+        # Single-Pass mHC main stack (V4.1): the pre_mix flows between
+        # sub-layers and collapse_pre_mix replaces the V4 decoder hc_head.
+        tok_embeddings = self.tok_embeddings
+        input_ids = tokens.detach().long()
+        hidden = (
+            embeds
+            if embeds is not None
+            else (tok_embeddings(tokens) if tok_embeddings is not None else tokens)
         )
-        output = super().forward(
-            tokens,
-            positions=positions,
-            attention_masks=attention_masks,
-            mtp_batch=mtp_batch,
-            input_embeds=embeds,
+        hidden = hidden.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+
+        pre_mix = None
+        last_layer = None
+        for layer in self.layers.values():
+            if pre_mix is None:
+                pre_mix = _make_identity_pre_mix(hidden, self.hc_mult)
+            hidden, pre_mix = layer.forward_with_pre_mix(
+                hidden,
+                input_ids,
+                attention_masks,
+                positions,
+                pre_mix=pre_mix,
+            )
+            last_layer = layer
+
+        if last_layer is None:
+            raise RuntimeError("V4.1 model has no transformer layers")
+        main_hidden = last_layer.collapse_pre_mix(hidden, pre_mix)
+        main_hidden = self.norm(main_hidden) if self.norm is not None else main_hidden
+
+        output = (
+            main_hidden
+            if self._skip_lm_head or self.lm_head is None
+            else self.lm_head(main_hidden)
         )
         return output.float() if golden_enabled() else output

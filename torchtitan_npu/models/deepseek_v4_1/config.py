@@ -50,8 +50,8 @@ class DeepSeekV41CropConfig:
             raise ValueError("the initial single-node crop requires 16 experts and EP8")
         if self.fsdp_shard_degree != 8:
             raise ValueError("the initial single-node crop requires FSDP shard degree 8")
-        if self.context_parallel_degree not in (1, 2):
-            raise ValueError("the first V4.1 implementation supports CP1 or CP2")
+        if self.context_parallel_degree != 1:
+            raise ValueError("the first V4.1 implementation is CP1-only")
         if self.candidate_topk_blocks <= 0 or self.candidate_block_size <= 0:
             raise ValueError("candidate block parameters must be positive")
 

@@ -386,6 +386,14 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         attention_context: _MTPAttentionContext,
         input_embeds: torch.Tensor | None = None,
     ) -> _MTPForwardState:
+        """Classic DeepSeek-V4 main stack forward.
+
+        Each block collapses within itself (no cross-sublayer mix), and
+        ``hc_head`` collapses the multi-stream state after all layers.
+        V4.1's single-pass path bypasses this via a separate loop that
+        uses ``forward_with_pre_mix`` on every block and
+        ``collapse_pre_mix`` at the decoder exit.
+        """
         tok_embeddings = self.tok_embeddings
         input_ids = tokens.detach().long()
         hidden = (
@@ -395,39 +403,14 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         )
         hidden = hidden.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
 
-        pre_mix = None
-        last_layer = None
         for layer in self.layers.values():
-            forward_with_pre_mix = getattr(layer, "forward_with_pre_mix", None)
-            if forward_with_pre_mix is None:
-                hidden = layer(
-                    hidden,
-                    input_ids,
-                    attention_context.attention_masks,
-                    attention_context.positions,
-                )
-                pre_mix = None
-            else:
-                if pre_mix is None:
-                    pre_mix = _make_identity_pre_mix(hidden, self.hc_mult)
-                hidden, pre_mix = layer(
-                    hidden,
-                    input_ids,
-                    attention_context.attention_masks,
-                    attention_context.positions,
-                    pre_mix=pre_mix,
-                )
-                last_layer = layer
-
-        if pre_mix is not None and last_layer is not None:
-            collapse = getattr(last_layer, "collapse_pre_mix", None)
-            if collapse is None:
-                raise TypeError(
-                    "a DeepSeek-V4 block with forward_with_pre_mix must expose collapse_pre_mix"
-                )
-            main_hidden = collapse(hidden, pre_mix)
-        else:
-            main_hidden = self.hc_head(hidden)
+            hidden = layer(
+                hidden,
+                input_ids,
+                attention_context.attention_masks,
+                attention_context.positions,
+            )
+        main_hidden = self.hc_head(hidden)
         main_hidden = self.norm(main_hidden) if self.norm is not None else main_hidden
         return _MTPForwardState(tok_embeddings, hidden, main_hidden)
 

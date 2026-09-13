@@ -5,6 +5,7 @@
 
 from dataclasses import dataclass, field
 from functools import cache
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -276,6 +277,7 @@ class Indexer(Module):
         compressor: "Compressor.Config | None" = None
         wk: Linear.Config | None = None
         k_norm: RMSNorm.Config | None = None
+        rotation: Literal["hadamard", "none"] = "hadamard"
 
     def __init__(self, config: Config):
         super().__init__()
@@ -285,6 +287,7 @@ class Indexer(Module):
         self.rope_head_dim = cfg.rope_head_dim
         self.compress_ratio = cfg.compress_ratio
         self.softmax_scale = cfg.index_head_dim**-0.5
+        self.rotation = cfg.rotation
         self.rope = cfg.rope.build()
 
         self.wq_b = cfg.wq_b.build()
@@ -304,9 +307,8 @@ class Indexer(Module):
             self.k_norm = None
             self.compressor = None
 
-    @staticmethod
-    def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
-        if golden_enabled():
+    def _rotate_activation(self, x: torch.Tensor) -> torch.Tensor:
+        if self.rotation == "none":
             return x
         d = x.size(-1)
         H = _hadamard(d, dtype=x.dtype, device=x.device)

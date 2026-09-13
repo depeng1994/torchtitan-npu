@@ -31,7 +31,6 @@ from .mhc import HcPost, HcPre
 from .mtp import (
     DeepSeekV4MTPDecoder,
     MTPBatch,
-    _make_identity_pre_mix,
     prepare_mtp_batch,
 )
 from .token_dispatcher import build_cp_plan
@@ -111,23 +110,24 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         input_ids: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
-        *,
-        pre_mix: torch.Tensor | None = None,
     ):
-        """Compatibility wrapper for callers that invoke a block directly."""
-        return_tuple = pre_mix is not None
-        if pre_mix is None:
-            pre_mix = _make_identity_pre_mix(x, self.hc_attn_pre.hc_mult)
-        hidden, next_pre_mix = self.forward_with_pre_mix(
-            x,
-            input_ids,
-            attention_masks,
-            positions,
-            pre_mix=pre_mix,
-        )
-        if return_tuple:
-            return hidden, next_pre_mix
-        return hidden
+        """Classic DeepSeek-V4 mHC forward.
+
+        Each sub-block (attention / FFN) collapses the multi-stream state with
+        its own ``pre`` mix inside ``HcPre``, and the decoder applies the
+        standalone ``hc_head`` collapse after all layers.  V4.1's single-pass
+        mHC (mix carried between sub-layers) goes through
+        ``forward_with_pre_mix`` instead.
+        """
+        residual = x
+        x, post, comb = self.hc_attn_pre(x)
+        x = self.attention(self.attention_norm(x), attention_masks, positions)
+        x = self.hc_post(x, residual, post, comb)
+        residual = x
+        x, post, comb = self.hc_ffn_pre(x)
+        x = self.moe(self.ffn_norm(x), input_ids=input_ids)
+        x = self.hc_post(x, residual, post, comb)
+        return x
 
 
 class DeepSeekV4Model(DeepSeekV4MTPDecoder):

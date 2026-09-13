@@ -153,6 +153,8 @@ def _make_v41_config(
         rope_factor=16.0,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
+        post_q_rms_norm=False,
+        rotation="none",
     )
 
     # The V4 base builder is decoder-only, so promote its config to the V4.1

@@ -287,6 +287,10 @@ class Attention(BaseAttention):
         n_groups: int
         compress_ratio: int
         norm_eps: float
+        # V4 re-scales the Q projection by RMS after ``wq_b`` (HF V4:
+        # q_norm(wq_a) -> wq_b -> RMS rescale -> RoPE); V4.1 dropped the
+        # second rescale (q_norm(wq_a) -> wq_b -> RoPE).
+        post_q_rms_norm: bool = True
 
         # Declare submodule configs as fields so sharding can be assigned before
         # the modules are built.
@@ -317,6 +321,7 @@ class Attention(BaseAttention):
         self.n_groups = cfg.n_groups
         self.compress_ratio = cfg.compress_ratio
         self.norm_eps = cfg.norm_eps
+        self.post_q_rms_norm = cfg.post_q_rms_norm
         self.rope = cfg.rope.build()
 
         self.token_dispatcher = cfg.token_dispatcher.build()
@@ -395,6 +400,8 @@ class Attention(BaseAttention):
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr)
+        if self.post_q_rms_norm:
+            q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.norm_eps)
         q = q.view(bsz, seqlen, -1, self.head_dim)
         q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
         golden = golden_enabled()
