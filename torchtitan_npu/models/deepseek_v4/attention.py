@@ -519,18 +519,12 @@ class Attention(BaseAttention):
                         and v41_context is not None
                         and v41_layer_id == v41_plan.candidate_source_layer
                     ):
-                        from torchtitan_npu.models.deepseek_v41.attention import (
-                            select_candidate_blocks,
-                        )
-
                         compress_lens = dense_mask.squeeze(1).sum(dim=-1)
-                        v41_context.put_candidates(
-                            select_candidate_blocks(
-                                index_scores,
-                                compress_lens,
-                                v41_plan.candidate_topk_blocks,
-                                v41_plan.candidate_block_size,
-                            )
+                        v41_context.build_candidates(
+                            index_scores,
+                            compress_lens,
+                            v41_plan.candidate_topk_blocks,
+                            v41_plan.candidate_block_size,
                         )
                     v41_context.put_source(
                         v41_layer_id,

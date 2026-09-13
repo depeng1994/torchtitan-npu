@@ -5,8 +5,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-# The plan/context classes below are built at class-creation time and the V4
-# decoder imports this module, so these imports have to stay at the top.
+# The plan/context classes below are built at class-creation time and shared
+# across the V4.1 model, so these imports have to stay at the top.
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +106,22 @@ class V41AttentionContext:
 
     def put_candidates(self, candidates: Any) -> None:
         self.candidates = candidates
+
+    def build_candidates(
+        self,
+        index_scores: torch.Tensor,
+        compress_lens: torch.Tensor | int,
+        topk_blocks: int,
+        block_size: int,
+    ) -> None:
+        """Select and store the level-one candidate block mask.
+
+        Kept inside the V4.1 context so the V4 decoder only needs the seam
+        (``put_candidates`` / ``candidates``) and never imports this package.
+        """
+        self.put_candidates(
+            select_candidate_blocks(index_scores, compress_lens, topk_blocks, block_size)
+        )
 
     def resolve(self, plan: V41CompressionSpec, layer_id: int) -> tuple[Any | None, Any | None, Any | None]:
         kv_source = plan.kv_source_for(layer_id)

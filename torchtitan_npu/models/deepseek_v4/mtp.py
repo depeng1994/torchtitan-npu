@@ -215,17 +215,6 @@ class _MTPAttentionContext(NamedTuple):
     positions: torch.Tensor | None
 
 
-def _make_identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
-    """Return the one-hot stream mix used at the input of the main stack."""
-    pre_mix = torch.zeros(
-        (*x.shape[:2], hc_mult),
-        device=x.device,
-        dtype=torch.float32,
-    )
-    pre_mix[..., 0] = 1.0
-    return pre_mix
-
-
 class _MTPForwardState(NamedTuple):
     tok_embeddings: Any
     hc_hidden: torch.Tensor

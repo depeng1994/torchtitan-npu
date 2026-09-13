@@ -16,7 +16,7 @@ from torchtitan.models.common.attention import AttentionMasksType  # noqa: TC002
 
 from torchtitan_npu.models.deepseek_v4.golden import golden_enabled
 from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
-from torchtitan_npu.models.deepseek_v4.mtp import _make_identity_pre_mix
+from torchtitan_npu.models.deepseek_v4.mhc import _make_identity_pre_mix
 
 # Annotation-only names, kept importable at runtime on purpose: the trainer
 # resolves ``Model.Config`` fields by name, so moving them behind TYPE_CHECKING
@@ -61,14 +61,22 @@ class V41Model(DeepSeekV4Model):
         image_marker_embeddings: ImageMarkerEmbeddings.Config | None = None
 
         def update_from_config(self, *, config, **kwargs):
+            # Fail-fast capability guards before any parent-side mutation.
+            cp = config.parallelism.context_parallel_degree
+            pp = config.parallelism.pipeline_parallel_degree
+            if cp != 1:
+                raise NotImplementedError(
+                    "DeepSeek V4.1 currently supports CP=1 only; "
+                    f"got CP={cp}"
+                )
+            if pp != 1:
+                raise NotImplementedError(
+                    "DeepSeek V4.1 does not support pipeline parallelism; "
+                    f"got PP={pp}"
+                )
             # Explicit parent-class call: the slots=True dataclass copy created
             # by the configurable framework can break zero-arg super() binding.
             DeepSeekV4Model.Config.update_from_config(self, config=config, **kwargs)
-            if config.parallelism.context_parallel_degree != 1:
-                raise NotImplementedError(
-                    "DeepSeek V4.1 currently supports CP=1 only; "
-                    f"got CP={config.parallelism.context_parallel_degree}"
-                )
 
     def __init__(self, config: Config):
         super().__init__(config)

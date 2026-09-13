@@ -6,18 +6,13 @@
 """V4.1 transformer block: Single-Pass mHC on top of the V4 block."""
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 
 from torchtitan.models.common.attention import AttentionMasksType
 
 from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4TransformerBlock
-
-if TYPE_CHECKING:
-    from .mtp import _make_identity_pre_mix
-else:
-    from torchtitan_npu.models.deepseek_v4.mtp import _make_identity_pre_mix
+from torchtitan_npu.models.deepseek_v4.mhc import _make_identity_pre_mix
 
 
 class DeepSeekV41TransformerBlock(DeepSeekV4TransformerBlock):
