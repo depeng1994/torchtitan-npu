@@ -55,8 +55,22 @@ python -m tests.integration_tests.run_tests <empty_out_dir> \
 
 结果（`assert_losses_equal` 为 bit-exact、无容差比较）：
 - **100 步全部跑通**，loss 轨迹与 golden 趋势一致（12.32 → 4.85），无崩溃、无 grad_norm 异常。
-- **step 1 精确匹配**（12.31539249420166 == golden 同值），证明模型初始化、前向/反向、数据流均与冻结基线一致。
-- **step 2 起出现微小偏差**：每步 abs diff 0.0004~0.003（相对 0.003%~0.05%），且**不随训练累积发散**（steps 1-100 各区间 max rel diff 均 ≤ 0.06%），呈典型浮点累加顺序/通信非确定性特征。
+- **step 1 精确匹配**（12.31539249420166 == golden 同值），证明初始参数下 step-1 forward loss 与冻结基线一致。
+- **step 2 起出现微小偏差**：每步 abs diff 0.0004~0.003（相对 0.003%~0.05%），且**不随训练累积发散**（steps 1-100 各区间 max rel diff 均 ≤ 0.06%），差异首次在第一次参数更新后可见。
 - 偏差来源：golden 在 `43da3cb` 冻结后，本分支后续 7 个修复 commit（Q RMS per-head 实现、FSDP `layer()` 调用路径、Indexer rotation 配置等）虽保持语义一致，但浮点运算路径（算子融合/通信归约顺序）发生变化，导致 bit-exact 轨迹漂移。
 
-**处理决定**：不修改 golden 文件（`tests/assets/losses/dsv41_golden_8p_ep8.txt`）来"掩盖"失败；随 PR 提交以上验证说明，由上游维护者评估并刷新 golden（若有需要）。
+### Determinism 验证（2026-09-13，a3-4-docker）
+
+- **同一 HEAD（af79151）连续两次 8P 100-step 运行 bit-exact**：两次结果逐 step loss 完全一致。
+  → 排除了 distributed runtime nondeterminism；偏差是 **deterministic implementation-path change**。
+
+### Golden Bisect（2-step，2026-09-13）
+
+| Commit | 结果 | 结论 |
+|--------|------|------|
+| `c38e5a3`（3798b91 之前） | **8P 直接崩溃**：`RuntimeError: aten.matmul.default got mixed torch.Tensor and DTensor` | 旧执行路径（`layer.forward_with_pre_mix()` 绕过 `nn.Module.__call__`）在 FSDP8+EP8 下**根本无法运行** |
+| `3798b91`（FSDP lifecycle 修复） | 2-step 可运行，step1 与 golden 精确一致 | 修复是必要的：`layer(...)` 经 `__call__` 触发 FSDP shard/unshard hooks |
+
+**Bisect 结论**：divergence 起点是 `3798b91` 的 FSDP `__call__` lifecycle 修复——它把旧 baseline 依赖的 **broken execution path** 修正为正确的 module 调用路径。这属于"修复已知错误执行路径"，而非随机浮点漂移。
+
+**处理决定**：Golden refresh 是合理的（regression invariant 应保护 correct implementation，而非永久保护 known-broken FSDP call path）。但按 GPT maintainer 要求，golden 文件的刷新作为单独 baseline-migration commit 提交，并在 commit message 中说明迁移原因；validation 文档明确记录 migration reason（FSDP lifecycle correctness fix）。
