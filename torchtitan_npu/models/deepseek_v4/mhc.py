@@ -92,8 +92,20 @@ class HcPre(Module):
         return self.collapse(x, collapse_mix), post, comb, pre
 
     def forward(self, x):
-        y, post, comb, _ = self.forward_with_pre_mix(x)
-        return y, post, comb
+        """DeepSeek-V4 classic mHC path with the legacy autograd graph intact.
+
+        Keep one shared FP32 cast for both mix generation and stream collapse.
+        Splitting those into two independent casts is forward-equivalent but
+        changes BF16 backward rounding before gradient accumulation, which is
+        visible in the frozen V4 training trajectory.
+        """
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(2).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x, self.hc_fn.float()) * rsqrt
+        pre, post, comb = self._sinkhorn(mixes, self.hc_scale.float(), self.hc_base.float())
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        return y.to(dtype), post, comb
 
 
 class HcPost(Module):
