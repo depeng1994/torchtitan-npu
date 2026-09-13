@@ -16,7 +16,7 @@ import importlib
 import logging
 from typing import TYPE_CHECKING
 
-from torchtitan_npu.compile.pattern_replacement import register_pre_aot_patterns
+from torchtitan_npu.compile.pattern_replacement import configure_pre_aot_patterns
 
 if TYPE_CHECKING:
     from torchtitan_npu.compile.pattern_replacement import PatternReplacement
@@ -58,25 +58,32 @@ def setup_patterns(
     same policy does not duplicate the shared pass.
     """
     if not enable_patterns:
+        configure_pre_aot_patterns({})
         logger.info("NPU compile patterns disabled; retaining decomposed Torch graph")
         return
 
     all_patterns = _discover_builtin_patterns()
     blacklist = frozenset(pattern_blacklist)
 
+    skipped: list[str] = []
     if blacklist:
+        skipped = [name for name in all_patterns if name in blacklist]
         selected = {
             name: p for name, p in all_patterns.items() if name not in blacklist
         }
-        skipped = [name for name in all_patterns if name in blacklist]
+        unknown = sorted(blacklist - set(all_patterns))
         for name in skipped:
             logger.info("NPU pattern %s skipped (blacklisted)", name)
+        for name in unknown:
+            logger.warning(
+                "NPU pattern %s blacklisted but not registered (typo?)", name
+            )
     else:
         selected = all_patterns
 
-    register_pre_aot_patterns(selected)
+    configure_pre_aot_patterns(selected)
     logger.info(
-        "NPU compile patterns registered: %d%s",
+        "NPU compile patterns configured: %d active (blacklisted: %d)",
         len(selected),
-        f" (blacklisted: {len(blacklist)})" if blacklist else "",
+        len(skipped),
     )

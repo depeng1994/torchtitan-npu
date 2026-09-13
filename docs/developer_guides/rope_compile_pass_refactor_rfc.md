@@ -2,7 +2,7 @@
 
 ## 状态
 
-- 状态：Implemented
+- 状态：Implementing
 - 基线分支：`refactor/rope-compile-pass`
 - 基线提交起点：`master@a23bda73d38306081248edb3b4df3b275fce87b8`
 - 范围：NPU RoPE override、pre-AOT pattern 注册/调度、CLI 开关、可观测性与验证

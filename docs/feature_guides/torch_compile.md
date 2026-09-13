@@ -94,10 +94,10 @@ NPU pre-AOT patterns（`pattern_manager`），无需手工设置 Python module p
 
 ```bash
 # 禁用全部 NPU patterns（保留 decomposed Torch graph）
---extension.compile.no-enable-patterns
+--compile.extension.no-enable-patterns
 
 # 黑名单指定 pattern（仅阻止目标 pattern；其余自动注册）
---extension.compile.pattern-blacklist dsv4_partial_rope_wo_squeeze_forward
+--compile.extension.pattern-blacklist dsv4_partial_rope_wo_squeeze_forward
 ```
 
 pattern 修改编译图，`override.imports` 修改配置树和组件，两者是独立入口。
@@ -126,8 +126,8 @@ pattern 的开发与验证方法见[片段融合算子接入](../graph_pattern_f
 | `TORCHINDUCTOR_NPU_BACKEND` | 选择 Inductor 内部的 NPU Codegen |
 | `ASCEND_SET_ENV_PATH` | 指定 CANN `set_env.sh`，未设置时按标准安装路径查找 |
 
-NPU pre-AOT pattern 的启用/黑名单通过 `--extension.compile.enable-patterns` 与
-`--extension.compile.pattern-blacklist` 控制，不再使用环境变量导入 pattern 模块。
+NPU pre-AOT pattern 的启用/黑名单通过 `--compile.extension.enable-patterns` 与
+`--compile.extension.pattern-blacklist` 控制，不再使用环境变量导入 pattern 模块。
 
 ## 3. 特殊背景及限制
 

@@ -13,7 +13,6 @@ from torchtitan_npu.compile import pattern_manager
 from torchtitan_npu.compile.pattern_replacement import (
     PatternReplacement,
     _PRE_AOT_PATTERN_PASS,
-    register_pre_aot_patterns,
 )
 
 

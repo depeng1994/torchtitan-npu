@@ -98,19 +98,44 @@ _PRE_AOT_PATTERN_PASS = _PreAOTPatternPass()
 def register_pre_aot_patterns(
     patterns: Mapping[str, PatternReplacement],
 ) -> None:
-    """Register patterns and install the shared pass for Inductor backends."""
+    """Register patterns and install the shared pass for Inductor backends.
+
+    This is an *additive* API — patterns accumulate.  Prefer
+    :func:`configure_pre_aot_patterns` when the caller intends to set the
+    exact pattern set (e.g. ``pattern_manager.setup_patterns``).
+    """
 
     if not patterns:
         return
     _PRE_AOT_PATTERN_PASS._patterns.update(patterns)
+    _ensure_pass_installed()
+    logger.info(
+        "NPU compile patterns registered: %d (total in pass: %d)",
+        len(patterns),
+        len(_PRE_AOT_PATTERN_PASS._patterns),
+    )
+
+
+def configure_pre_aot_patterns(
+    patterns: Mapping[str, PatternReplacement],
+) -> None:
+    """Set the exact pattern set, replacing any previously registered patterns.
+
+    Unlike ``register_pre_aot_patterns`` (additive), this function replaces the
+    entire pattern dict so ``enable_patterns=False`` or a changed blacklist
+    takes effect immediately.
+    """
+    _PRE_AOT_PATTERN_PASS._patterns.clear()
+    if patterns:
+        _PRE_AOT_PATTERN_PASS._patterns.update(patterns)
+        _ensure_pass_installed()
+
+
+def _ensure_pass_installed() -> None:
+    """Ensure the shared pre-AOT pass is in the Inductor custom pass chain."""
     installed = get_custom_graph_passes(inductor_config.pre_grad_custom_pass)
     if _PRE_AOT_PATTERN_PASS not in installed:
         inductor_config.pre_grad_custom_pass = (
             *installed,
             _PRE_AOT_PATTERN_PASS,
         )
-    logger.info(
-        "NPU compile patterns registered: %d (total in pass: %d)",
-        len(patterns),
-        len(_PRE_AOT_PATTERN_PASS._patterns),
-    )

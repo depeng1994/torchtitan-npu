@@ -531,11 +531,43 @@ def test_compile_extension_config_explicit_values():
     assert cfg.pattern_blacklist == ("dsv4_partial_rope_wo_squeeze_forward",)
 
 
-def test_extension_config_contains_compile_extension():
-    """ExtensionConfig carries a ``compile`` sub-config with correct defaults."""
+def test_extension_config_has_no_compile_extension():
+    """Compile extension lives on the compile component, not global extension."""
     from torchtitan_npu.config.configs import ExtensionConfig
 
     ext = ExtensionConfig()
-    assert hasattr(ext, "compile")
-    assert ext.compile.enable_patterns is True
-    assert ext.compile.pattern_blacklist == ()
+    assert not hasattr(ext, "compile")
+
+
+def test_npu_compile_config_carries_extension():
+    """NPU CompileConfig extends upstream and owns the compile extension."""
+    from torchtitan_npu.config.configs import CompileConfig, CompileExtensionConfig
+
+    cfg = CompileConfig()
+    assert cfg.enable is False
+    assert cfg.backend == "inductor"
+    assert isinstance(cfg.extension, CompileExtensionConfig)
+    assert cfg.extension.enable_patterns is True
+    assert cfg.extension.pattern_blacklist == ()
+
+    explicit = CompileConfig(
+        enable=True,
+        extension=CompileExtensionConfig(
+            enable_patterns=False,
+            pattern_blacklist=("dsv4_partial_rope_wo_squeeze_forward",),
+        ),
+    )
+    assert explicit.enable is True
+    assert explicit.extension.enable_patterns is False
+    assert explicit.extension.pattern_blacklist == (
+        "dsv4_partial_rope_wo_squeeze_forward",
+    )
+
+
+def test_npu_compile_config_keeps_upstream_post_init():
+    """Upstream CompileConfig.__post_init__ still runs on the NPU subclass."""
+    from torchtitan_npu.config.configs import CompileConfig
+
+    # Async TP without model compile must raise exactly like upstream.
+    with pytest.raises(ValueError, match="Async TP requires"):
+        CompileConfig(enable_async_tensor_parallel=True)

@@ -156,13 +156,9 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",
             ),
-            extra_override_imports=(
-                # Decomposed RoPE must be imported *after* asc_complex so
-                # the last exact-match override (decomposed) wins.  This
-                # produces the canonical decomposed graph that DSV4 partial
-                # and generic interleaved patterns consume.
-                "torchtitan_npu.override.common.rope.decomposed",
-            ),
+            # TrainerEx auto-injects the decomposed RoPE override on the
+            # Inductor path, so this case also exercises that automatic
+            # canonicalization (no manual override import needed).
             use_golden=False,
             check_loss=False,
         ),
