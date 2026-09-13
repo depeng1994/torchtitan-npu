@@ -50,6 +50,8 @@ def test_v4_hc_pre_bf16_backward_matches_legacy_graph_bitwise():
     _loss(actual_outputs).backward()
     _loss(reference_outputs).backward()
 
+    assert x_actual.grad is not None
+    assert x_reference.grad is not None
     assert torch.equal(x_actual.grad, x_reference.grad)
     for (actual_name, actual_param), (reference_name, reference_param) in zip(
         actual.named_parameters(),
@@ -57,4 +59,6 @@ def test_v4_hc_pre_bf16_backward_matches_legacy_graph_bitwise():
         strict=True,
     ):
         assert actual_name == reference_name
+        assert actual_param.grad is not None
+        assert reference_param.grad is not None
         assert torch.equal(actual_param.grad, reference_param.grad), actual_name
