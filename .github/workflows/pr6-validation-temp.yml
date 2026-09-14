@@ -30,16 +30,50 @@ jobs:
           python -m pip install pre-commit pyrefly pytest
           python -m pip install -e .
 
+      - name: Prepare TorchTitan source for Pyrefly
+        run: |
+          rm -rf /tmp/torchtitan
+          git clone --depth 1 --branch v0.3.0 https://github.com/pytorch/torchtitan.git /tmp/torchtitan
+          test "$(git -C /tmp/torchtitan rev-parse HEAD)" = "086bf6c166ec85c1298eb5596fa9bf95f6a2d840"
+
       - name: V4 unit tests
         id: v4
         continue-on-error: true
-        run: pytest -q tests/unit_tests/models/deepseek_v4/
+        run: |
+          python - <<'PY'
+          import pathlib
+          import sys
+          import types
+          import pytest
+
+          root = pathlib.Path.cwd()
+          package = types.ModuleType("torchtitan_npu")
+          package.__file__ = str(root / "torchtitan_npu" / "__init__.py")
+          package.__path__ = [str(root / "torchtitan_npu")]
+          package.__package__ = "torchtitan_npu"
+          sys.modules["torchtitan_npu"] = package
+          raise SystemExit(pytest.main(["-q", "tests/unit_tests/models/deepseek_v4/"]))
+          PY
 
       - name: V41 unit tests
         id: v41
         if: always()
         continue-on-error: true
-        run: pytest -q tests/unit_tests/models/deepseek_v41/
+        run: |
+          python - <<'PY'
+          import pathlib
+          import sys
+          import types
+          import pytest
+
+          root = pathlib.Path.cwd()
+          package = types.ModuleType("torchtitan_npu")
+          package.__file__ = str(root / "torchtitan_npu" / "__init__.py")
+          package.__path__ = [str(root / "torchtitan_npu")]
+          package.__package__ = "torchtitan_npu"
+          sys.modules["torchtitan_npu"] = package
+          raise SystemExit(pytest.main(["-q", "tests/unit_tests/models/deepseek_v41/"]))
+          PY
 
       - name: Pre-commit
         id: precommit
