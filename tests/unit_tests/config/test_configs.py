@@ -24,6 +24,7 @@ from torchtitan_npu.config import (
 )
 from torchtitan_npu.config import TrainingConfig as NPUTrainingConfig
 from torchtitan_npu.config import manager as config_manager
+from torchtitan_npu.config.configs import CompileConfig as NPUCompileConfig
 from torchtitan_npu.config.converters import TrainerConfigConverter
 from torchtitan_npu.distributed import utils as distributed_utils
 from torchtitan_npu.extensions.profiler import CANNProfiler
@@ -72,9 +73,23 @@ def test_config_manager_adapts_standard_component_configs_without_changing_value
     assert isinstance(config.optimizer, OptimizerConfig)
     assert config.optimizer.name == "native"
     for config_field in fields(Trainer.Config):
-        if config_field.name in ("optimizer", "profiler", "training", "checkpoint"):
+        if config_field.name in (
+            "optimizer",
+            "profiler",
+            "training",
+            "checkpoint",
+            "compile",
+        ):
             continue
         assert getattr(config, config_field.name) == getattr(source, config_field.name)
+    # NPU CompileConfig extends upstream with an extension field; verify the
+    # upstream fields pass through unchanged.
+    assert isinstance(config.compile, NPUCompileConfig)
+    for config_field in fields(source.compile):
+        assert getattr(config.compile, config_field.name) == getattr(
+            source.compile,
+            config_field.name,
+        )
     assert isinstance(config.profiler, CANNProfiler.Config)
     assert isinstance(config.profiler.build(), CANNProfiler)
     for config_field in fields(source.profiler):
@@ -508,3 +523,174 @@ def test_set_allow_hf32_updates_all_backends(monkeypatch, allow_hf32):
     assert fake_torch_npu.npu.matmul.allow_hf32 is allow_hf32
     assert fake_torch_npu.npu.conv.allow_hf32 is allow_hf32
     assert fake_torch_npu.npu.aclnn.allow_hf32 is allow_hf32
+
+
+def test_compile_extension_config_defaults():
+    """CompileExtensionConfig defaults are correct."""
+    from torchtitan_npu.config.configs import CompileExtensionConfig
+
+    cfg = CompileExtensionConfig()
+    assert cfg.enable_patterns is True
+    assert cfg.pattern_blacklist == ()
+
+
+def test_compile_extension_config_explicit_values():
+    """CompileExtensionConfig can be constructed with overrides."""
+    from torchtitan_npu.config.configs import CompileExtensionConfig
+
+    cfg = CompileExtensionConfig(
+        enable_patterns=False,
+        pattern_blacklist=("partial_rope_wo_squeeze_forward",),
+    )
+    assert cfg.enable_patterns is False
+    assert cfg.pattern_blacklist == ("partial_rope_wo_squeeze_forward",)
+
+
+def test_extension_config_has_no_compile_extension():
+    """Compile extension lives on the compile component, not global extension."""
+    from torchtitan_npu.config.configs import ExtensionConfig
+
+    ext = ExtensionConfig()
+    assert not hasattr(ext, "compile")
+
+
+def test_npu_compile_config_carries_extension():
+    """NPU CompileConfig extends upstream and owns the compile extension."""
+    from torchtitan_npu.config.configs import CompileConfig, CompileExtensionConfig
+
+    cfg = CompileConfig()
+    assert cfg.enable is False
+    assert cfg.backend == "inductor"
+    assert isinstance(cfg.extension, CompileExtensionConfig)
+    assert cfg.extension.enable_patterns is True
+    assert cfg.extension.pattern_blacklist == ()
+
+    explicit = CompileConfig(
+        enable=True,
+        extension=CompileExtensionConfig(
+            enable_patterns=False,
+            pattern_blacklist=("partial_rope_wo_squeeze_forward",),
+        ),
+    )
+    assert explicit.enable is True
+    assert explicit.extension.enable_patterns is False
+    assert explicit.extension.pattern_blacklist == (
+        "partial_rope_wo_squeeze_forward",
+    )
+
+
+def test_npu_compile_config_keeps_upstream_post_init():
+    """Upstream CompileConfig.__post_init__ still runs on the NPU subclass."""
+    from torchtitan_npu.config.configs import CompileConfig
+
+    # Async TP without model compile must raise exactly like upstream.
+    with pytest.raises(ValueError, match="Async TP requires"):
+        CompileConfig(enable_async_tensor_parallel=True)
+
+
+def test_config_package_reexports_compile_configs():
+    """CompileConfig/CompileExtensionConfig are public NPU config types."""
+    from torchtitan_npu.config import CompileConfig as PkgCompileConfig
+    from torchtitan_npu.config import CompileExtensionConfig as PkgCompileExtensionConfig
+    from torchtitan_npu.config.configs import CompileExtensionConfig as DirectCompileExtensionConfig
+
+    assert PkgCompileConfig is NPUCompileConfig
+    assert PkgCompileExtensionConfig is DirectCompileExtensionConfig
+
+
+@pytest.mark.parametrize(
+    ("imports", "expected"),
+    [
+        # Only asc_complex -> replaced by decomposed
+        (["torchtitan_npu.override.common.rope.asc_complex"],
+         ["torchtitan_npu.override.common.rope.decomposed"]),
+        # Already decomposed -> no duplication, no asc_complex residue
+        (["torchtitan_npu.override.common.rope.decomposed"],
+         ["torchtitan_npu.override.common.rope.decomposed"]),
+        # Both present -> only decomposed remains
+        (["torchtitan_npu.override.common.rope.asc_complex",
+          "torchtitan_npu.override.common.rope.decomposed"],
+         ["torchtitan_npu.override.common.rope.decomposed"]),
+        # No ComplexRoPE override -> decomposed appended
+        (["torchtitan_npu.override.deepseek_v4.sparse_attn.asc"],
+         ["torchtitan_npu.override.deepseek_v4.sparse_attn.asc",
+          "torchtitan_npu.override.common.rope.decomposed"]),
+    ],
+)
+def test_ensure_decomposed_rope_canonicalizes_imports(imports, expected):
+    """Inductor path must converge to exactly one decomposed ComplexRoPE."""
+    config = TrainerEx.Config()
+    config.override.imports = list(imports)
+
+    TrainerEx._ensure_decomposed_rope(config)
+
+    assert config.override.imports == expected
+
+
+def test_ensure_decomposed_rope_ignores_compile_off(monkeypatch):
+    """Without Inductor model compile, imports are left untouched.
+
+    Uses the *real* ``TrainerEx.__init__`` gate (not a copied stub) by
+    monkeypatching the heavy base-initialisation chain so only the compile-
+    policy gating is exercised.
+    """
+    config = TrainerEx.Config()
+    original = ["torchtitan_npu.override.common.rope.asc_complex"]
+    config.override.imports = list(original)
+
+    import torchtitan_npu.patches.torchtitan.trainer as trainer_patch
+
+    def base_init_stub(self, c):
+        self.config = c
+        self.model_parts = []
+        self.gradient_accumulation_steps = 1
+
+    monkeypatch.setattr(Trainer, "__init__", base_init_stub)
+    monkeypatch.setattr(trainer_patch.EMATrainer, "__init__", base_init_stub)
+    monkeypatch.setattr(trainer_module, "set_allow_hf32", lambda *a, **k: None)
+    from torchtitan.config.configurable import Configurable
+
+    monkeypatch.setattr(Configurable.Config, "build", lambda self, **kw: None)
+
+    def fail_if_canonicalized(_config):
+        raise AssertionError("_ensure_decomposed_rope must not run when compile is off")
+
+    monkeypatch.setattr(TrainerEx, "_ensure_decomposed_rope", staticmethod(fail_if_canonicalized))
+    monkeypatch.setattr(trainer_module, "setup_patterns", lambda **kwargs: None)
+
+    trainer = TrainerEx(config=config)
+    assert trainer is not None
+    assert config.override.imports == original
+
+
+def test_config_manager_parses_compile_extension_via_cli(
+    monkeypatch,
+    tmp_path,
+):
+    """``--compile.extension.*`` CLI flags reach ``TrainerEx.Config.compile.extension``."""
+    module_name = "_torchtitan_npu_compile_extension_registry"
+
+    def test_config() -> Trainer.Config:
+        return Trainer.Config(hf_assets_path=str(tmp_path))
+
+    _install_config_registry(monkeypatch, module_name, test_config)
+
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            module_name,
+            "--config",
+            "test_config",
+            "--compile.enable",
+            "--compile.extension.no-enable-patterns",
+            "--compile.extension.pattern-blacklist",
+            "partial_rope_wo_squeeze_forward",
+        ]
+    )
+
+    assert isinstance(config, TrainerEx.Config)
+    assert config.compile.enable is True
+    assert config.compile.extension.enable_patterns is False
+    assert config.compile.extension.pattern_blacklist == (
+        "partial_rope_wo_squeeze_forward",
+    )

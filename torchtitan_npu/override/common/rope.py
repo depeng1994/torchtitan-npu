@@ -6,7 +6,7 @@
 
 """Override: provide torch-compatible and AscendC fused rotary embeddings.
 
-The workaround variant uses pre-expanded cosine/sine caches; the AscendC fused
+The decomposed variant uses pre-expanded cosine/sine caches; the AscendC fused
 variants call ``torch_npu.npu_rotary_mul``. Select one per RoPE config.
 """
 
@@ -111,7 +111,7 @@ def _apply_interleaved_rope(
     return (x_float * cos + rotated * sin).type_as(x)
 
 
-class WorkaroundComplexRoPE(  # pyrefly: ignore [inconsistent-inheritance]
+class DecomposedComplexRoPE(  # pyrefly: ignore [inconsistent-inheritance]
     _InterleavedCacheMixin, ComplexRoPE
 ):
     @dataclass(kw_only=True, slots=True)
@@ -138,10 +138,10 @@ class WorkaroundComplexRoPE(  # pyrefly: ignore [inconsistent-inheritance]
 @override(
     target=ComplexRoPE.Config,
     exact=True,
-    description="Torch-compatible interleaved ComplexRoPE (workaround)",
+    description="Torch-compatible interleaved ComplexRoPE (decomposed)",
 )
-def workaround(cfg: ComplexRoPE.Config) -> WorkaroundComplexRoPE.Config:
-    return derive(cfg, WorkaroundComplexRoPE.Config)
+def decomposed(cfg: ComplexRoPE.Config) -> DecomposedComplexRoPE.Config:
+    return derive(cfg, DecomposedComplexRoPE.Config)
 
 
 class _FirstRowPositionsMixin:
@@ -164,10 +164,10 @@ class _FirstRowPositionsMixin:
 
 class AscComplexRoPE(
     _FirstRowPositionsMixin,
-    WorkaroundComplexRoPE,
+    DecomposedComplexRoPE,
 ):
     @dataclass(kw_only=True, slots=True)
-    class Config(WorkaroundComplexRoPE.Config):
+    class Config(DecomposedComplexRoPE.Config):
         pass
 
     @staticmethod

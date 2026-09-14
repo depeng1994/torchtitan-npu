@@ -71,8 +71,7 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 ```
 
 该 wrapper 最终调用 `scripts/run_train_multinodes.sh`；同一节点上的 `torchrun` 子进程会继承启动 shell
-的环境变量。需要启用 pre-AOT pattern 时，再增加 `PATTERN_IMPORTS`；如果脚本无法自动识别本机地址，设置
-对应的 `LOCAL_HOST`。
+的环境变量。如果脚本无法自动识别本机地址，设置对应的 `LOCAL_HOST`。
 
 ### 2.2 使用 `aot_eager` 检查编译兼容性
 
@@ -90,21 +89,23 @@ AutoFuse。当前 DeepSeek-V4 示例默认使用 `aot_eager`；验证 AutoFuse �
 
 ### 2.3 注册特定图 pattern
 
-当融合目标是 Module 内的一段稳定连续计算时，可以在进程启动前导入 pattern 模块：
+当融合目标是 Module 内的一段稳定连续计算时，Inductor 会在训练启动时自动发现并注册内置的
+NPU pre-AOT patterns（`pattern_manager`），无需手工设置 Python module path。可通过 CLI 控制：
 
 ```bash
-PATTERN_IMPORTS=torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope \
-TORCHINDUCTOR_NPU_BACKEND=ascendc \
-COMPILE_BACKEND=inductor \
-bash scripts/run_train.sh <训练参数>
+# 禁用全部 NPU patterns（保留 decomposed Torch graph）
+--compile.extension.no-enable-patterns
+
+# 黑名单指定 pattern（仅阻止目标 pattern；其余自动注册）
+--compile.extension.pattern-blacklist partial_rope_wo_squeeze_forward
 ```
 
-多个模块使用逗号分隔。pattern 修改编译图，`override.imports` 修改配置树和组件，两者是独立入口。
+pattern 修改编译图，`override.imports` 修改配置树和组件，两者是独立入口。
 pattern 的开发与验证方法见[片段融合算子接入](../graph_pattern_fusion.md)。
 
 ### 2.4 配置和环境变量
 
-本仓直接复用上游 `torchtitan.config.CompileConfig`：
+`torchtitan-npu` 的 `CompileConfig` 继承上游 `torchtitan.config.CompileConfig` 并追加 `extension` 字段：
 
 | 字段 | 当前默认值 | 作用 |
 | --- | --- | --- |
@@ -112,6 +113,8 @@ pattern 的开发与验证方法见[片段融合算子接入](../graph_pattern_f
 | `components` | `["model", "loss"]` | 选择标准训练路径中的编译组件 |
 | `backend` | `"inductor"` | 传给 `torch.compile` 的 Dynamo backend |
 | `enable_async_tensor_parallel` | `False` | 是否启用 Inductor Async TP |
+| `extension.enable_patterns` | `True` | 是否注册 NPU pre-AOT graph patterns |
+| `extension.pattern_blacklist` | `()` | 阻止注册的 pattern 名称元组 |
 
 当前固定的上游基线实际消费 `model` 和 `loss`。配置中写入其他名称，不代表对应组件已经编译。
 `COMPILE_BACKEND` 便捷入口会显式选择 `model`；需要同时编译 loss 时，在脚本末尾追加
@@ -123,9 +126,10 @@ pattern 的开发与验证方法见[片段融合算子接入](../graph_pattern_f
 | --- | --- |
 | `COMPILE_BACKEND` | 非空时，启动脚本追加 model compile CLI |
 | `TORCHINDUCTOR_NPU_BACKEND` | 选择 Inductor 内部的 NPU Codegen |
-| `PATTERN_IMPORTS` | `TORCHTITAN_NPU_PATTERN_IMPORTS` 的脚本便捷别名 |
-| `TORCHTITAN_NPU_PATTERN_IMPORTS` | 导入并注册以逗号分隔的 pattern 模块 |
 | `ASCEND_SET_ENV_PATH` | 指定 CANN `set_env.sh`，未设置时按标准安装路径查找 |
+
+NPU pre-AOT pattern 的启用/黑名单通过 `--compile.extension.enable-patterns` 与
+`--compile.extension.pattern-blacklist` 控制，不再使用环境变量导入 pattern 模块。
 
 ## 3. 特殊背景及限制
 
@@ -287,13 +291,16 @@ loss 由上游 `BaseLoss._maybe_compile` 独立检查 `components`，并使用�
 
 ### 5.3 pre-AOT pattern
 
-`torchtitan_npu.compile` 在首次导入时读取 `TORCHTITAN_NPU_PATTERN_IMPORTS`。目标模块调用
-`register_pre_aot_patterns`，将具名 `PatternReplacement` 追加到共享 `_PreAOTPatternPass`：
+`torchtitan_npu.compile.pattern_manager` 在训练启动时按稳定顺序自动导入内置 pattern
+modules（DSV4 partial 融合在前，generic RoPE 在后），应用 `enable_patterns` /
+`pattern_blacklist` 后，将具名 `PatternReplacement` 追加到共享 `_PreAOTPatternPass`：
 
 - 保留已经存在的 Inductor custom pass；
 - 共享 pass 只安装一次；
 - pattern 未命中时保留原图；
-- pattern 名称、字面量策略、源码和 closure 参数参与 cache identity。
+- pattern 名称、字面量策略、源码和 closure 参数参与 cache identity；
+- 每次 pre-AOT invocation 打印汇总统计：`registered` / `matched_patterns` /
+  `replacements` / `cumulative_replacements`。
 
 模型已经编译后再注册 pattern，不会追溯修改已生成的 compiled callable。DeepSeek-V4 partial RoPE 是当前参考
 实现，详细的 search/replacement、alias 和梯度约束不在本文重复展开。
@@ -325,7 +332,7 @@ loss 由上游 `BaseLoss._maybe_compile` 独立检查 `components`，并使用�
 | 量化训练 | `TrainerEx` 在模型构建前执行编译感知的量化配置转换；量化不会自动启用 compile |
 | TP/EP/FSDP | 并行化顺序决定编译边界；标准 CompileConfig 不等于 GraphTrainer 的图内通信调度 |
 | Async TP | 要求 compile 已启用、`components` 包含 `model` 且存在 TP mesh |
-| 多机训练 | 所有节点必须使用相同软件版本、Codegen backend 和 pattern imports |
+| 多机训练 | 所有节点必须使用相同软件版本、Codegen backend 和 pattern 开关 |
 
 ## 6. 验证、支持边界与关键文件索引
 
@@ -352,7 +359,7 @@ loss 由上游 `BaseLoss._maybe_compile` 独立检查 `components`，并使用�
 | loss 编译 | `components` 包含 `loss` | 独立于模型编译；收益取决于 loss 图规模和 fallback |
 | AscendC AutoFuse | `backend=inductor` 且 NPU backend 为 `ascendc` | 实际融合范围由 `torch_npu`、CANN、SoC、dtype、shape 和 layout 决定 |
 | `aot_eager` 检查 | `backend=aot_eager` | 可验证成图和正反向，不证明 AutoFuse 性能 |
-| pre-AOT pattern | 显式导入 pattern 模块 | 当前提供 DeepSeek-V4 partial RoPE 示例；真实 Kernel 需在配套算子环境验证 |
+| pre-AOT pattern | 自动注册（默认开启） | 当前提供 DeepSeek-V4 partial RoPE 与 generic interleaved RoPE；真实 Kernel 需在配套算子环境验证 |
 | GraphTrainer | 选择 `graph_trainer_*` 配置 | 独立特性，不属于本文标准 CompileConfig 路径 |
 
 源码存在某条路径不表示全部设备和并行组合均已验证。发布验证应记录模型、SoC、dtype、序列布局、并行策略和
@@ -362,12 +369,13 @@ loss 由上游 `BaseLoss._maybe_compile` 独立检查 `components`，并使用�
 
 | 归属 | 文件或模块 | 作用 |
 | --- | --- | --- |
-| 本仓 | `scripts/run_train.sh` | 单机启动、AscendC 默认 Codegen、compile 和 pattern 参数 |
+| 本仓 | `scripts/run_train.sh` | 单机启动、AscendC 默认 Codegen、compile 参数 |
 | 本仓 | `scripts/run_train_multinodes.sh` | 多机启动和 compile 参数；NPU backend 需在各节点显式统一 |
 | 本仓 | `torchtitan_npu/train.py` | 复用上游训练入口并触发插件初始化 |
 | 本仓 | `torchtitan_npu/__init__.py` | 固定 patches、compile、config、extensions 和 ops 的加载顺序 |
-| 本仓 | `torchtitan_npu/compile/__init__.py` | 读取并导入 `TORCHTITAN_NPU_PATTERN_IMPORTS` 指定的 pattern 模块 |
-| 本仓 | `torchtitan_npu/compile/pattern_replacement.py` | 共享 pre-AOT pass、注册和 cache identity |
+| 本仓 | `torchtitan_npu/compile/__init__.py` | 暴露 pattern 注册入口（`setup_patterns`） |
+| 本仓 | `torchtitan_npu/compile/pattern_replacement.py` | 共享 pre-AOT pass、注册、统计和 cache identity |
+| 本仓 | `torchtitan_npu/compile/pattern_manager.py` | pattern 自动发现、过滤（blacklist）与注册 |
 | 本仓 | `torchtitan_npu/patches/workaround/device_copy.py` | NPU 异步 D2H 和 `device_put` 兼容 |
 | 本仓 | `torchtitan_npu/patches/torch_npu/inductor_runtime_estimation.py` | NPU runtime estimation 和 standalone compile 兼容 |
 | 本仓 | `torchtitan_npu/extensions/trainer.py` | 编译感知的 NPU Trainer 与量化转换 |

@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal
 
 import tyro
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
+from torchtitan.config import CompileConfig as _BaseCompileConfig
 from torchtitan.config import TrainingConfig as _BaseTrainingConfig
 from torchtitan.tools.profiler import Profiler as _BaseProfiler
 
@@ -111,6 +112,36 @@ class QuantizationExtensionConfig:
     recipe: QuantizationRecipe = "mix"
     enable_mxfp4_qat: bool = False
     dst_type_max: float = 0.0
+
+
+@dataclass(kw_only=True, slots=True)
+class CompileExtensionConfig:
+    """NPU-specific compile extension options.
+
+    Controls automatic NPU pre-AOT pattern registration and the per-pattern
+    blacklist.  ``enable_patterns`` and ``pattern_blacklist`` are CLI-settable
+    via ``--compile.extension.enable-patterns`` etc.
+    """
+
+    enable_patterns: bool = True
+    """Enable automatic NPU pre-AOT pattern registration."""
+
+    pattern_blacklist: tuple[str, ...] = ()
+    """Pattern names to skip even when available.  Use the stable pattern name
+    (e.g. ``partial_rope_wo_squeeze_forward``), not a Python module path."""
+
+
+@dataclass(kw_only=True, slots=True)
+class CompileConfig(_BaseCompileConfig):
+    """NPU compile configuration with pattern-extension options.
+
+    Extends upstream ``CompileConfig`` with ``extension`` so the CLI path is
+    ``--compile.extension.enable-patterns`` etc.
+    """
+
+    extension: CompileExtensionConfig = field(
+        default_factory=CompileExtensionConfig,
+    )
 
 
 @dataclass(kw_only=True, slots=True)

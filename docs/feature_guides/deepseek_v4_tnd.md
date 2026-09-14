@@ -14,7 +14,7 @@ DeepSeek-V4 的示例 wrapper 有两种可切换的 recipe（`USE_GOLDEN` 选择
 
 ```text
 USE_GOLDEN=1  # wrapper 里的 Golden 组合：
-              #   override.common.rope.workaround
+              #   override.common.rope.decomposed
               #   override.deepseek_v4.sparse_attn.golden
               #   (the MoE is the normal clamped bf16 path on both sides)
 USE_GOLDEN=0  # wrapper 里的默认测试组合：

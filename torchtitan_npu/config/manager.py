@@ -28,10 +28,12 @@ def register_config_converter(
 @wraps(_original_load_config)
 def _patched_load_config(self, args: list[str]) -> tuple[object, list[str]]:
     config, filtered_args = _original_load_config(self, args)
-    if isinstance(config, Trainer.Config):
-        converter = _CONFIG_CONVERTERS.get(type(config))
-        if converter is not None:
-            config = converter.convert(config)
+    # Exact-type matching: only convert when the runtime type is registered.
+    # This keeps user-defined Trainer.Config subclasses untouched and naturally
+    # handles the EMATrainer class-identity split (both base types registered).
+    converter = _CONFIG_CONVERTERS.get(type(config))
+    if converter is not None:
+        config = converter.convert(config)
     return config, filtered_args
 
 

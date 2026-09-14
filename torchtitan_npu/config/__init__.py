@@ -5,6 +5,8 @@
 
 from . import manager as _manager  # noqa: F401
 from .configs import (
+    CompileConfig,
+    CompileExtensionConfig,
     ExtensionConfig,
     MuonOptimizerProfile,
     OptimizerConfig,
@@ -17,6 +19,8 @@ from .configs import (
 )
 
 __all__ = [
+    "CompileConfig",
+    "CompileExtensionConfig",
     "ExtensionConfig",
     "MuonOptimizerProfile",
     "OptimizerConfig",
