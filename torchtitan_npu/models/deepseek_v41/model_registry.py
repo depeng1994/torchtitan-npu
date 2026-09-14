@@ -10,8 +10,6 @@ from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model_spec import ModelSpec
 
-from torchtitan_npu.models.deepseek_v4.reference import ReferenceMetadataExtension
-
 from .attention import DeepSeekV41Attention
 from .model import V41Model
 from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings
@@ -20,6 +18,8 @@ _MARKER_INIT = {name: partial(torch.nn.init.normal_, std=1.0) for name in ("imag
 
 if TYPE_CHECKING:
     from torchtitan.protocols.model import ModelConfigConverter
+
+    from torchtitan_npu.models.deepseek_v4.reference import ReferenceMetadataExtension
 
 from .config import (
     V41_COMPRESS_RATIOS,
@@ -103,9 +103,7 @@ def _make_v41_config(
     from torchtitan_npu.models.deepseek_v4 import _make_v4_config
 
     vocab_size = 129280
-    source_key_indexer_layers = tuple(
-        layer_id for layer_id in index_source_layers if layer_id in V41_KV_SOURCE_LAYERS
-    )
+    source_key_indexer_layers = tuple(layer_id for layer_id in index_source_layers if layer_id in V41_KV_SOURCE_LAYERS)
     external_key_indexer_layers = tuple(
         layer_id for layer_id in index_source_layers if layer_id not in V41_KV_SOURCE_LAYERS
     )
@@ -248,6 +246,7 @@ def model_registry(
         _register_step_pre_hooks,
         parallelize_deepseek_v4,
     )
+
     from .vision_state_dict import DeepSeekV41StateDictAdapter
 
     config_factories = {

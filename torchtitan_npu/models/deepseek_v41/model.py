@@ -10,8 +10,8 @@ from torchtitan.distributed.context_parallel import cp_shard
 from torchtitan.models.common.attention import AttentionMasksType  # noqa: TC002
 
 from torchtitan_npu.models.deepseek_v4.golden import golden_enabled
-from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
 from torchtitan_npu.models.deepseek_v4.mhc import _make_identity_pre_mix
+from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
 
 from .attention import V41AttentionContext, build_v41_compression_spec
 from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings  # noqa: TC001
@@ -62,15 +62,9 @@ class V41Model(DeepSeekV4Model):
             cp = config.parallelism.context_parallel_degree
             pp = config.parallelism.pipeline_parallel_degree
             if cp != 1:
-                raise NotImplementedError(
-                    "DeepSeek V4.1 currently supports CP=1 only; "
-                    f"got CP={cp}"
-                )
+                raise NotImplementedError(f"DeepSeek V4.1 currently supports CP=1 only; got CP={cp}")
             if pp != 1:
-                raise NotImplementedError(
-                    "DeepSeek V4.1 does not support pipeline parallelism; "
-                    f"got PP={pp}"
-                )
+                raise NotImplementedError(f"DeepSeek V4.1 does not support pipeline parallelism; got PP={pp}")
             compile_config = getattr(config, "compile", None)
             if compile_config is not None and getattr(compile_config, "enable", False):
                 raise NotImplementedError(

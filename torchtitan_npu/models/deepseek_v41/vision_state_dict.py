@@ -2,6 +2,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import torch
+
 from torchtitan_npu.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 
 
@@ -97,31 +98,15 @@ class DeepSeekV41StateDictAdapter(DeepSeekV4StateDictAdapter):
         self._vision_adapter = DeepSeekV41VisionStateDictAdapter()
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
-        vision_hf = {
-            k: v
-            for k, v in hf_state_dict.items()
-            if self._vision_adapter.owns_hf_key(k)
-        }
-        base_hf = {
-            k: v
-            for k, v in hf_state_dict.items()
-            if not self._vision_adapter.owns_hf_key(k)
-        }
+        vision_hf = {k: v for k, v in hf_state_dict.items() if self._vision_adapter.owns_hf_key(k)}
+        base_hf = {k: v for k, v in hf_state_dict.items() if not self._vision_adapter.owns_hf_key(k)}
         result = super().from_hf(base_hf)
         result.update(self._vision_adapter.from_hf(vision_hf))
         return result
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        vision_local = {
-            k: v
-            for k, v in state_dict.items()
-            if self._vision_adapter.owns_local_key(k)
-        }
-        base_local = {
-            k: v
-            for k, v in state_dict.items()
-            if not self._vision_adapter.owns_local_key(k)
-        }
+        vision_local = {k: v for k, v in state_dict.items() if self._vision_adapter.owns_local_key(k)}
+        base_local = {k: v for k, v in state_dict.items() if not self._vision_adapter.owns_local_key(k)}
         result = super().to_hf(base_local)
         result.update(self._vision_adapter.to_hf(vision_local))
         return result

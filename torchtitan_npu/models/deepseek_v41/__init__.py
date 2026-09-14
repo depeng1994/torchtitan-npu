@@ -1,8 +1,8 @@
 from .attention import (
     V41AttentionContext,
-    V41GoldenAttentionModule,
     V41CompressionSpec,
     V41GoldenAttention,
+    V41GoldenAttentionModule,
     build_v41_compression_spec,
 )
 from .config import (
@@ -43,9 +43,9 @@ __all__ = [
     "DeepSeekV41FullScaleProfile",
     "DeepSeekV41VisionStateDictAdapter",
     "V41AttentionContext",
-    "V41GoldenAttentionModule",
     "V41CompressionSpec",
     "V41GoldenAttention",
+    "V41GoldenAttentionModule",
     "build_v41_compression_spec",
     "deepseek_v41_flash_30layers_16experts_vision",
     "deepseek_v41_flash_30layers_16experts_vision_config",

@@ -329,11 +329,7 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
 
         outputs = []
         compressed = None if ratio <= 1 else metadata.plans.get(ratio)
-        block_ranges = (
-            None
-            if compressed is None
-            else _sequence_ranges(compressed.cu_seqlens_cmp_k)
-        )
+        block_ranges = None if compressed is None else _sequence_ranges(compressed.cu_seqlens_cmp_k)
         for document_id, (q_start, q_end) in enumerate(_sequence_ranges(metadata.varlen.cu_seq_q)):
             length = q_end - q_start
             document_query = query[q_start:q_end].unsqueeze(0)

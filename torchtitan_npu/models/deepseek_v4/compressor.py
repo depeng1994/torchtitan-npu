@@ -16,7 +16,6 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.common.metadata_extension import LightningIndexerKernelConfig
-
 from torchtitan_npu.models.deepseek_v4.golden import golden_enabled
 
 from .metadata import CompressedKernelContract

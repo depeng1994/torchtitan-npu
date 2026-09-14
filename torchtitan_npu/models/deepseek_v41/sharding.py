@@ -18,6 +18,4 @@ def set_deepseek_v41_sharding_extensions(config) -> None:
         )
 
     for layer_cfg in config.layers:
-        layer_cfg.moe.router.sharding_config = ShardingConfig(
-            state_shardings={"bias_vl": _DENSE_PARAM_REP}
-        )
+        layer_cfg.moe.router.sharding_config = ShardingConfig(state_shardings={"bias_vl": _DENSE_PARAM_REP})

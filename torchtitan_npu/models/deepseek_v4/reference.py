@@ -154,9 +154,7 @@ def derive_reference_layout(
         torch.arange(len(lengths), device=device, dtype=torch.int32),
         lengths,
     )
-    pos_in_doc_flat = (
-        torch.arange(total_tokens, device=device) - cu_seq_q[doc_of_token_flat.long()]
-    ).to(torch.int32)
+    pos_in_doc_flat = (torch.arange(total_tokens, device=device) - cu_seq_q[doc_of_token_flat.long()]).to(torch.int32)
     doc_of_token = doc_of_token_flat.view(batch_size, seq_len)
     pos_in_doc = pos_in_doc_flat.view(batch_size, seq_len)
 
