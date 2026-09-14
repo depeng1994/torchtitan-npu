@@ -4,7 +4,7 @@
 
 分支：`rfc/deepseek-v4-1-training`
 
-本文件同时保留已经完成的历史验证，以及最新 architecture/correctness refactor 之后必须重新执行的 validation gate。**历史 Golden 结果不自动外推到最新 HEAD。**
+本文件记录 DeepSeek V4.1 从原始 baseline 到最终 architecture/correctness refactor 的审查与验证过程。**历史验证结果保留作为证据，但不会自动外推到最新 HEAD。**
 
 ## Review 闭环
 
@@ -27,7 +27,7 @@
 ## 当前实现边界
 
 支持目标：
-- 40-layer V4.1 topology（另有 30-layer validation crop）
+- 40-layer V4.1 topology（另有 validation crop）
 - 16 routed experts resource crop / EP8
 - Single-Pass mHC
 - CSA2 source/reuse/reindex + layer-20 candidate hierarchy
@@ -46,18 +46,24 @@
 - private indexer-training objective / exact VL bias update recipe
 - DSpark / Engram / quantized-training parity
 
-## 历史验证证据
+## 历史验证结果
+
+| 阶段 | 版本/提交 | 验证项 | 环境 | 结果 | 当前有效性 |
+|---|---|---|---|---|---|
+| 原始 baseline | `38595e0` | ds-code inference 边界对拍 | Ascend 910 + CANN 9.2.0 | 326/326 boundary `torch.equal` + SHA256 exact | 证明原始 reference operator 数学基线；不代表最终架构 |
+| 原始 baseline | `38595e0` | V41 8P FSDP8+EP8 deterministic Golden | 8P NPU | 100-step frozen trajectory | 后续 debug flavor/refactor 已 supersede |
+| debug guard | `43da3cb` | DSV4 debug-model pattern | 8P NPU | 100-step，可通过标准 integration entry；约 9 min | 证明轻量 Golden guard 可运行；后续 correctness 改动已 supersede |
+| review 修复阶段 | 后续 review commits | V4 unit suite | 开发/NPU 环境 | 245 passed | 证明当时 V4 regression 闭环；最终 refactor 后需重跑 |
+| review 修复阶段 | 后续 review commits | V41 StateDict UT | 开发环境 | 5 passed；之后加强为 exact key-set + tensor equality | StateDict 设计证据；最终 HEAD 仍需重跑 |
+| FSDP lifecycle 修复后 | `3798b91` 之后 | V41 8P FSDP8+EP8 Golden | 8P NPU | 重复 100-step bit-exact；新 Golden 100/100 exact | 证明 FSDP lifecycle 修复后的轨迹稳定；ratio=1 correctness 修复后已 supersede |
+| FullAC 验证 | 同一历史 HEAD | FullAC 重复 100-step | 8P NPU | 两次 trajectory bit-exact | 只证明当前 CP1/PP1 eager recipe 稳定，不证明 AC-off 等价 |
+| 当前重构 | 最新 HEAD | Ruff / format / codespell / OAT | GitHub Actions CPU runner | 已执行；机械问题已修复 | 当前静态检查继续收尾 Pyrefly baseline |
+| 当前重构 | 最新 HEAD | V4/V41 CPU UT | GitHub Actions CPU runner | 正在通过 CPU-only import bootstrap 解决 NPU runtime import 副作用 | 非最终 NPU gate |
+| 当前 correctness | 最新 HEAD | ratio=1 real global-KV Golden | 8P NPU | **待重跑** | **最终 merge gate** |
 
 ### FSDP lifecycle bisect
 
 旧执行路径直接调用 block sub-forward，绕过 `nn.Module.__call__`，8P FSDP+EP 下会报 mixed Tensor/DTensor。`3798b91` 改回正常 `layer(...)` 调用后触发 FSDP hooks，恢复可运行性。该 bisect 证明此前一次 Golden migration 的根因是 **FSDP lifecycle correctness fix**，而不是随机 runtime nondeterminism。
-
-### 已完成的历史验证
-
-- V4 unit suite：此前轮次已通过（最终新 refactor 后仍需重跑）。
-- V41 StateDict suite：此前 5 tests passed；round-trip test 后续已修成 strict equality。
-- V41 8P FSDP8+EP8：此前版本曾完成 deterministic 100-step trajectory，并据 FSDP lifecycle root cause 迁移过一次 Golden。
-- FullAC：此前同 HEAD 重复 100-step 轨迹 deterministic；只证明当前 recipe 的稳定性，不等价于 AC-off 数学等价性。
 
 ## 最新 architecture/correctness refactor
 
@@ -70,14 +76,13 @@
 5. ratio=1 reference metadata 由 V41 显式 materialize，成为真实 causal global-KV container；V4 ratio=1 默认语义不变。
 6. V41-only vision AC/FSDP、image-marker sharding、`bias_vl` sharding/StateDict ownership 从 V4 移出。
 7. Golden override 改成显式 `sparse_indices + active compress_ratio` contract，不再读取 `_v41_*` 动态属性。
+8. V4 目录移除 V41/V4.1 runtime policy 和命名，依赖方向恢复为 `deepseek_v41 -> deepseek_v4` 单向。
 
 ### 为什么必须重新跑 Golden
 
 这一轮并非纯代码搬家：**ratio=1 从“reference mask 中不 materialize”修正为 V4.1 的真实 shared/global-KV 语义**。因此旧冻结 loss trajectory 已被 correctness 修复主动 supersede，不能继续作为最新 HEAD 的 regression oracle，也不能通过手工修改 loss 文件来掩盖变化。
 
 ## 最终 merge validation gate（最新 HEAD）
-
-在 NPU 开发环境中执行：
 
 ```bash
 # 1. Unit / static gates
