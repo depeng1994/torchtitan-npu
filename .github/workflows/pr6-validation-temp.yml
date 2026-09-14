@@ -1,9 +1,12 @@
-name: PR6 temporary final validation
+name: PR6 final validation
 
 on:
   push:
     branches:
       - rfc/deepseek-v4-1-training
+  pull_request:
+    branches:
+      - master
 
 jobs:
   unit-and-precommit:
@@ -12,10 +15,21 @@ jobs:
     env:
       TORCH_DEVICE_BACKEND_AUTOLOAD: '0'
     steps:
-      - name: Checkout
+      - name: Checkout validated revision
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Show validated revision
+        run: |
+          git rev-parse HEAD
+          git log -1 --oneline
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "PR head: ${{ github.event.pull_request.head.sha }}"
+            echo "PR base: ${{ github.event.pull_request.base.sha }}"
+            echo "PR merge: ${{ github.event.pull_request.merge_commit_sha }}"
+            test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.merge_commit_sha }}"
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
