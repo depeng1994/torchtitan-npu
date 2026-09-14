@@ -1,0 +1,39 @@
+name: PR6 one-shot formatting autofix
+
+on:
+  push:
+    branches:
+      - rfc/deepseek-v4-1-training
+
+permissions:
+  contents: write
+
+jobs:
+  autofix:
+    if: github.event.head_commit.message == 'ci: add one-shot formatting autofix'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install formatters
+        run: python -m pip install pre-commit ruff==0.14.14
+      - name: Apply deterministic fixes
+        run: |
+          pre-commit run end-of-file-fixer --all-files || true
+          ruff check --fix --line-length 120 --exclude '.agents/**,tests/**' . || true
+          ruff format --line-length 120 --exclude '.agents/**,tests/**' .
+      - name: Commit autofixes
+        run: |
+          if git diff --quiet; then
+            echo 'No autofixes needed.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'style: apply pre-commit autofixes'
+          git push
