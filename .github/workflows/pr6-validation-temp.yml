@@ -9,6 +9,8 @@ jobs:
   unit-and-precommit:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      TORCH_DEVICE_BACKEND_AUTOLOAD: '0'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,10 +31,28 @@ jobs:
           python -m pip install -e .
 
       - name: V4 unit tests
+        id: v4
+        continue-on-error: true
         run: pytest -q tests/unit_tests/models/deepseek_v4/
 
       - name: V41 unit tests
+        id: v41
+        if: always()
+        continue-on-error: true
         run: pytest -q tests/unit_tests/models/deepseek_v41/
 
       - name: Pre-commit
+        id: precommit
+        if: always()
+        continue-on-error: true
         run: pre-commit run --all-files
+
+      - name: Enforce validation result
+        if: always()
+        run: |
+          echo "V4 UT: ${{ steps.v4.outcome }}"
+          echo "V41 UT: ${{ steps.v41.outcome }}"
+          echo "pre-commit: ${{ steps.precommit.outcome }}"
+          test "${{ steps.v4.outcome }}" = success
+          test "${{ steps.v41.outcome }}" = success
+          test "${{ steps.precommit.outcome }}" = success
