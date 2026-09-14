@@ -5,12 +5,8 @@ on:
     branches:
       - rfc/deepseek-v4-1-training
 
-permissions:
-  contents: write
-
 jobs:
   autofix:
-    if: github.event.head_commit.message == 'ci: add one-shot formatting autofix'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,14 +22,17 @@ jobs:
           pre-commit run end-of-file-fixer --all-files || true
           ruff check --fix --line-length 120 --exclude '.agents/**,tests/**' . || true
           ruff format --line-length 120 --exclude '.agents/**,tests/**' .
-      - name: Commit autofixes
+      - name: Collect modified files
         run: |
-          if git diff --quiet; then
-            echo 'No autofixes needed.'
-            exit 0
-          fi
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
-          git commit -m 'style: apply pre-commit autofixes'
-          git push
+          mkdir -p /tmp/autofix
+          git diff --name-only -z | while IFS= read -r -d '' path; do
+            mkdir -p "/tmp/autofix/$(dirname "$path")"
+            cp "$path" "/tmp/autofix/$path"
+          done
+          git diff --stat
+      - name: Upload autofix files
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr6-autofix-files
+          path: /tmp/autofix
+          if-no-files-found: error
