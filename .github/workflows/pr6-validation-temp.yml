@@ -45,6 +45,7 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install pre-commit pyrefly pytest
           python -m pip install -e .
+          python -m pyrefly --version
 
       - name: Prepare TorchTitan source for Pyrefly
         run: |
@@ -52,44 +53,63 @@ jobs:
           git clone --depth 1 --branch v0.3.0 https://github.com/pytorch/torchtitan.git /tmp/torchtitan
           test "$(git -C /tmp/torchtitan rev-parse HEAD)" = "086bf6c166ec85c1298eb5596fa9bf95f6a2d840"
 
-      - name: V4 unit tests
-        id: v4
-        continue-on-error: true
+      - name: Prepare CPU-only import bootstrap
         run: |
-          python - <<'PY'
+          rm -rf /tmp/pr6-ci-bootstrap
+          mkdir -p /tmp/pr6-ci-bootstrap
+          cat > /tmp/pr6-ci-bootstrap/sitecustomize.py <<'PY'
+          import os
           import pathlib
           import sys
           import types
-          import pytest
 
-          root = pathlib.Path.cwd()
-          package = types.ModuleType("torchtitan_npu")
-          package.__file__ = str(root / "torchtitan_npu" / "__init__.py")
-          package.__path__ = [str(root / "torchtitan_npu")]
-          package.__package__ = "torchtitan_npu"
-          sys.modules["torchtitan_npu"] = package
-          raise SystemExit(pytest.main(["-q", "tests/unit_tests/models/deepseek_v4/"]))
+          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+
+          def namespace(name: str, path: pathlib.Path) -> None:
+              if name in sys.modules:
+                  return
+              module = types.ModuleType(name)
+              module.__file__ = str(path / "__init__.py")
+              module.__path__ = [str(path)]
+              module.__package__ = name
+              sys.modules[name] = module
+
+          namespace("torchtitan_npu", root / "torchtitan_npu")
+          namespace("torchtitan_npu.models", root / "torchtitan_npu" / "models")
+          namespace("torchtitan_npu.patches", root / "torchtitan_npu" / "patches")
+          namespace(
+              "torchtitan_npu.models.deepseek_v41",
+              root / "torchtitan_npu" / "models" / "deepseek_v41",
+          )
           PY
+
+      - name: V4 unit tests
+        id: v4
+        continue-on-error: true
+        env:
+          PYTHONPATH: /tmp/pr6-ci-bootstrap
+        run: pytest -q tests/unit_tests/models/deepseek_v4/
 
       - name: V41 unit tests
         id: v41
         if: always()
         continue-on-error: true
-        run: |
-          python - <<'PY'
-          import pathlib
-          import sys
-          import types
-          import pytest
+        env:
+          PYTHONPATH: /tmp/pr6-ci-bootstrap
+        run: pytest -q tests/unit_tests/models/deepseek_v41/
 
-          root = pathlib.Path.cwd()
-          package = types.ModuleType("torchtitan_npu")
-          package.__file__ = str(root / "torchtitan_npu" / "__init__.py")
-          package.__path__ = [str(root / "torchtitan_npu")]
-          package.__package__ = "torchtitan_npu"
-          sys.modules["torchtitan_npu"] = package
-          raise SystemExit(pytest.main(["-q", "tests/unit_tests/models/deepseek_v41/"]))
-          PY
+      - name: Pyrefly master baseline diagnostic
+        if: always()
+        continue-on-error: true
+        run: |
+          rm -rf /tmp/pr6-master
+          git worktree add --detach /tmp/pr6-master origin/master
+          (
+            cd /tmp/pr6-master
+            python -m pyrefly check --config pyproject.toml > /tmp/pr6-master-pyrefly.log 2>&1 || true
+          )
+          echo "master error summary:"
+          grep -E '^ INFO [0-9]+ errors|^ERROR ' /tmp/pr6-master-pyrefly.log | tail -n 60 || true
 
       - name: Pre-commit
         id: precommit
