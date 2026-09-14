@@ -11,6 +11,17 @@ from torch import nn
 from torchtitan.protocols.module import Module
 
 
+def _make_identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:
+    """Return the one-hot stream mix used at the input of a single-pass stack."""
+    pre_mix = torch.zeros(
+        (*x.shape[:2], hc_mult),
+        device=x.device,
+        dtype=torch.float32,
+    )
+    pre_mix[..., 0] = 1.0
+    return pre_mix
+
+
 class HcPre(Module):
     """Head-collaboration pre step; owns its mixing parameters."""
 
@@ -45,7 +56,7 @@ class HcPre(Module):
         comb = comb * hc_scale[2] + hc_base[2 * hc_mult :].view(hc_mult, hc_mult).unsqueeze(0).unsqueeze(0)
 
         row_max = comb.max(dim=-1, keepdim=True).values
-        comb = torch.exp(comb - row_max)
+        comb = torch.exp(comb - row_max).clone()
         comb = comb / comb.sum(dim=-1, keepdim=True) + self.eps
         comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
         for _ in range(self.sinkhorn_iters - 1):
@@ -53,7 +64,40 @@ class HcPre(Module):
             comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
         return pre, post, comb
 
+    def _mixes(self, x):
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(2).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x, self.hc_fn.float()) * rsqrt
+        return self._sinkhorn(mixes, self.hc_scale.float(), self.hc_base.float())
+
+    @staticmethod
+    def collapse(x, pre_mix):
+        shape, dtype = x.size(), x.dtype
+        y = torch.sum(pre_mix.unsqueeze(-1) * x.float().reshape(shape), dim=2)
+        return y.to(dtype)
+
+    def forward_with_pre_mix(self, x, pre_mix=None):
+        """Collapse with a caller-supplied stream mix for single-pass variants.
+
+        The default V4 path calls :meth:`forward`: each sub-block collapses
+        with its own freshly computed pre mix.  Derived single-pass variants
+        may instead carry the pre mix between neighbouring sub-layers through
+        this narrow extension seam.  ``pre_mix=None`` falls back to the local
+        mix generated from ``x`` itself.
+        """
+        pre, post, comb = self._mixes(x)
+        collapse_mix = pre if pre_mix is None else pre_mix
+        return self.collapse(x, collapse_mix), post, comb, pre
+
     def forward(self, x):
+        """DeepSeek-V4 classic mHC path with the legacy autograd graph intact.
+
+        Keep one shared FP32 cast for both mix generation and stream collapse.
+        Splitting those into two independent casts is forward-equivalent but
+        changes BF16 backward rounding before gradient accumulation, which is
+        visible in the frozen V4 training trajectory.
+        """
         shape, dtype = x.size(), x.dtype
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)

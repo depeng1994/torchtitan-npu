@@ -101,9 +101,13 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
             },
         )
         if getattr(layer_config.attention, "compressor", None) is not None:
-            for projection in ("wkv", "wgate"):
+            projections = ("wkv", "wgate") if layer_config.attention.compressor.wgate is not None else ("wkv",)
+            for projection in projections:
                 shardings[f"{prefix}.attention.compressor.{projection}.weight"] = owned
-            shardings[f"{prefix}.attention.compressor.ape"] = owned
+            if layer_config.attention.compressor.compress_ratio > 1 and getattr(
+                layer_config.attention.compressor, "use_ape", True
+            ):
+                shardings[f"{prefix}.attention.compressor.ape"] = owned
         expert_sharding = ComputeLayout(
             shardings_by_mesh_axis={
                 **{axis: Shard(0) for axis in dense_dp_axes},
@@ -128,9 +132,15 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
                 },
             )
             shardings[f"{prefix}.attention.indexer.weights_proj.weight"] = owned
-            for projection in compressor_projections:
-                shardings[f"{prefix}.attention.indexer.compressor.{projection}.weight"] = owned
-            shardings[f"{prefix}.attention.indexer.compressor.ape"] = owned
+            indexer_compressor = indexer.compressor
+            if indexer_compressor is not None:
+                projections = ("wkv", "wgate") if indexer_compressor.wgate is not None else ("wkv",)
+                for projection in projections:
+                    shardings[f"{prefix}.attention.indexer.compressor.{projection}.weight"] = owned
+                if indexer_compressor.compress_ratio > 1 and getattr(indexer_compressor, "use_ape", True):
+                    shardings[f"{prefix}.attention.indexer.compressor.ape"] = owned
+            elif indexer.wk is not None:
+                shardings[f"{prefix}.attention.indexer.wk.weight"] = owned
         if include_mtp_projections:
             for projection in mtp_projections:
                 shardings[f"{prefix}.{projection}.weight"] = owned
@@ -172,6 +182,7 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
         r"(?:"
         rf"attention\.(?:{'|'.join(attention_projections)})\.weight|"
         rf"attention\.indexer\.(?:{'|'.join(indexer_projections)})\.weight|"
+        rf"attention\.indexer\.wk\.weight|"
         rf"attention\.(?:compressor|indexer\.compressor)\.(?:{'|'.join(compressor_projections)})\.weight|"
         r"attention\.(?:compressor|indexer\.compressor)\.ape|"
         rf"moe\.shared_experts\.(?:{'|'.join(expert_projections)})\.weight|"

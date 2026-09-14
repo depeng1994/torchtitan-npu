@@ -299,7 +299,7 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
     @dataclass(kw_only=True, slots=True)
     class Config(MTPDecoder.Config):
         hc_mult: int = 4
-        hc_head: HcHead.Config
+        hc_head: HcHead.Config | None = None
 
         def update_from_config(self, *, config, **kwargs) -> None:
             if not self.mtp_layers:
@@ -329,7 +329,7 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         # different block while retaining the same decoder-level contract.
         Decoder.__init__(self, config)
         self.hc_mult = config.hc_mult
-        self.hc_head = config.hc_head.build()
+        self.hc_head = config.hc_head.build() if config.hc_head is not None else None
 
         if not config.mtp_layers:
             self.mtp_layers = None
@@ -345,9 +345,10 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         positions: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
         mtp_batch: MTPBatch | None = None,
+        input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         attention_context = _MTPAttentionContext(attention_masks, positions)
-        state = self._forward_main(tokens, attention_context)
+        state = self._forward_main(tokens, attention_context, input_embeds=input_embeds)
 
         if self.mtp_layers is None:
             if self._skip_lm_head or self.lm_head is None:
@@ -372,10 +373,22 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         self,
         tokens: torch.Tensor,
         attention_context: _MTPAttentionContext,
+        input_embeds: torch.Tensor | None = None,
     ) -> _MTPForwardState:
+        """Classic DeepSeek-V4 main stack forward.
+
+        Each block collapses within itself (no cross-sublayer mix), and
+        ``hc_head`` collapses the multi-stream state after all layers.  Derived
+        decoders with different mixing semantics should override their main
+        stack loop rather than changing this V4 path.
+        """
         tok_embeddings = self.tok_embeddings
         input_ids = tokens.detach().long()
-        hidden = tok_embeddings(tokens) if tok_embeddings is not None else tokens
+        hidden = (
+            input_embeds
+            if input_embeds is not None
+            else (tok_embeddings(tokens) if tok_embeddings is not None else tokens)
+        )
         hidden = hidden.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
 
         for layer in self.layers.values():
@@ -385,7 +398,6 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
                 attention_context.attention_masks,
                 attention_context.positions,
             )
-
         main_hidden = self.hc_head(hidden)
         main_hidden = self.norm(main_hidden) if self.norm is not None else main_hidden
         return _MTPForwardState(tok_embeddings, hidden, main_hidden)

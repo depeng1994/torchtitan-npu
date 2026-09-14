@@ -39,7 +39,7 @@ compressed region is the concatenation of its documents' complete blocks,
 padded to ``S // ratio`` slots.
 """
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 import torch
@@ -57,7 +57,9 @@ __all__ = [
     "CompressedKernelContract",
     "CompressedVarlenMetadata",
     "build_compressed_varlen_metadata",
+    "build_index_dense_mask",
     "build_kernel_layout",
+    "ensure_index_dense_masks",
 ]
 
 
@@ -81,118 +83,65 @@ class CompressedBlockLayout:
       gather (``cmp_k_global_gather_indices``).
     """
 
-    # ---- part 1: the unified contract (CP and non-CP) ----
     cu_seqlens_cmp_k: torch.Tensor | None = None
-    """Cumulative compressed-block lengths over the packed stream (int32),
-    ``[n_seqs + 1]``.  Entry ``i`` is the global start index of sequence
-    ``i``'s compressed blocks.  ``None`` for ratio-1 plans."""
+    """Cumulative compressed-block lengths over the packed stream (int32)."""
 
     n_cmp_blocks_host: int | None = None
-    """Host-cached ``cu_seqlens_cmp_k[-1]`` (total compressed blocks), set at
-    the eager plan-build boundary so ``_assemble_tnd`` avoids a per-layer
-    ``.item()`` D2H sync inside the compiled region."""
+    """Host-cached total compressed block count."""
 
     block_remainder: torch.Tensor | None
-    """Per-sequence block remainder (int32), ``[n_seqs]``: ``len[i] % ratio``
-    trailing tokens of sequence ``i`` fall short of one full block and
-    produce no compressed KV entry.  ``None`` for ratio-1 plans."""
+    """Per-sequence incomplete-block remainder; ``None`` for ratio-1 plans."""
 
     gather_indices: torch.Tensor | None
-    """The pooled block-row indices (int64) the dispatcher's ``gather``
-    applies.  Without context parallel they are the contiguous doc-major
-    block-token indices into the local stream (``x.flatten(0, 1)``) —
-    the plain local gather; under context parallel they are the assembly
-    into ``cat([x_local, exchange_recv_rows])`` in pooled order — the
-    remote gather + permute.  Reshape to ``[n_blocks, ratio, D]`` after
-    the gather.  ``None`` for ratio-1 plans."""
+    """Pooled block-row indices consumed by the token dispatcher."""
 
     block_positions: torch.Tensor | None = None
-    """Document-relative block starts (int32) ``[n_blocks]`` — the RoPE
-    positions of the pooled keys (block ``b`` of a document sits at
-    ``b * ratio``).  The compressor contract: precomputed once per batch so
-    no per-layer derivation is needed.  ``None`` for ratio-1 plans."""
+    """Document-relative block-start positions for compressed-key RoPE."""
 
     first_indices: torch.Tensor | None = None
-    """Document-first block ids (int64) ``[n_segs]`` — the positions of the
-    first block of every segment in the ``gather_indices`` block order,
-    i.e. ``cu_seqlens_cmp_k[:-1]``.  The overlap validity mask: the borrowed
-    (previous-block) rows of these blocks are masked to zero weight.  The
-    compressor contract: precomputed once per batch.  ``None`` for ratio-1
-    plans."""
+    """Document-first block ids used by overlap masking."""
 
     li_metadata: torch.Tensor | None = None
     """Opaque ratio-4 LI metadata produced by the selected provider."""
 
-    # ---- part 2: the dispatcher fields (CP only) ----
     exchange: "ExchangePlan | None" = None
-    """The block exchange routing (alltoallv input/output splits) of the
-    projected ``kv``/``score`` rows completing the plan blocks'
-    ``[A, B)`` sub-range.  ``None`` without context parallel."""
+    """CP block-exchange routing; ``None`` without context parallel."""
 
     compressed_rows: torch.Tensor | None = None
-    """Container-packing selection (int64 ``[n_kept]``): the positions of
-    the kept blocks in the pooled key stream (the borrow-source blocks are
-    dropped).  ``None`` without context parallel (all blocks are kept)."""
+    """Container-packing selection under context parallel."""
 
     out_width: int | None = None
-    """The container grid width: ``seq_len // ratio`` without context
-    parallel, the uniform ``max_kept`` shard width under CP (every rank's
-    container is a valid ``S(1)`` shard).  ``None`` for ratio-1 plans."""
+    """Container grid width when the ratio owns a packed container."""
 
     cmp_k_global_gather_indices: torch.Tensor | None = None
-    """The compressed-K global gather (int64 ``[sum seqlen_k // ratio]``) —
-    the compressed analogue of ``k_global_gather_indices``: per-segment
-    full-prefix blocks as offsets into the all-gathered
-    ``[cp * out_width, D]`` container (the ShardingConfig all-gather's
-    output).  ``None`` without context parallel."""
+    """Compressed-key global gather indices under context parallel."""
 
 
 @dataclass(kw_only=True, slots=True)
 class CompressedVarlenMetadata:
-    """The DeepSeek-V4 varlen attention contract (the common part).
-
-    Carried as ``attention_masks`` through the DSA layers.  Built by
-    the model's ``build_attention_masks`` from a ``VarlenMetadata``
-    stream: the kernel contract (``plans``).  The ``metadata_extension``
-    (e.g. the AscendC kernel metadata, or the reference tier) post-processes
-    it into the concrete per-path contract.
-
-    The container grid is ``[1, S]`` with ``S`` equal to the total token
-    count (``local_batch_size == 1``): ``batch_size`` is always ``1`` and
-    ``seq_len`` is ``cu_seq_q[-1]`` — both derived as properties, not
-    stored.  Without context parallel, ``cu_seq_q`` and ``cu_seq_k`` are
-    the same tensor (consumers read ``varlen.cu_seq_q`` / ``varlen.cu_seq_k``
-    directly; under context parallel the ori cumsum is the ``window``
-    plan's ``cu_seqlens_ori_kv``).
-    """
+    """The DeepSeek-V4 varlen attention contract (the common part)."""
 
     varlen: "VarlenMetadata | CPVarlenMetadata"
-    """Token-stream boundaries (``cu_seq_q`` / ``cu_seq_k``).  Under context
-    parallel the rank-local ``CPVarlenMetadata`` (the shard path's own
-    builder output)."""
+    """Token-stream boundaries for the current rank."""
 
     plans: dict[int, CompressedBlockLayout]
-    """Kernel contract for each ratio present in the model.  Ratio-1 plans
-    describe no compressed region."""
+    """Kernel contract for each ratio present in the model."""
 
     window: "WindowPlan | None" = None
-    """The sliding-window plan (CP only, ``None`` without): the ratio-
-    independent window exchange + ori-stream assembly the Attention's
-    ``swa_k`` gather consumes (``token_dispatcher.WindowPlan``)."""
+    """Sliding-window exchange/assembly plan under context parallel."""
 
     seq_len_host: int | None = None
-    """Host-cached total token count (``cu_seq_q[-1]``), set once at the eager
-    ``build_compressed_varlen_metadata`` boundary so the ``seq_len`` property
-    avoids a per-layer ``.item()`` D2H sync inside the compiled region."""
+    """Host-cached total token count."""
+
+    index_dense_masks: dict[int, torch.Tensor] = field(default_factory=dict)
+    """Backend-independent causal masks for sparse index/candidate stages."""
 
     @property
     def batch_size(self) -> int:
-        """Container batch size (``1`` for the current packed scenario)."""
         return 1
 
     @property
     def seq_len(self) -> int:
-        """Container sequence length (the total token count)."""
         if self.seq_len_host is not None:
             return self.seq_len_host
         return int(self.varlen.cu_seq_q[-1].item())
@@ -200,15 +149,7 @@ class CompressedVarlenMetadata:
 
 @runtime_checkable
 class CompressedKernelContract(Protocol):
-    """The per-ratio plan shape shared by the model-dir metadata and the
-    NPU slim type: the compressor-contract plans (``gather_indices``,
-    ``block_positions``, ``first_indices``) plus the kernel tensors.
-
-    Consumers that read only the plans (e.g. the Compressor) accept this
-    protocol instead of the concrete metadata type, so the fused path's
-    slim metadata (which carries no reference tier) satisfies the contract
-    without the model directory knowing about it.
-    """
+    """The per-ratio compressor/kernel plan shape shared by all backends."""
 
     plans: dict[int, CompressedBlockLayout]
 
@@ -217,15 +158,7 @@ def build_kernel_layout(
     varlen: VarlenMetadata,
     compress_ratios: tuple[int, ...] | list[int],
 ) -> dict[int, CompressedBlockLayout]:
-    """The kernel-contract tier: the per-ratio plans for a plain stream.
-
-    Called once per batch by ``build_compressed_varlen_metadata``; the
-    AscendC path materializes no reference tier (its extension only consumes
-    the plans).  The container grid is ``[1, S]`` with ``S`` equal to the
-    total token count, so the layout is derived purely from the document
-    boundaries and the ratios.  Context-parallel streams must use
-    ``build_cp_plan`` instead (guarded below).
-    """
+    """Build the kernel-contract tier for a plain packed stream."""
     if not hasattr(varlen, "cu_seq_q"):
         raise TypeError(f"build_kernel_layout expects a varlen stream, got {type(varlen)}.")
 
@@ -237,31 +170,21 @@ def build_kernel_layout(
             "build_kernel_layout requires a plain stream (cu_seq_q == "
             "cu_seq_k); context-parallel plans come from build_cp_plan."
         )
-    # The packed scenario runs with local_batch_size == 1; raise seq_len
-    # instead of local_batch_size.
     seq_len = int(cu_seq_q[-1].item())
 
-    # The plain per-document derivation: each document contributes its
-    # complete leading blocks (the ``len % ratio`` tail produces no
-    # compressed entry), gathered contiguously document by document.  The
-    # plans carry no dispatcher fields — the dispatcher's gather degrades
-    # to the plain local gather, so the forward path never special-cases
-    # context parallel.
     cu = cu_seq_q.cpu().tolist()
     lengths = [cu[i + 1] - cu[i] for i in range(len(cu) - 1)]
     distinct_ratios = sorted({int(r) for r in compress_ratios})
     device = cu_seq_q.device
     plans: dict[int, CompressedBlockLayout] = {}
     for ratio in distinct_ratios:
-        if ratio == 1:
-            plans[1] = CompressedBlockLayout(
+        if ratio <= 1:
+            plans[ratio] = CompressedBlockLayout(
                 cu_seqlens_cmp_k=None,
                 block_remainder=None,
                 gather_indices=None,
             )
             continue
-        if ratio not in (4, 128):
-            raise NotImplementedError(f"CompressedBlockLayout does not support ratio={ratio}; expected 1, 4, or 128.")
         c_lens = [length // ratio for length in lengths]
         cu_seqs = torch.cat(
             [
@@ -279,10 +202,6 @@ def build_kernel_layout(
         block_positions = (
             torch.cat(positions, dim=0) if positions else torch.empty((0,), dtype=torch.int32, device=device)
         )
-        # Doc-start block ids of the docs that actually have blocks
-        # (``cu[i] < cu[i+1]``); zero-block docs contribute no blocks to
-        # mask, and a trailing zero-block doc's boundary would be an
-        # out-of-range index.
         first_indices = cu_seqs[:-1][torch.diff(cu_seqs) > 0].to(torch.int64)
         plans[ratio] = CompressedBlockLayout(
             cu_seqlens_cmp_k=cu_seqs,
@@ -305,36 +224,77 @@ def build_compressed_varlen_metadata(
     varlen: VarlenMetadata,
     compress_ratios: tuple[int, ...] | list[int],
 ) -> CompressedVarlenMetadata:
-    """Build the DSV4 varlen contract for one rank-local token stream.
-
-    Called once per batch by the model's ``build_attention_masks``: the
-    common kernel contract (``build_kernel_layout``).  The reference tier
-    and the vendor kernel tensors are filled by the ``metadata_extension``
-    (``reference.py`` / the AscendC override).
-
-    Args:
-        varlen: Rank-local ``VarlenMetadata``.  ``cu_seq_q`` is
-            authoritative for document boundaries.
-        compress_ratios: Compression ratios present in the model.
-    """
+    """Build the common DSV4 varlen contract for one rank-local token stream."""
     plans = build_kernel_layout(varlen, compress_ratios)
-    # Cache the total token count on the host so the ``seq_len`` property
-    # avoids a per-layer ``.item()`` D2H sync inside the compiled region.
-    # Built once here (eager boundary) from ``cu_seq_q[-1]``.
-    return CompressedVarlenMetadata(
+    metadata = CompressedVarlenMetadata(
         varlen=varlen,
         plans=plans,
         seq_len_host=int(varlen.cu_seq_q[-1].item()),
     )
+    return ensure_index_dense_masks(metadata)
+
+
+def build_index_dense_mask(
+    metadata: CompressedVarlenMetadata,
+    ratio: int,
+) -> torch.Tensor:
+    """Build the causal index-selection mask for any metadata backend.
+
+    The returned shape is ``[1, 1, query_len, container_len]`` and includes
+    document and causal reachability only; candidate filtering remains the
+    indexer's responsibility.
+    """
+    cached = metadata.index_dense_masks.get(ratio)
+    if cached is not None:
+        return cached
+    if ratio < 0:
+        raise ValueError(f"compression ratio must be non-negative, got {ratio}")
+    ratio = max(ratio, 1)
+    cu_q = metadata.varlen.cu_seq_q
+    seq_len = metadata.seq_len
+    device = cu_q.device
+    lengths = torch.diff(cu_q).to(torch.long)
+    doc_ids = torch.repeat_interleave(torch.arange(lengths.numel(), device=device, dtype=torch.long), lengths)
+    token_starts = cu_q[:-1].to(torch.long)
+    positions = torch.arange(seq_len, device=device, dtype=torch.long) - token_starts[doc_ids]
+
+    if ratio == 1:
+        return (
+            ((doc_ids[:, None] == doc_ids[None, :]) & (positions[:, None] >= positions[None, :]))
+            .unsqueeze(0)
+            .unsqueeze(1)
+        )
+
+    plan = metadata.plans.get(ratio)
+    if plan is None or plan.cu_seqlens_cmp_k is None:
+        raise ValueError(f"metadata has no compressed plan for ratio={ratio}")
+    cu_cmp = plan.cu_seqlens_cmp_k.to(torch.long)
+    container_len = plan.out_width
+    if container_len is None:
+        container_len = seq_len // ratio
+    block_ids = torch.arange(container_len, device=device, dtype=torch.long)
+    block_doc = torch.searchsorted(cu_cmp[1:], block_ids, right=True)
+    block_local = block_ids - cu_cmp[block_doc]
+    valid = block_ids < cu_cmp[-1]
+    block_doc = block_doc.masked_fill(~valid, -1)
+    block_local = block_local.masked_fill(~valid, -1)
+    causal_limit = (positions + 1) // ratio
+    return (
+        ((doc_ids[:, None] == block_doc[None, :]) & (block_local[None, :] < causal_limit[:, None]))
+        .unsqueeze(0)
+        .unsqueeze(1)
+    )
+
+
+def ensure_index_dense_masks(metadata: CompressedVarlenMetadata) -> CompressedVarlenMetadata:
+    """Materialize index masks once at the eager metadata boundary."""
+    if not metadata.index_dense_masks:
+        metadata.index_dense_masks = {ratio: build_index_dense_mask(metadata, ratio) for ratio in metadata.plans}
+    return metadata
 
 
 def register_pytree_node_for_dataclass(cls: type) -> None:
-    """Register a kw-only dataclass as a pytree node (idempotent).
-
-    The graph_trainer's ``minimal_fx_tracer`` requires every ``attention_masks``
-    leaf to be a tensor/primitive; an unregistered dataclass is rejected as a
-    single non-primitive leaf.
-    """
+    """Register a kw-only dataclass as a pytree node (idempotent)."""
     from torch.utils._pytree import SUPPORTED_NODES, GetAttrKey, KeyEntry, register_pytree_node
 
     if cls in SUPPORTED_NODES:
@@ -345,8 +305,6 @@ def register_pytree_node_for_dataclass(cls: type) -> None:
         return [getattr(obj, name) for name in field_names], None
 
     def flatten_with_keys(obj) -> tuple[list[tuple[KeyEntry, Any]], None]:
-        # ``GetAttrKey`` is structurally assignable to the ``KeyEntry`` protocol
-        # at runtime, but pyrefly treats list as invariant, so cast the list.
         keys = cast(
             "list[tuple[KeyEntry, Any]]",
             [(GetAttrKey(name), getattr(obj, name)) for name in field_names],
