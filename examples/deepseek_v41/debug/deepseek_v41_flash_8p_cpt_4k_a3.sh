@@ -5,11 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 # Run this script on a single node.
-# Append CLI arguments to override the defaults below:
-#   ./examples/deepseek_v41/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh --training.steps 5
-# USE_GOLDEN=1 is the only currently supported operator path. USE_GOLDEN=0
-# (AscendC) is rejected until the ratio-1 shared/global-KV contract is
-# implemented by the fused sparse-attention kernels.
+# Default entry: the real CC12M caption data (40-layer crop) with the
+# verified fusion stack enabled by default.  USE_GOLDEN=1 selects the
+# pure reference operator path.  The synthetic vision fixture stays available as the Golden path via
+#   CONFIG=deepseek_v41_flash_40layers_16experts_vision ./<this script>
+# (its own defaults — STEPS=40, warmup 25, default attention chunk —
+# are untouched by the CC12M wiring below).
 
 set -euo pipefail
 
@@ -18,12 +19,49 @@ WORLD_SIZE="${NGPU}"
 
 # Model
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v41}"
-CONFIG="${CONFIG:-deepseek_v41_flash_40layers_16experts_vision}"
+CONFIG="${CONFIG:-deepseek_v41_flash_40layers_16experts_cc12m}"
 
 # Dataloader & Checkpoint
 DATASET="${DATASET:-c4_test}"
 DATASET_PATH="${DATASET_PATH:-tests/assets/c4_test}" # your data path
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-/data/tokenizer/dsv4_tokenizer}" # your tokenizer path
+
+# CC12M data entry wiring (active when a *_cc12m recipe is selected).
+CC12M_ARGS=()
+if [[ "${CONFIG}" == *_cc12m ]]; then
+    export CC12M_MANIFEST_PATH="${CC12M_MANIFEST_PATH:-/data/p00465316/fused/datasets/cc12m/subset_8k/manifest.jsonl}"
+    export CC12M_DATA_DIR="${CC12M_DATA_DIR:-/data/p00465316/fused/datasets/cc12m/subset_8k}"
+    export CC12M_TOKENIZER_PATH="${CC12M_TOKENIZER_PATH:-/data/p00465316/fused/dsv41_tokenizer}"
+    if [[ ! -f "${CC12M_MANIFEST_PATH}" ]]; then
+        echo "FATAL: CC12M manifest not found at ${CC12M_MANIFEST_PATH}."
+        echo "Prepare the subset once with examples/deepseek_v41/prepare_cc12m.py"
+        echo "(see examples/deepseek_v41/readme.md)."
+        exit 2
+    fi
+    # Verified-shape pins: the 40-layer backward workspace does not fit
+    # with the default attention chunk 256 (verified OOM); chunk 128 runs
+    # at 73.5% HBM.
+    export TTNPU_DSA_ATTN_CHUNK="${TTNPU_DSA_ATTN_CHUNK:-128}"
+    export TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-1}"
+    export HF_ASSETS_PATH="${CC12M_TOKENIZER_PATH}"
+    # Run length: STEPS is the only knob — it keeps training.steps and
+    # the LR schedule (total-steps=STEPS, warmup=2) in sync.  Direct CLI
+    # overrides are rejected so a run can never desynchronize them.
+    for arg in "$@"; do
+        case "$arg" in
+            --training.steps|--training.steps=*|\
+            --lr-scheduler.total-steps|--lr-scheduler.total-steps=*|\
+            --lr-scheduler.warmup-steps|--lr-scheduler.warmup-steps=*)
+                echo "FATAL: '${arg}' would desynchronize the LR schedule from the run length."
+                echo "Use STEPS=<n> instead; it configures training.steps, total-steps and"
+                echo "warmup-steps together."
+                exit 2
+                ;;
+        esac
+    done
+    STEPS_CC12M="${STEPS:-40}"
+    CC12M_ARGS=(--training.steps "${STEPS_CC12M}" --lr-scheduler.total-steps "${STEPS_CC12M}" --lr-scheduler.warmup-steps 2)
+fi
 
 # Parallelism
 TP=1
@@ -36,21 +74,16 @@ SPMD_BACKEND="spmd_types"
 
 # Training
 # The reference fallback is intentionally kept at seq_len=512 for the 8-card
-# validation recipe.
+# validation recipe.  STEPS stays hardcoded for the synthetic fixture
+# (schedule pinned below); the CC12M entry overrides steps/total/warmup
+# together via CC12M_ARGS.
 SEQ_LEN=512
 MBS=1
 GBS=8
 STEPS=40
 
 # Debug
-export USE_GOLDEN="${USE_GOLDEN:-1}"
-if [[ "${USE_GOLDEN}" != "1" ]]; then
-    echo "FATAL: DeepSeek-V4.1 currently supports the golden/reference path only."
-    echo "The AscendC sparse-attention path does not yet accept the V4.1"
-    echo "ratio-1 shared global KV contract (CSA2 layer 20-39)."
-    echo "Set USE_GOLDEN=1 (default) or unset USE_GOLDEN."
-    exit 2
-fi
+export USE_GOLDEN="${USE_GOLDEN:-0}"
 DEBUG_ARGS="
     --debug.no-moe-force-load-balance
     --debug.print-config
@@ -137,14 +170,43 @@ OPTIMIZER_ARGS="
 "
 # The upstream scheduler clamps warmup to training.steps, so a short comparison
 # run would silently get a different LR curve; total-steps above pins the
-# schedule length to the validation recipe instead.
+# schedule length to the validation recipe instead.  The CC12M entry appends
+# its own steps/total/warmup overrides (see CC12M_ARGS above), which take
+# precedence as later CLI values.
 OPTIMIZER_OVERRIDES="
     torchtitan_npu.override.common.optimizer.virtual
 "
 
-NPU_OPS_OVERRIDES=(
-    torchtitan_npu.override.common.rope.workaround
-)
+NPU_OPS_OVERRIDES=()
+if [[ "${USE_GOLDEN}" == "1" ]]; then
+    # Golden/reference path (USE_GOLDEN=1): pure reference operators,
+    # bit-equivalent to the FUSION50 B0 baseline.
+    NPU_OPS_OVERRIDES=(
+        torchtitan_npu.override.common.rope.workaround
+    )
+else
+    # Fused path (default): the FUSION50-accepted stack — rope/moe
+    # showed no observable trajectory difference in the containing
+    # combination; rms_norm/mhc post differ by <= 4.8e-3 random-signed
+    # with no drift (accepted).
+    NPU_OPS_OVERRIDES=(
+        torchtitan_npu.override.deepseek_v41.rms_norm.ascendc
+        torchtitan_npu.override.deepseek_v41.rope.ascendc
+        torchtitan_npu.override.deepseek_v41.moe.ascendc
+        torchtitan_npu.override.deepseek_v41.mhc.asc_hc_post
+    )
+    # A5-only fused operators, one switch: sparse attention (ratio-2
+    # cmp_topk=256 rejected on A3) + mHC Sinkhorn (operator package
+    # missing on A3).  The A5 wrapper enables this by default; Golden
+    # always stays reference.
+    if [[ "${ENABLE_A5_FUSION:-0}" == "1" ]]; then
+        NPU_OPS_OVERRIDES+=(
+            torchtitan_npu.override.deepseek_v41.sparse_attn.asc_metadata
+            torchtitan_npu.override.deepseek_v41.sparse_attn.asc
+            torchtitan_npu.override.deepseek_v41.mhc.asc_sinkhorn
+        )
+    fi
+fi
 
 MODULE="${MODULE}" \
 CONFIG="${CONFIG}" \
@@ -160,5 +222,6 @@ bash scripts/run_train.sh \
     $PROFILER_ARGS \
     $COMM_ARGS \
     $CHECKPOINT_ARGS \
+    ${CC12M_ARGS[@]+"${CC12M_ARGS[@]}"} \
     --override.imports "${NPU_OPS_OVERRIDES[@]}" $OPTIMIZER_OVERRIDES \
     "$@"

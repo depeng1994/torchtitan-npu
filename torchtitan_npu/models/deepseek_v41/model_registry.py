@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 import torch.nn as nn
 from torchtitan.config import derive
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.models.common import Embedding, Linear, RMSNorm
+from torchtitan.models.common import Embedding, Linear
 from torchtitan.models.common.config_utils import (
     make_ffn_config,
     make_routed_experts_config,
@@ -40,6 +40,7 @@ from .mhc import HcPost, HcPre
 from .model import V41Model
 from .moe import V41MoE, V41Router
 from .reference import ReferenceMetadataExtension
+from .rms_norm import V41RMSNorm
 from .sparse_attention import V41SparseAttention
 from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings
 
@@ -181,7 +182,8 @@ def _make_compressor_config(
                 param_init=_LINEAR_INIT,
             )
         ),
-        norm=RMSNorm.Config(
+        norm=V41RMSNorm.Config(
+            reference_fp32=compress_ratio > 1,
             normalized_shape=head_dim,
             eps=norm_eps,
             param_init=_NORM_INIT,
@@ -231,7 +233,7 @@ def _make_indexer_config(
                 bias=False,
                 param_init=_LINEAR_INIT,
             ),
-            k_norm=RMSNorm.Config(
+            k_norm=V41RMSNorm.Config(
                 normalized_shape=index_head_dim,
                 eps=norm_eps,
                 param_init=_NORM_INIT,
@@ -320,7 +322,7 @@ def _make_v41_attn_config(
             bias=False,
             param_init=_LINEAR_INIT,
         ),
-        q_norm=RMSNorm.Config(
+        q_norm=V41RMSNorm.Config(
             normalized_shape=q_lora_rank,
             eps=norm_eps,
             param_init=_NORM_INIT,
@@ -337,7 +339,7 @@ def _make_v41_attn_config(
             bias=False,
             param_init=_LINEAR_INIT,
         ),
-        kv_norm=RMSNorm.Config(
+        kv_norm=V41RMSNorm.Config(
             normalized_shape=hd,
             eps=norm_eps,
             param_init=_NORM_INIT,
@@ -508,12 +510,12 @@ def _make_v41_config(
             DeepSeekV41TransformerBlock.Config(
                 layer_id=layer_id,
                 attention=attn_cfg,
-                attention_norm=RMSNorm.Config(
+                attention_norm=V41RMSNorm.Config(
                     normalized_shape=widths.dim,
                     eps=norm_eps,
                     param_init=_NORM_INIT,
                 ),
-                ffn_norm=RMSNorm.Config(
+                ffn_norm=V41RMSNorm.Config(
                     normalized_shape=widths.dim,
                     eps=norm_eps,
                     param_init=_NORM_INIT,
@@ -547,7 +549,7 @@ def _make_v41_config(
             embedding_dim=widths.dim,
             param_init=_EMBEDDING_INIT,
         ),
-        norm=RMSNorm.Config(normalized_shape=widths.dim, eps=norm_eps, param_init=_NORM_INIT),
+        norm=V41RMSNorm.Config(normalized_shape=widths.dim, eps=norm_eps, param_init=_NORM_INIT),
         lm_head=Linear.Config(
             in_features=widths.dim,
             out_features=vocab_size,

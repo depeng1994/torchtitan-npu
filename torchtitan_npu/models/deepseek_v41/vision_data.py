@@ -173,13 +173,14 @@ class ImagePatchProcessor:
             best_height, best_width = self._solve_resize_ratio(height, width)
         return best_height, best_width
 
-    def from_path(self, path: str | Path) -> tuple[torch.Tensor, torch.Tensor]:
-        try:
-            from PIL import Image, ImageOps
-        except ImportError as exc:
-            raise RuntimeError("Pillow is required for real image input") from exc
-        image = Image.open(path).convert("RGB")
-        width, height = image.size
+    def target_grid(self, height: float, width: float) -> tuple[int, int]:
+        """The one raw-size -> patch-grid decision.
+
+        Shared by ``from_path`` (full pixel decode) and offline
+        shape/budget calculations, so preparation and runtime can never
+        drift apart.  The aspect clamp, min-pixels upscale and
+        ``_safe_resize`` chain below are exact, in the original order.
+        """
         if self.max_wh_ratio is not None and width > height * self.max_wh_ratio:
             width = height * self.max_wh_ratio
         if 0 < width * height < self.min_pixels:
@@ -187,6 +188,17 @@ class ImagePatchProcessor:
             width *= scale
             height *= scale
         target_h, target_w = self._safe_resize(height, width)
+        return target_h // self.patch_size, target_w // self.patch_size
+
+    def from_path(self, path: str | Path) -> tuple[torch.Tensor, torch.Tensor]:
+        try:
+            from PIL import Image, ImageOps
+        except ImportError as exc:
+            raise RuntimeError("Pillow is required for real image input") from exc
+        image = Image.open(path).convert("RGB")
+        width, height = image.size
+        grid_h, grid_w = self.target_grid(height, width)
+        target_h, target_w = grid_h * self.patch_size, grid_w * self.patch_size
         if self.max_wh_ratio is not None and image.width >= self.max_wh_ratio * image.height:
             image = image.resize((target_w, target_h), Image.Resampling.BICUBIC)
         else:
@@ -201,7 +213,6 @@ class ImagePatchProcessor:
         pixels = ((pixels - torch.tensor(self.mean)[:, None, None]) / torch.tensor(self.std)[:, None, None]).to(
             torch.bfloat16
         )
-        grid_h, grid_w = target_h // self.patch_size, target_w // self.patch_size
         patches = (
             pixels.view(3, grid_h, self.patch_size, grid_w, self.patch_size)
             .permute(1, 3, 0, 2, 4)

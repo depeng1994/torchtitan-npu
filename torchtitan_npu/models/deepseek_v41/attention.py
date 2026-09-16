@@ -16,7 +16,7 @@ the per-forward shared state in :class:`V41AttentionContext` (reset by
 the model at every forward; never carried across batches).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -30,6 +30,7 @@ from torchtitan.protocols.module import Module
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor, Indexer, pack_container
+from .rope import V41RoPERotation
 from .sparse_attention import V41SparseAttention
 
 
@@ -235,6 +236,7 @@ class DeepSeekV41Attention(BaseAttention):
         n_heads: int
         inner_attention: Module.Config
         rope: RoPE.Config
+        rotary: V41RoPERotation.Config = field(default_factory=V41RoPERotation.Config)
         head_dim: int
         rope_head_dim: int
         q_lora_rank: int
@@ -264,6 +266,7 @@ class DeepSeekV41Attention(BaseAttention):
         self.compress_ratio = cfg.compress_ratio
         self.norm_eps = cfg.norm_eps
         self.rope = cfg.rope.build()
+        self.rotary = cfg.rotary.build()
         self.wq_a = cfg.wq_a.build()
         self.q_norm = cfg.q_norm.build()
         self.wq_b = cfg.wq_b.build()
@@ -281,19 +284,13 @@ class DeepSeekV41Attention(BaseAttention):
         """Read-only access to the wrapped attention module."""
         return self.compressed_sparse_attention.inner_attention
 
-    def _golden_rope(self, x: torch.Tensor, positions: torch.Tensor, *, inverse: bool = False):
-        """Apply the reference complex-pair rotation through the float cache."""
+    def _apply_rope(self, x: torch.Tensor, positions: torch.Tensor, *, inverse: bool = False):
         cache = self.rope._reshape_cache(x, positions)
         if isinstance(cache, tuple):
             cos, sin = cache
-            freqs = torch.complex(cos[..., ::2], sin[..., ::2])
         else:
-            freqs = cache
-        if inverse:
-            freqs = freqs.conj()
-        real, imag = x.float().reshape(*x.shape[:-1], -1, 2).unbind(-1)
-        c, s = freqs.real, freqs.imag
-        return torch.stack((real * c - imag * s, imag * c + real * s), dim=-1).flatten(-2).type_as(x)
+            cos, sin = cache.real.repeat_interleave(2, dim=-1), cache.imag.repeat_interleave(2, dim=-1)
+        return self.rotary(x, cos, sin, inverse=inverse)
 
     def _project_q(self, x, positions) -> tuple[torch.Tensor, torch.Tensor]:
         bsz, seqlen, _ = x.size()
@@ -301,7 +298,7 @@ class DeepSeekV41Attention(BaseAttention):
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).view(bsz, seqlen, -1, self.head_dim)
         q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
-        q_rope = self._golden_rope(q_rope, positions)
+        q_rope = self._apply_rope(q_rope, positions)
         return qr, torch.cat([q_nope, q_rope], dim=-1)
 
     def _project_window_kv(self, x, attention_masks, positions) -> torch.Tensor:
@@ -309,7 +306,7 @@ class DeepSeekV41Attention(BaseAttention):
         swa_k = self.kv_norm(self.wkv(x))
         kv_nope, kv_rope = torch.split(swa_k, [self.head_dim - rd, rd], dim=-1)
         kv_input = kv_rope.unsqueeze(2)
-        kv_rope = self._golden_rope(kv_input, positions.reshape(1, -1)).squeeze(2)
+        kv_rope = self._apply_rope(kv_input, positions.reshape(1, -1)).squeeze(2)
         swa_k = torch.cat([kv_nope, kv_rope], dim=-1)
         return swa_k
 
@@ -437,7 +434,7 @@ class DeepSeekV41Attention(BaseAttention):
         bsz, seqlen = o.shape[:2]
         rd = self.rope_head_dim
         o_nope, o_rope = torch.split(o, [self.head_dim - rd, rd], dim=-1)
-        o_rope = self._golden_rope(o_rope, positions, inverse=True)
+        o_rope = self._apply_rope(o_rope, positions, inverse=True)
         o = torch.cat([o_nope, o_rope], dim=-1)
         n_local_groups = self.n_groups // (self.n_heads // o.shape[2])
         o = o.view(bsz, seqlen, n_local_groups, -1)

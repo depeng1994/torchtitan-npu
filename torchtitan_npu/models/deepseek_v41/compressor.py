@@ -24,7 +24,7 @@ own no key projection at all and must receive ``key_override`` from the
 attention context.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torchtitan.models.common.linear import Linear
@@ -33,21 +33,14 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
 from .metadata import CompressedBlockLayout
+from .rope import V41RoPERotation
 
 
-def _golden_complex_rope(rope, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-    """Reference adjacent-pair complex rotation using the expanded float cache."""
-    cos, sin = rope._reshape_cache(x, positions.reshape(1, -1))
-    freqs = torch.complex(cos[..., ::2], sin[..., ::2])
-    pairs = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    return torch.view_as_real(pairs * freqs).flatten(-2).type_as(x)
-
-
-def _golden_rms_norm(norm: RMSNorm, x: torch.Tensor) -> torch.Tensor:
-    dtype = x.dtype
-    x = x.float()
-    x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + norm.eps)  # pyrefly: ignore [unsupported-operation]
-    return (norm.weight * x).to(dtype)
+def _apply_complex_rope(rope, rotary, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    if positions.ndim == 1:
+        positions = positions.unsqueeze(0)
+    cos, sin = rope._reshape_cache(x, positions)
+    return rotary(x, cos, sin)
 
 
 def pack_container(x: torch.Tensor, plan: CompressedBlockLayout) -> torch.Tensor:
@@ -69,6 +62,7 @@ class Compressor(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         rope: RoPE.Config
+        rotary: V41RoPERotation.Config = field(default_factory=lambda: V41RoPERotation.Config(mode="complex"))
         wkv: Linear.Config
         wgate: Linear.Config | None
         norm: RMSNorm.Config
@@ -84,6 +78,7 @@ class Compressor(Module):
         self.nope_head_dim = cfg.head_dim - cfg.rope_head_dim
         self.compress_ratio = cfg.compress_ratio
         self.rope = cfg.rope.build()
+        self.rotary = cfg.rotary.build()
         self.wkv = cfg.wkv.build()
         self.wgate = cfg.wgate.build() if cfg.wgate is not None else None
         self.norm = cfg.norm.build()
@@ -95,8 +90,9 @@ class Compressor(Module):
         rd = self.rope_head_dim
         nope_dim = self.head_dim - rd
         kv_nope, kv_rope = torch.split(kv, [nope_dim, rd], dim=-1)
-        rotated = _golden_complex_rope(
+        rotated = _apply_complex_rope(
             self.rope,
+            self.rotary,
             kv_rope.unsqueeze(2),
             positions,
         ).squeeze(2)
@@ -133,7 +129,7 @@ class Compressor(Module):
         kv = projected_kv[:, : rows * ratio].reshape(batch, rows, ratio, -1).float()
         score = projected_score[:, : rows * ratio].reshape(batch, rows, ratio, -1).float()
         latent = (kv * score.softmax(dim=2)).sum(dim=2)
-        latent = _golden_rms_norm(self.norm, latent.to(dtype))
+        latent = self.norm(latent.to(dtype))
         block_positions = torch.arange(rows, device=x.device, dtype=torch.long) * ratio
         output = self._apply_rope(latent, block_positions)
         return (output, latent) if return_pre_rope else output
@@ -150,6 +146,7 @@ class Indexer(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         rope: RoPE.Config
+        rotary: V41RoPERotation.Config = field(default_factory=lambda: V41RoPERotation.Config(mode="complex"))
         wq_b: Linear.Config
         weights_proj: Linear.Config
         num_index_heads: int
@@ -168,6 +165,7 @@ class Indexer(Module):
         self.compress_ratio = cfg.compress_ratio
         self.softmax_scale = cfg.index_head_dim**-0.5
         self.rope = cfg.rope.build()
+        self.rotary = cfg.rotary.build()
 
         self.wq_b = cfg.wq_b.build()
         self.weights_proj = cfg.weights_proj.build()
@@ -198,7 +196,7 @@ class Indexer(Module):
         idx_q = self.wq_b(qr)
         idx_q = idx_q.view(bsz, seqlen, self.num_index_heads, self.head_dim)
         q_nope, q_rope = torch.split(idx_q, [self.head_dim - rd, rd], dim=-1)
-        q_rope = _golden_complex_rope(self.rope, q_rope, positions)
+        q_rope = _apply_complex_rope(self.rope, self.rotary, q_rope, positions)
         idx_q = torch.cat([q_nope, q_rope], dim=-1)
         if key_override is None:
             if self.wk is None:
@@ -225,7 +223,7 @@ class Indexer(Module):
         if rd == 0:
             return key
         key_nope, key_rope = torch.split(key, [self.head_dim - rd, rd], dim=-1)
-        rotated = _golden_complex_rope(self.rope, key_rope.unsqueeze(2), positions).reshape_as(key_rope)
+        rotated = _apply_complex_rope(self.rope, self.rotary, key_rope.unsqueeze(2), positions).reshape_as(key_rope)
         return torch.cat([key_nope, rotated], dim=-1)
 
     @staticmethod
