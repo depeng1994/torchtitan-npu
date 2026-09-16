@@ -61,6 +61,13 @@ __all__ = [
 ]
 
 
+def _shape_tensor(size: int) -> torch.Tensor:
+    """Represent a batch-dependent size as an input dimension, without storage."""
+    tensor = torch.empty((size, 0), dtype=torch.uint8, device="cpu")
+    torch._dynamo.maybe_mark_dynamic(tensor, 0)
+    return tensor
+
+
 @dataclass(kw_only=True, slots=True)
 class CompressedBlockLayout:
     """Kernel contract for one compression ratio (the key of ``plans``).
@@ -139,12 +146,21 @@ class CompressedBlockLayout:
     parallel, the uniform ``max_kept`` shard width under CP (every rank's
     container is a valid ``S(1)`` shard).  ``None`` for ratio-1 plans."""
 
+    container_shape: torch.Tensor | None = None
+    """Storage-free CPU tensor whose leading dimension is ``out_width``.
+    The dispatcher reads this dimension instead of specializing on the host
+    integer, which varies with the packed documents under CP."""
+
     cmp_k_global_gather_indices: torch.Tensor | None = None
     """The compressed-K global gather (int64 ``[sum seqlen_k // ratio]``) —
     the compressed analogue of ``k_global_gather_indices``: per-segment
     full-prefix blocks as offsets into the all-gathered
     ``[cp * out_width, D]`` container (the ShardingConfig all-gather's
     output).  ``None`` without context parallel."""
+
+    def __post_init__(self) -> None:
+        if self.container_shape is None and self.out_width is not None:
+            self.container_shape = _shape_tensor(self.out_width)
 
 
 @dataclass(kw_only=True, slots=True)

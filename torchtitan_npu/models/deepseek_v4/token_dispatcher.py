@@ -69,7 +69,7 @@ from torchtitan.distributed.utils import get_spmd_backend
 
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
 
-from .metadata import CompressedBlockLayout
+from .metadata import CompressedBlockLayout, _shape_tensor
 
 __all__ = [
     "CPTokenDispatcher",
@@ -499,29 +499,30 @@ class ExchangePlan:
 
     The splits are plain host lists, built once per batch: the eager
     collective APIs need Python ints and the per-layer exchange must never
-    call ``.tolist()`` (a D2H sync per layer per step). During tracing, CPU
-    tensors expose the same sizes as data-dependent ``SymInt`` values so a new
-    packed batch does not recompile every block. Keeping those scalar inputs on
-    CPU avoids a per-layer NPU-to-CPU sync.
+    read tensor data. During tracing, each peer size comes from an input
+    tensor dimension, so AOTAutograd can carry it into the backward graph.
+    Unlike ``.tolist()``, this does not create fresh unbacked symbols during
+    selective activation recomputation. The shape-only CPU tensors have no
+    storage and work for any CP degree, including empty peer splits.
     """
 
     send_indices: torch.Tensor
     send_splits: list[int]
     recv_splits: list[int]
     recv_offsets: torch.Tensor
-    send_splits_tensor: torch.Tensor = field(init=False)
-    recv_splits_tensor: torch.Tensor = field(init=False)
+    send_split_shapes: list[torch.Tensor] = field(init=False)
+    recv_split_shapes: list[torch.Tensor] = field(init=False)
 
     def __post_init__(self) -> None:
-        self.send_splits_tensor = torch.tensor(self.send_splits, dtype=torch.int64, device="cpu")
-        self.recv_splits_tensor = torch.tensor(self.recv_splits, dtype=torch.int64, device="cpu")
+        self.send_split_shapes = [_shape_tensor(n) for n in self.send_splits]
+        self.recv_split_shapes = [_shape_tensor(n) for n in self.recv_splits]
 
     def splits_for_collective(self) -> tuple[list[int], list[int]]:
         """Return dynamic sizes while tracing and host sizes in eager mode."""
         if torch.compiler.is_compiling() or torch.compiler._is_non_strict_tracing():
             return (
-                self.send_splits_tensor.tolist(),
-                self.recv_splits_tensor.tolist(),
+                [shape.shape[0] for shape in self.send_split_shapes],
+                [shape.shape[0] for shape in self.recv_split_shapes],
             )
         return self.send_splits, self.recv_splits
 
@@ -632,7 +633,7 @@ class CPTokenDispatcher(Configurable):
         # pooled streams select directly.
         x2 = x.flatten(0, 1) if x.ndim > 2 else x
         out = x2 if plan.compressed_rows is None else x2[plan.compressed_rows]
-        out_width = plan.out_width
-        assert out_width is not None, "select requires the container width"
+        assert plan.container_shape is not None, "select requires the container width"
+        out_width = plan.container_shape.shape[0]
         pad = x.new_zeros((out_width - out.shape[0], x.shape[-1]))
         return torch.cat([out, pad], dim=0).unsqueeze(0)
