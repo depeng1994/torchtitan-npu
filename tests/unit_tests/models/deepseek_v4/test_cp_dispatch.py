@@ -920,6 +920,7 @@ def test_multiprocess_gloo(tmp_path):
         filter(
             None,
             [
+                env.get("TORCHTITAN_DIR", ""),
                 str(_REPO / "tests" / "unit_tests" / "models" / "deepseek_v4"),
                 str(_REPO),
                 env.get("PYTHONPATH", ""),
@@ -978,3 +979,34 @@ def test_cp_gather_compile_reuses_graph_across_dynamic_splits_gloo():
     assert first.shape == (6, 8)
     assert second.shape == (14, 16)
     assert len(compiled_graphs) == 1
+
+
+@pytest.mark.parametrize("world", [2, 4], ids=["cp2", "cp4"])
+def test_cp_dispatch_sac_inductor_outputs_gradients_and_graph_reuse(tmp_path, world):
+    worker = Path(__file__).with_name("cp_compile_worker.py")
+    env = dict(os.environ)
+    env.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(_free_port()), WORLD_SIZE=str(world))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [env.get("TORCHTITAN_DIR", ""), *sys.path]))
+    env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+    env["OMP_NUM_THREADS"] = "1"
+    processes = []
+    try:
+        for rank in range(world):
+            log = (tmp_path / f"rank{rank}.log").open("w+")
+            proc = subprocess.Popen(
+                [sys.executable, str(worker)],
+                env={**env, "RANK": str(rank)},
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            processes.append((proc, log))
+        for proc, log in processes:
+            proc.wait(timeout=600)
+            log.seek(0)
+            assert proc.returncode == 0, log.read()
+    finally:
+        for proc, log in processes:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            log.close()
