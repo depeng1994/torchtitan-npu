@@ -196,3 +196,71 @@
 | **是否建议继续在当前实现上补 validator** | **不建议。** 先删除/复用，把 loader 缩回训练职责；否则 R11/R6 若按“缺什么补什么”继续做，会让 430 行 loader 与 527 行 UT 进一步增长。 |
 | **对本 PR 合入的影响** | 专项本身不新增独立 correctness blocker，但 S1/S3/S7 与原 R1/R12/clean-code 职责直接相关，建议在本 PR 内一并收敛。尤其 S1 能同时解决路径 env、`**kwargs` 吞 tokenizer、双 tokenizer/vocab source-of-truth 等多个原 review 点。 |
 | **精简后的目标形态** | 一个 launcher + 一个 CC12M recipe；数据位置走现有 dataloader CLI；tokenizer 由 Trainer 单点构造；dataset 只负责 manifest/image/sequence/shard；preparer 只负责确定性过滤/选样/提取；A/B 验证走正式测试而不是 production debug CLI。 |
+
+## 10. V4.1 primitive ownership / 上游复用专项 Review
+
+> **修正说明**：本节是在横向对比 TorchTitan v0.3.0 `models/common`、本仓 `override/common`、`patches/torchtitan/models/common` 后得出的架构结论。它**覆盖并修正**第 9.4 节中对 `V41RMSNorm` / `V41RoPERotation` 的暂定“保留”结论；若两节存在冲突，以本节为准。第 9.4 节当时只判断了“是否减少 V4.1 文件内部重复”，没有继续判断“是否在仓库/上游层面重复造了一套 common primitive”。
+
+### 10.1 总体原则与归属判断
+
+| Primitive / 行为 | 是否应由 V4.1 单独拥有 | Review 结论 |
+|---|---|---|
+| 普通 RMSNorm（q/kv、Transformer block、final norm、普通 indexer norm） | **否** | 数学/状态语义与 TorchTitan `RMSNorm` 相同，不应仅为了获得 V4.1 专属 exact override target 而换成 `V41RMSNorm`。应继续使用 upstream `RMSNorm.Config` + 本仓 `override/common/rms_norm.py`。 |
+| “FP32 归一化 + FP32 weight multiply 后最后一次 cast”的 RMSNorm | **可以有独立语义类型，但不应泛化成所有 V4.1 norm** | vision 与 ratio>1 compressor 的确有冻结 reference 数值顺序，pre-PR 也分别维护 `_ReferenceRMSNorm` / `_golden_rms_norm`。应把这一个语义抽成窄的 `Fp32RMSNorm`/等价类型；若可复用则放 model-neutral common/Extension，否则只在真正需要的 V4.1 callsite 使用。 |
+| RoPE cache / YaRN / position reshape | **否** | 已由 TorchTitan `RoPE/ComplexRoPE/CosSinRoPE` 和本仓 split-aware backport/override 负责；V4.1 不应再拥有一套 cache abstraction。 |
+| “给外部 cos/sin 做 interleave / complex / half rotation”的算术 seam | **需要一个可替换 seam，但不应是 V4.1-owned** | 这是通用 rotary arithmetic，不包含 V4.1 模型语义。若上游 `RoPE.forward` 当前接口不能覆盖 vision 外部 2D table / 不同 frozen op-order，应在与 `torchtitan.models.common.rope` 对应的 common/Extension 层补一个 model-neutral seam，而不是新增 `models/deepseek_v41/rope.py` + `override/deepseek_v41/rope.py`。 |
+| V4.1 vision 的 2D RoPE table 生成 | **是** | `_vision_rope/_vision_rope_batch` 描述 V4.1 vision position layout，属于模型结构；应留在 V4.1 vision。需要复用的是“旋转运算”，不是 2D table 语义。 |
+| V4.1 Router（`bias_vl`、`image_mask`、sqrtsoftplus、sorted top-k） | **是** | 这些是明确的 V4.1 VL routing 语义，上游通用 router 不具备，不应为了去重塞进 patch/common。 |
+| V4.1 expert 的 frozen dtype / clamp / score-absorb arithmetic | **是** | `V41GroupedExperts` / `V41FeedForward` 的 FP32 gate/up、clamp、router score 放置和 cast 顺序决定 reference 数值轨迹，属于模型语义。 |
+| MoE 的通用 dispatch/combine、SP padding、token accounting orchestration | **原则上否** | 这些是框架能力；V4.1 当前因 router extra kwargs / score absorption / dtype contract 不得不复制一部分 upstream `MoE/RoutedExperts.forward`，属于可接受的兼容债，但目标应是通过 upstream hook/common seam 删除重复 orchestration，而不是长期 fork。 |
+| Ascend RMSNorm / rotary kernel wrapper | **普通语义应 common；特殊语义才 V4.1-specific** | `override/common/rms_norm.py`、`override/common/rope.py` 已有 `npu_rms_norm/npu_rotary_mul`。V4.1 不应只为“限制 override 作用域”复制同一个 kernel adapter。 |
+| Ascend V4.1 grouped-expert override | **是，位置正确** | 新 `override/deepseek_v41/moe.py` 针对 V4.1 frozen expert arithmetic 做 grouped GEMM 替换，属于 NPU + 模型语义交叉点，放 V4.1 override 合理。 |
+
+### 10.2 专项 Finding
+
+| ID | 级别 | 代码位置 | 架构问题 | 建议修改方案 |
+|---|---|---|---|---|
+| A1 | **High / architecture，建议本 PR 必改** | `models/deepseek_v41/rope.py`；`override/deepseek_v41/rope.py`；`attention.py` / `compressor.py` / `vision.py` 新增 `rotary` Config | **`V41RoPERotation` 解决的是 common abstraction 缺口，不是 V4.1 模型特性。** PR 前 attention、compressor、vision 确实各有不同 operation order 的本地 helper，抽出来是对的；但当前抽成 V4.1-owned Config 后，又在 `AscV41RoPERotation` 中重新实现一遍 `torch_npu.npu_rotary_mul`。横向看，TorchTitan `ComplexRoPE.apply_rotary_emb` 已有 adjacent-pair complex rotation、`CosSinRoPE` 已有 half rotation，本仓 `override/common/rope.py` 已有 interleaved reference arithmetic、`AscComplexRoPE`、`AscCosSinRoPE`、`AscPartialComplexRoPE`。因此当前是“V4.1 内部去重、仓库整体增重”。 | 保留“把 cache 生成和 apply arithmetic 解耦”的设计意图，但把 seam 提到 model-neutral 层：优先让 decoder/compressor/indexer 直接走 `RoPE.forward(query, key=None, positions, inverse=...)`/split-aware API；vision 的外部 2D cos/sin 若无法套现有 RoPE，则在与 upstream `models/common/rope.py` 镜像的 Extension/common 中补**一个** external-cache rotary seam，并让 common Ascend override 实现 `npu_rotary_mul`。完成后删除 `models/deepseek_v41/rope.py` 和 `override/deepseek_v41/rope.py`。 |
+| A2 | **High / duplicate configuration** | `DeepSeekV41Attention.Config.rotary`、`Compressor.Config.rotary`、`Indexer.Config.rotary`、`VisionAttention/Block/Encoder.Config.rotary` | **同一 RoPE 语义被拆成 `rope`（cache/positions）+ `rotary`（apply）两套 Config source-of-truth。** `mode="interleave"/"complex"/"half"` 实际是各 callsite 冻结的数值实现细节，却被建模成可配置字段；理论上用户/override 可以组合出不匹配的 cache format + rotary mode。对于 frozen trajectory 来说，这不是需要开放的实验维度。 | 不要把 operation-order 当训练 CLI/config 维度。如果确实必须保留多种 arithmetic 以匹配 frozen reference，应由具体 RoPE implementation/type 固定，而不是每个 V4.1 owner 再携带一个 `rotary.mode`。配置层只表达一个 RoPE implementation。 |
+| A3 | **High / over-specialization，建议本 PR 必改** | `models/deepseek_v41/rms_norm.py`；`model_registry.py` 把 q_norm/kv_norm/block/final/indexer norm 全部从 `RMSNorm.Config` 换成 `V41RMSNorm.Config`；`override/deepseek_v41/rms_norm.py` | **只有少数位置需要 V4.1 特殊 FP32 contract，但 PR 把整个模型的 RMSNorm 类型都 V4.1 化了。** `reference_fp32=False` 时 `V41RMSNorm.forward()` 只是 `super().forward()`，这些实例没有新增模型语义；唯一作用主要是给 `@override(target=V41RMSNorm.Config, exact=True)` 提供一个 model-specific tag。与此同时仓里已经有通用 `override/common/rms_norm.py::AscRMSNorm`。这会让以后 upstream RMSNorm API/实现优化必须额外验证一套 V41 wrapper。 | 普通 q_norm/kv_norm、block attention/ffn norm、final norm、无需 FP32 特殊顺序的 indexer norm恢复为 upstream `RMSNorm.Config`，直接复用 common Ascend override。只把 pre-PR 确实调用 `_golden_rms_norm` / `_ReferenceRMSNorm` 的位置收敛到一个**语义命名**的 FP32 norm 类型；其 NPU override 只覆盖这个特殊类型。不要使用“模型名 subclass”作为纯 override tag。 |
+| A4 | **Medium / layering inversion（既有问题，本 PR 加深耦合）** | `model_registry.py` 从 `torchtitan_npu.override.common.rope` 导入 `WorkaroundComplexRoPE`；本 PR 再在 model layer 上叠 `V41RoPERotation` | V4.1 reference model 在 PR 前已经直接依赖 `override.common`，说明当前 RoPE 缺口本来就没有放在干净的层级：reference model 应依赖 upstream/common model contract，NPU override 应单向依赖 model，不应反向。新 `V41RoPERotation` 没有解决这一 inversion，只是在其上再加一层 model-specific apply abstraction。 | 把 reference-compatible `WorkaroundComplexRoPE` / split API 放回 upstream-shaped common/Extension（或在 pinned TorchTitan 已具备等价 API 后直接删除 workaround），让依赖方向变成 `model -> common/extension <- override`；不要让 `models/deepseek_v41` import `override.*`。该问题虽非本 PR 首次引入，但本 PR 正在重做 RoPE seam，适合一起收敛。 |
+| A5 | **Medium / ownership boundary，MoE 基础定义总体合理** | `models/deepseek_v41/moe.py::{V41Router,V41RoutedExperts,V41GroupedExperts,V41FeedForward,V41MoE}` | **MoE 与 RMSNorm/RoPE 不同：V4.1 单独定义有充分理由，但当前文件混合了“模型语义”和“框架 orchestration”。** `V41Router` 的 VL bias/image_mask/sorted top-k、`V41GroupedExperts`/`V41FeedForward` 的 frozen dtype/clamp/score 顺序必须保留；而 `V41MoE.forward`、`V41RoutedExperts.forward` 的 padding、dispatch/combine、token accounting 大量镜像 upstream/patch，容易随 TorchTitan 升级漂移。 | 本 PR 不要求为了这个既有问题重写整个 MoE；**不要把 V4.1 VL 逻辑搬进 patch**。长期应推动 upstream/common 暴露最小 hook（例如 router extra kwargs / expert score-absorb seam），V4.1 只保留 router + expert arithmetic；一旦 pinned upstream 提供等价 hook，删除复制的 generic orchestration。 |
+| A6 | **Medium / NPU override reuse** | `override/deepseek_v41/moe.py::AscV41GroupedExperts.forward()` | 新 grouped-GEMM override 的**归属是正确的**：它只替换 `V41GroupedExperts`，没有全局 monkey patch，也没有污染 patch 目录；但实现仍复制了 DTensor→local、offset cumsum、SPMD type mutate 这一段框架机械逻辑。 | 当前可接受，但若 V4/V4.1 或其他模型出现第三个同类 override，应立即抽一个 model-neutral grouped-expert helper/hook；不要继续复制。该项不建议把 V41-specific expert arithmetic搬到 `patches/torchtitan`，除非抽出的部分本身是明确可贡献上游的通用 seam。 |
+| A7 | **High / anti-pattern rule** | 本 PR `V41RMSNorm` / `V41RoPERotation` 的 exact override 设计动机 | **“为了 exact override 隔离而先造一个模型专属 reference class”不应成为本仓通用模式。** Override 的边界应该跟随真实语义边界；否则每个模型都会出现 `ModelXRMSNorm/ModelXRoPE/...`，上游 common 的演进无法自然下沉，Extension/Override 也会退化成按模型复制算子 adapter。 | Maintainer 规则建议明确：只有当 forward/state/config contract 与 upstream/common 有**真实语义差异**时才定义 model-specific primitive；若差异只是 kernel implementation，优先复用 common Config + common override；若缺少可精确选择的 hook，则修 common/Extension hook，而不是用空 subclass/type tag 绕过。 |
+
+### 10.3 针对三个用户点的最终判断
+
+| 项目 | 为什么当前会单独维护 | 是否架构合理 | 本次建议 |
+|---|---|---|---|
+| **RMSNorm** | PR 想同时统一 vision/compressor 的 FP32 reference arithmetic，并给 V4.1 fusion 一个 exact override target | **一半合理、一半过度。** FP32 特殊 contract 合理；把所有普通 RMSNorm 都改成 V41 类型不合理 | 收窄到真正 FP32 特殊位置；普通 norm 回 upstream/common；删除“V41 类型仅作 override tag”的部分 |
+| **RoPE** | attention/compressor/vision 原来三套 operation order，需要抽 seam 才能统一切换 fused kernel | **抽 seam 合理，但放成 V4.1 专属 primitive + 专属 NPU override 不合理** | 把 seam 提到 upstream-shaped common/Extension，复用现有 RoPE/cache/Ascend override；V4.1 只保留 vision 2D table 和模型侧调用关系 |
+| **MoE** | V4.1 有 image-aware routing、sqrtsoftplus/sorted top-k、score absorption、特殊 FP32/clamp/cast reference contract | **核心模型定义合理** | 保留 V41 Router/expert semantic；逐步删除复制的 generic orchestration；新 Asc grouped-expert override 位置可接受，但补 R5/R6 的真实 UT/ST |
+
+### 10.4 目标架构
+
+| 层级 | 应承载内容 |
+|---|---|
+| TorchTitan / upstream-shaped common | 标准 RMSNorm、RoPE cache/position/scaling、通用 MoE dispatch/combine；若缺 external-cache rotary / router-extra-kwargs / score-absorb hook，应优先向这里补通用 seam并推动上游 |
+| `torchtitan_npu/extensions/...`（按上游目录镜像） | pinned upstream 尚未提供、但**模型无关**且可作为上游增强的通用 seam；例如确有必要的 external-cache rotary abstraction。不得包含 V4.1/A3/A5 特有策略 |
+| `torchtitan_npu/models/deepseek_v41` | V4.1 独有模型语义：vision 2D position table、CSA2 topology、VL router/image bias、frozen expert arithmetic、必要的 FP32 norm contract（若暂时没有更通用归属） |
+| `torchtitan_npu/override/common` | 真正通用的 NPU implementation replacement，例如标准 RMSNorm / 通用 RoPE kernel；不按模型复制同一 torch_npu adapter |
+| `torchtitan_npu/override/deepseek_v41` | 只有同时依赖 **V4.1 语义 + NPU kernel contract** 的实现，例如当前 grouped-expert / sparse-attn / mHC 特殊融合 |
+| `patches/torchtitan` | 仅放准备贡献 upstream 的临时代码；V4.1 image bias、vision 2D RoPE、模型专属 arithmetic 不得为了“复用”搬进 patch |
+
+### 10.5 本专项优先级与对前文的修订
+
+| 优先级 | 要求 |
+|---|---|
+| **A-P1 / 本 PR 必须收敛** | A1/A2：不要保留 V4.1-owned duplicate RoPE + 第二套 `rotary` Config；A3：RMSNorm 只为真实特殊语义分型，普通 norm 回归 upstream/common |
+| **A-P1 / 建议同 PR 收敛** | A4：既然本 PR 正在重构 RoPE seam，顺带消除 `models/deepseek_v41 -> override.common.rope` 的反向依赖，或至少在 PR 中给出明确迁移 TODO/后续上游落点 |
+| **A-P2 / 非本 PR blocker** | A5/A6：MoE 的 model-specific semantic 保留；generic orchestration/hook 随 upstream 演进逐步去重。新 V41 grouped-GEMM override 本身不因“单独定义”被否定，但仍受 R5/R6 测试要求约束 |
+| **对第 5/9.4 节的修订** | 原“`V41RMSNorm` 保留”“`V41RoPERotation` 保留主体”“V41 RMS/RoPE override 均归属正确”的表述仅从 V4.1 文件内去重看成立，**从全仓/上游架构看不再成立**。应按本节 A1-A4 的收敛方案复审。 |
+
+### 10.6 专项结论
+
+| 结论 | 说明 |
+|---|---|
+| **是否应该为 V4.1 单独维护三套 primitive** | **不应该一概维护。** RMSNorm 只保留真正特殊的 FP32 contract；RoPE 不应 V4.1-owned；MoE 的 VL/router/expert semantic 应 V4.1-owned。 |
+| **本 PR 是否存在新的架构问题** | **有。** 新增的 `V41RoPERotation` + `AscV41RoPERotation`、以及把全部 RMSNorm 改成 `V41RMSNorm`，都把“operator override 隔离”转化成了 model-specific primitive fork，削弱了与上游 common 的复用。 |
+| **是否否定本 PR 的去重目标** | **不否定。** 删除 attention/compressor/vision 原本散落的 `_golden_rope/_apply_rope/_ReferenceRMSNorm` 是正确目标；问题在于抽取后的 owner 层级不对。应“继续去重，但往 common/Extension 收敛”，而不是恢复三份本地 helper。 |
+| **MoE 是否也要删掉 V41 定义** | **否。** V41Router/image bias、frozen expert arithmetic 是模型语义；真正应消除的是 generic dispatch/combine/padding 的复制，而不是把 V4.1 语义塞进 upstream patch。 |
