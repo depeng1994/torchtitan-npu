@@ -21,7 +21,7 @@ torchtitan 迁移而来。
 | `dsv3_2_dsa_ep2_fsdp2` | DeepSeek-V3.2 | DSA + EP2/FSDP2 | 2 | - | 是 | - |
 | `dsv3_2_dsa_cp2` | DeepSeek-V3.2 | DSA + CP2 | 2 | - | 否 | ST 仅验证训练触发；CPU metadata oracle 单独覆盖，暂未生成 CP2 golden loss |
 | `dsv4_ema_ep2_fsdp2` | DeepSeek-V4 | Golden + EP2/FSDP2 + EMA CPU offload | 2 | - | 否 | 校验完整 DCP metadata 包含 `ema_optimizer.*` |
-| `dsv41_golden_2p_ep2_fsdp2` | DeepSeek-V4.1 | Golden 调试模型（40 层全结构、调试宽度）+ FSDP2 + EP2，50 步精确 loss | 2 | - | 是 | 多模态 golden 轨迹守护，锚定 `tests/assets/losses/dsv41_golden_2p_ep2_fsdp2.txt`；8 卡形状作手动 A/B 回归，锚不入库 |
+| `dsv41_golden_2p_ep2_fsdp2` | DeepSeek-V4.1 | Golden 调试模型（40 层全结构、调试宽度）+ FSDP2 + EP2，30 步精确 loss | 2 | - | 是 | 多模态 golden 轨迹守护，锚定 `tests/assets/losses/dsv41_golden_2p_ep2_fsdp2.txt`；8 卡形状作手动 A/B 回归，锚不入库 |
 
 V4.1 模型栈完全独立于 `deepseek_v4`（无继承、无 import、无跨模型 override，见 `tests/unit_tests/models/deepseek_v41/test_independence.py`）；golden 参考算子是 `V41SparseAttention`/`V41MoE` 的原生路径，套件仅需 RoPE workaround 与 virtual optimizer 两个通用 override。
 

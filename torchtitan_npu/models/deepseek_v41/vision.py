@@ -4,12 +4,15 @@
 
 __all__ = ["DeepSeekV41VisionEncoder"]
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 import torch
 import torch.nn.functional as F
 from torchtitan.models.common import Linear
 from torchtitan.protocols.module import Module, ModuleList
+
+from .rms_norm import V41RMSNorm
+from .rope import V41RoPERotation
 
 
 class ImageMarkerEmbeddings(Module):
@@ -33,24 +36,6 @@ class ImageMarkerEmbeddings(Module):
         return output
 
 
-class _ReferenceRMSNorm(Module):
-    """Pure Torch RMSNorm with the reference FP32 accumulation contract."""
-
-    def __init__(self, dim: int, eps: float):
-        super().__init__()
-        self.eps = eps
-        self.weight = torch.nn.Parameter(torch.ones(dim, dtype=torch.float32))
-
-    def reset_parameters(self):
-        torch.nn.init.ones_(self.weight)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
-        return (self.weight * x).to(dtype)
-
-
 def _vision_rope(n_h: int, n_w: int, rope_dim: int, theta: float, device):
     inv_freq = 1.0 / (theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim))
     hpos = torch.arange(n_h, device=device).unsqueeze(1).expand(n_h, n_w)
@@ -70,14 +55,6 @@ def _vision_rope_batch(grids: torch.Tensor, max_tokens: int, rope_dim: int, thet
         cos[index, :tokens] = image_cos[0, :tokens]
         sin[index, :tokens] = image_sin[0, :tokens]
     return cos, sin
-
-
-def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    dtype = x.dtype
-    pairs = x.float()
-    width = pairs.shape[-1] // 2
-    x1, x2 = pairs.narrow(-1, 0, width), pairs.narrow(-1, width, width)
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(dtype)
 
 
 class PatchEmbed(Module):
@@ -104,8 +81,11 @@ class VisionAttention(Module):
         dim: int
         num_heads: int
 
+        rotary: V41RoPERotation.Config = field(default_factory=lambda: V41RoPERotation.Config(mode="half"))
+
     def __init__(self, config: Config):
         super().__init__()
+        self.rotary = config.rotary.build()
         if config.dim % config.num_heads != 0:
             raise ValueError("vision dim must be divisible by vision heads")
         self.num_heads = config.num_heads
@@ -131,8 +111,8 @@ class VisionAttention(Module):
             q = q.view(p, self.num_heads, self.head_dim)
             k = k.view(p, self.num_heads, self.head_dim)
             v = v.view(p, self.num_heads, self.head_dim)
-            q = _apply_rope(q, cos, sin)
-            k = _apply_rope(k, cos, sin)
+            q = self.rotary(q, cos, sin)
+            k = self.rotary(k, cos, sin)
             out = F.scaled_dot_product_attention(
                 q.transpose(0, 1),
                 k.transpose(0, 1),
@@ -148,8 +128,8 @@ class VisionAttention(Module):
         q = q.view(n, p, self.num_heads, self.head_dim)
         k = k.view(n, p, self.num_heads, self.head_dim)
         v = v.view(n, p, self.num_heads, self.head_dim)
-        q = _apply_rope(q, cos, sin).transpose(1, 2)
-        k = _apply_rope(k, cos, sin).transpose(1, 2)
+        q = self.rotary(q, cos, sin).transpose(1, 2)
+        k = self.rotary(k, cos, sin).transpose(1, 2)
         v = v.transpose(1, 2)
         mask = valid[:, None, :, None] & valid[:, None, None, :]
         # The reference's tensor contract is [heads, patches, dim] with no batch
@@ -200,12 +180,17 @@ class VisionBlock(Module):
         num_heads: int
         inter_dim: int
         norm_eps: float = 1e-6
+        norm: V41RMSNorm.Config = field(
+            default_factory=lambda: V41RMSNorm.Config(normalized_shape=1, reference_fp32=True)
+        )
+
+        rotary: V41RoPERotation.Config = field(default_factory=lambda: V41RoPERotation.Config(mode="half"))
 
     def __init__(self, config: Config):
         super().__init__()
-        self.norm1 = _ReferenceRMSNorm(config.dim, config.norm_eps)
-        self.attn = self.attention_type.Config(dim=config.dim, num_heads=config.num_heads).build()
-        self.norm2 = _ReferenceRMSNorm(config.dim, config.norm_eps)
+        self.norm1 = replace(config.norm, normalized_shape=config.dim, eps=config.norm_eps).build()
+        self.attn = self.attention_type.Config(dim=config.dim, num_heads=config.num_heads, rotary=config.rotary).build()
+        self.norm2 = replace(config.norm, normalized_shape=config.dim, eps=config.norm_eps).build()
         self.mlp = VisionMLP.Config(dim=config.dim, inter_dim=config.inter_dim).build()
 
     def forward(self, x, cos, sin, valid):
@@ -273,6 +258,11 @@ class DeepSeekV41VisionEncoder(Module):
         text_dim: int = 4096
         downsample_ratio: int = 3
         norm_eps: float = 1e-6
+        norm: V41RMSNorm.Config = field(
+            default_factory=lambda: V41RMSNorm.Config(normalized_shape=1, reference_fp32=True)
+        )
+
+        rotary: V41RoPERotation.Config = field(default_factory=lambda: V41RoPERotation.Config(mode="half"))
 
     def __init__(self, config: Config):
         super().__init__()
@@ -287,11 +277,13 @@ class DeepSeekV41VisionEncoder(Module):
                     num_heads=config.num_heads,
                     inter_dim=config.inter_dim,
                     norm_eps=config.norm_eps,
+                    norm=config.norm,
+                    rotary=config.rotary,
                 ).build()
                 for _ in range(config.num_layers)
             ]
         )
-        self.norm = _ReferenceRMSNorm(config.dim, config.norm_eps)
+        self.norm = replace(config.norm, normalized_shape=config.dim, eps=config.norm_eps).build()
         self.aligner = ImageAligner.Config(
             dim=config.dim,
             text_dim=config.text_dim,
