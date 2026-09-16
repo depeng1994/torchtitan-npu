@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 --extra-index-url https://download.pytorch.org/whl/nightly/cpu
 torch==2.14.0.dev20260719
 --find-links https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torch-npu/index.html
@@ -11,3 +16,8 @@ ninja
 triton-ascend==3.2.1
 scipy==1.13.1
 safetensors==0.8.0
+# Pinned exactly, not by range: scripts/generate_engram_token_map.py builds the
+# Engram token-compression map from this package's normalizer pipeline, so its
+# StripAccents and Lowercase semantics decide every Engram row ID. A different
+# minor version can change the map without changing anything visible.
+tokenizers==0.22.2

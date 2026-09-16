@@ -15,6 +15,7 @@ from torchtitan_npu.models.deepseek_v41.vision_state_dict import DeepSeekV41Visi
 def _build_model_config():
     """A minimal local V4.1 fixture (the debugmodel topology, tiny widths)."""
     config = deepseek_v41_debugmodel_config()
+    config.engram_enabled = False
     config.vocab_size = 32
     config.tok_embeddings.num_embeddings = 32
     config.lm_head.out_features = 32

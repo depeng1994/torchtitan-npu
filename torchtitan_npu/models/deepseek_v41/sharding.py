@@ -22,8 +22,10 @@ from torchtitan.models.common.decoder_sharding import (
     rowwise_config,
     set_decoder_sharding_config,
 )
-from torchtitan.models.common.moe_sharding import set_moe_sharding_config
-from torchtitan.protocols.sharding import ShardingConfig, SpmdLayout
+from torchtitan.models.common.moe_sharding import expert_param_placement_sparse, set_moe_sharding_config
+from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig, SpmdLayout
+
+DP, CP, TP = MeshAxisName.DP, MeshAxisName.CP, MeshAxisName.TP
 
 _dense_param_rep = dense_param_placement(tp=spmd.R)
 _attn_sink_placement = dense_param_placement(tp=spmd.S(0))
@@ -37,6 +39,63 @@ _GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
 _replicate_weight = ShardingConfig(
     state_shardings={"weight": _dense_param_rep},
 )
+
+
+def _engram_hidden_placement(*, enable_sp: bool) -> SpmdLayout:
+    if not enable_sp:
+        return dense_activation_placement(tp=spmd.I)
+    return SpmdLayout(
+        {
+            DP: spmd.V,
+            CP: spmd.V,
+            TP: spmd.V,
+        },
+        partition_spec=(DP, (CP, TP), None, None),
+    )
+
+
+def set_engram_sharding_config(engram_cfg, *, enable_ep: bool, enable_sp: bool) -> None:
+    """Declare the dense mHC boundary and the sparse table storage family."""
+    dense_param_rep = dense_param_placement(tp=spmd.R)
+    table_state = {
+        "weight": expert_param_placement_sparse() if enable_ep else dense_param_rep,
+        "token_id_map": dense_param_rep,
+        "head_vocab_sizes": dense_param_rep,
+        "offsets": dense_param_rep,
+        "hash_multipliers": dense_param_rep,
+        "compressed_pad_id": dense_param_rep,
+    }
+    engram_cfg.table.sharding_config = ShardingConfig(state_shardings=table_state)
+
+    engram_cfg.gate.sharding_config = ShardingConfig(
+        state_shardings={
+            "wkv": dense_param_rep,
+            "q_weight": dense_param_rep,
+            "k_weight": dense_param_rep,
+        }
+    )
+    hidden = _engram_hidden_placement(enable_sp=enable_sp)
+    token_src = dense_activation_placement(tp=spmd.R)
+    token_dst = dense_token_ids_sequence_parallel_placement() if enable_sp else token_src
+    engram_cfg.sharding_config = ShardingConfig(
+        in_src_shardings={
+            "hidden_states_BLMD": hidden,
+            "input_ids_BL": token_src,
+            "positions_BL": token_src,
+            "image_mask": token_src,
+        },
+        in_dst_shardings={
+            "hidden_states_BLMD": hidden,
+            "input_ids_BL": token_dst,
+            "positions_BL": token_dst,
+            "image_mask": token_dst,
+        },
+        out_src_shardings=hidden,
+        out_dst_shardings=hidden,
+        local_map=LocalMapConfig(
+            in_grad_placements=(hidden, None, None, None),
+        ),
+    )
 
 
 def dense_token_ids_sequence_parallel_placement():
@@ -228,6 +287,9 @@ def set_deepseek_v41_sharding_config(
 ) -> None:
     """Assign the complete V4.1 placement policy."""
     set_decoder_sharding_config(config, enable_sp=enable_sp)
+    for layer in config.layers:
+        if layer.engram is not None:
+            set_engram_sharding_config(layer.engram, enable_ep=enable_ep, enable_sp=enable_sp)
 
     if config.image_marker_embeddings is not None:
         config.image_marker_embeddings.sharding_config = ShardingConfig(

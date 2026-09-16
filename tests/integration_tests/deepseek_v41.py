@@ -35,13 +35,14 @@ GOLDEN_ENV = {
 }
 
 
-def build_deepseek_v41_test_list() -> list[OverrideDefinitions]:
+def _build_golden_test_list() -> list[OverrideDefinitions]:
     return [
         OverrideDefinitions(
             override_args=[
                 GOLDEN_OVERRIDES
                 + (
                     "--training.steps=30",
+                    "--no-engram-enabled",
                     "--training.local-batch-size=1",
                     "--training.global-batch-size=2",
                     "--training.seq-len=512",
@@ -56,13 +57,13 @@ def build_deepseek_v41_test_list() -> list[OverrideDefinitions]:
                     "--debug.no-moe-force-load-balance",
                     "--hf-assets-path=tests/assets/deepseek_v3",
                     "--optimizer.implementation=fused",
-                    "--optimizer.param-groups.0.optimizer-name=AdamW",
-                    "--optimizer.param-groups.0.optimizer-kwargs.lr=1e-5",
-                    "--optimizer.param-groups.0.optimizer-kwargs.betas",
+                    "--optimizer.param-groups.1.optimizer-name=AdamW",
+                    "--optimizer.param-groups.1.optimizer-kwargs.lr=1e-5",
+                    "--optimizer.param-groups.1.optimizer-kwargs.betas",
                     "0.9",
                     "0.95",
-                    "--optimizer.param-groups.0.optimizer-kwargs.eps=1e-6",
-                    "--optimizer.param-groups.0.optimizer-kwargs.weight-decay=0.1",
+                    "--optimizer.param-groups.1.optimizer-kwargs.eps=1e-6",
+                    "--optimizer.param-groups.1.optimizer-kwargs.weight-decay=0.1",
                     # The LR recipe (warmup 25 / total 40) is part of the frozen
                     # anchor: the trajectory was produced with the 40-step
                     # baseline schedule. Keep it unchanged when shortening the smoke
@@ -87,3 +88,49 @@ def build_deepseek_v41_test_list() -> list[OverrideDefinitions]:
             timeout=7200,
         ),
     ]
+
+
+def _build_engram_case(*, ep_degree=2, fsdp_degree=2, ascendc=False):
+    overrides = ("--override.imports", "torchtitan_npu.override.common.rope.workaround")
+    if ascendc:
+        overrides += ('torchtitan_npu.override.deepseek_v41.engram.host_offload={"num_max_tokens_per_rank":4096}',)
+    common = overrides + (
+        "--training.steps=4",
+        "--training.seq-len=512",
+        "--training.local-batch-size=1",
+        f"--training.global-batch-size={fsdp_degree}",
+        "--parallelism.spmd-backend=partial_dtensor",
+        f"--parallelism.data-parallel-shard-degree={fsdp_degree}",
+        f"--parallelism.expert-parallel-degree={ep_degree}",
+        "--parallelism.context-parallel-degree=1",
+        "--parallelism.tensor-parallel-degree=1",
+        "--parallelism.pipeline-parallel-degree=1",
+        "--parallelism.context-parallel-load-balancer=None",
+        "--hf-assets-path=tests/assets/deepseek_v3",
+        "--debug.no-moe-force-load-balance",
+        "--checkpoint.enable",
+        "--checkpoint.interval=2",
+        "--checkpoint.no-last-save-model-only",
+    )
+    return OverrideDefinitions(
+        override_args=[common, common + ("--checkpoint.load-step=2",)],
+        test_name=f"dsv41_engram_{'ascendc' if ascendc else 'torch'}_ep{ep_degree}_fsdp{fsdp_degree}_resume",
+        test_descr="V4.1 multimodal Engram FullAC training and exact DCP continuation",
+        ngpu=fsdp_degree,
+        use_golden=False,
+        check_loss=False,
+        check_resume=True,
+        expected_steps=((1, 2, 3, 4), (3, 4)),
+        requires_engram_ops=ascendc,
+        env_vars={**GOLDEN_ENV, "CONFIG": "deepseek_v41_debugmodel"},
+        timeout=600,
+    )
+
+
+def build_deepseek_v41_test_list():
+    # Four ranks add sparse-table replicas across E-DP, beyond the two-rank EP path.
+    return _build_golden_test_list() + [_build_engram_case(), _build_engram_case(fsdp_degree=4)]
+
+
+def build_engram_ascendc_test_list():
+    return [_build_engram_case(ascendc=True)]

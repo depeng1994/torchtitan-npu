@@ -124,11 +124,11 @@ COMM_ARGS="
 # Optimizer & LR scheduler
 OPTIMIZER_ARGS="
     --optimizer.implementation fused
-    --optimizer.param-groups.0.optimizer-name AdamW
-    --optimizer.param-groups.0.optimizer-kwargs.lr 1.0e-5
-    --optimizer.param-groups.0.optimizer-kwargs.betas 0.9 0.95
-    --optimizer.param-groups.0.optimizer-kwargs.eps 1.0e-6
-    --optimizer.param-groups.0.optimizer-kwargs.weight-decay 1.0e-1
+    --optimizer.param-groups.1.optimizer-name AdamW
+    --optimizer.param-groups.1.optimizer-kwargs.lr 1.0e-5
+    --optimizer.param-groups.1.optimizer-kwargs.betas 0.9 0.95
+    --optimizer.param-groups.1.optimizer-kwargs.eps 1.0e-6
+    --optimizer.param-groups.1.optimizer-kwargs.weight-decay 1.0e-1
     --lr-scheduler.warmup-steps 25
     --lr-scheduler.decay-type cosine
     --lr-scheduler.decay-ratio 1.0
@@ -138,9 +138,6 @@ OPTIMIZER_ARGS="
 # The upstream scheduler clamps warmup to training.steps, so a short comparison
 # run would silently get a different LR curve; total-steps above pins the
 # schedule length to the validation recipe instead.
-OPTIMIZER_OVERRIDES="
-    torchtitan_npu.override.common.optimizer.virtual
-"
 
 NPU_OPS_OVERRIDES=(
     torchtitan_npu.override.common.rope.workaround
@@ -160,5 +157,5 @@ bash scripts/run_train.sh \
     $PROFILER_ARGS \
     $COMM_ARGS \
     $CHECKPOINT_ARGS \
-    --override.imports "${NPU_OPS_OVERRIDES[@]}" $OPTIMIZER_OVERRIDES \
+    --override.imports "${NPU_OPS_OVERRIDES[@]}" \
     "$@"

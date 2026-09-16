@@ -14,7 +14,8 @@ golden FP32 contract.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -68,6 +69,7 @@ class V41Model(Decoder):
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
         n_layers: int
+        engram_enabled: bool = True
         hc_mult: int = 4
         compress_ratios: tuple[int, ...]
         window_size: int
@@ -104,6 +106,37 @@ class V41Model(Decoder):
                 seq_len = config.training.seq_len
                 for _, rope_cfg, _, _ in self.traverse(RoPE.Config):
                     setattr(rope_cfg, "max_seq_len", seq_len)  # noqa: B010
+
+            if not self.engram_enabled:
+                for layer in self.layers:
+                    layer.engram = None
+                # Remove only the model-owned table group; preserve CLI changes
+                # to the dense optimizer and the frozen no-Engram recipe.
+                config.optimizer.param_groups = [
+                    group for group in config.optimizer.param_groups if group.pattern != r".*\.engram\.table\.weight$"
+                ]
+
+            engram_configs = [layer.engram for layer in self.layers if layer.engram is not None]
+            ep_degree = max(1, parallelism.expert_parallel_degree)
+            for engram_cfg in engram_configs:
+                table_cfg = engram_cfg.table
+                if table_cfg.require_token_id_map and table_cfg.token_id_map_path is None:
+                    if config.hf_assets_path is None:
+                        raise ValueError(
+                            "Engram tokenizer compression is required, but neither "
+                            "table.token_id_map_path nor hf_assets_path is configured."
+                        )
+                    table_cfg.token_id_map_path = os.path.join(
+                        config.hf_assets_path,
+                        "engram_token_id_map.npy",
+                    )
+                if table_cfg.num_embeddings % ep_degree != 0:
+                    raise ValueError(
+                        f"Engram physical table size ({table_cfg.num_embeddings}) must "
+                        f"be divisible by EP degree ({ep_degree}). Increase "
+                        "EngramArgs.table_padding_multiple without changing it "
+                        "between checkpoints."
+                    )
 
             from .sharding import set_deepseek_v41_sharding_config
 
@@ -152,6 +185,8 @@ class V41Model(Decoder):
             return nparams, num_flops_per_token
 
     def __init__(self, config: Config):
+        if not config.engram_enabled:
+            config = replace(config, layers=[replace(layer, engram=None) for layer in config.layers])
         super().__init__(config)
         cfg = config
         self.hc_mult = cfg.hc_mult
@@ -285,7 +320,7 @@ class V41Model(Decoder):
         self.attention_context.reset()
 
         if pixel_values is None:
-            image_mask = None
+            image_mask = token_types.ge(0) if token_types is not None else None
             embeds = input_embeds
         else:
             if image_grid is None or (image_spans is None and image_feature_indices is None):

@@ -25,6 +25,9 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
     """V4.1 adapter: the local text mapping plus the V4.1 vision additions."""
 
     def __init__(self, model_config, hf_assets_path):
+        self._has_engram = model_config.engram_enabled and any(
+            getattr(layer, "engram", None) is not None for layer in model_config.layers
+        )
         super().__init__(model_config, hf_assets_path)
 
         self.from_hf_map = {
@@ -101,13 +104,19 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
         self._vision_adapter = DeepSeekV41VisionStateDictAdapter()
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+        self._check_engram_hf_support()
         vision_hf = {k: v for k, v in hf_state_dict.items() if self._vision_adapter.owns_hf_key(k)}
         base_hf = {k: v for k, v in hf_state_dict.items() if not self._vision_adapter.owns_hf_key(k)}
         result = self._from_hf_text(base_hf)
         result.update(self._vision_adapter.from_hf(vision_hf))
         return result
 
+    def _check_engram_hf_support(self):
+        if self._has_engram:
+            raise NotImplementedError("Engram HF conversion is not supported; use native DCP with the same EP degree")
+
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        self._check_engram_hf_support()
         vision_local = {k: v for k, v in state_dict.items() if self._vision_adapter.owns_local_key(k)}
         base_local = {k: v for k, v in state_dict.items() if not self._vision_adapter.owns_local_key(k)}
         result = self._to_hf_text(base_local)

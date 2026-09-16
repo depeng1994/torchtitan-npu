@@ -597,9 +597,10 @@ def deepseek_v41_flash_30layers_16experts_vision_config(
         V41_COMPRESS_RATIOS,
         V41_INDEX_SOURCE_LAYERS,
         V41_KV_SOURCE_LAYERS,
+        DeepSeekV41CropConfig,
     )
 
-    return _make_v41_config(
+    config = _make_v41_config(
         n_layers=30,
         compress_ratios=V41_COMPRESS_RATIOS,
         kv_source_layers=V41_KV_SOURCE_LAYERS,
@@ -608,6 +609,8 @@ def deepseek_v41_flash_30layers_16experts_vision_config(
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
     )
+
+    return _attach_engram(config, DeepSeekV41CropConfig().engram)
 
 
 def deepseek_v41_flash_40layers_16experts_vision_config(
@@ -620,9 +623,10 @@ def deepseek_v41_flash_40layers_16experts_vision_config(
         V41_FULL_COMPRESS_RATIOS,
         V41_FULL_INDEX_SOURCE_LAYERS,
         V41_KV_SOURCE_LAYERS,
+        DeepSeekV41FullLayerConfig,
     )
 
-    return _make_v41_config(
+    config = _make_v41_config(
         n_layers=40,
         compress_ratios=V41_FULL_COMPRESS_RATIOS,
         kv_source_layers=V41_KV_SOURCE_LAYERS,
@@ -631,6 +635,8 @@ def deepseek_v41_flash_40layers_16experts_vision_config(
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
     )
+
+    return _attach_engram(config, DeepSeekV41FullLayerConfig().engram)
 
 
 def deepseek_v41_debugmodel_config(
@@ -643,9 +649,10 @@ def deepseek_v41_debugmodel_config(
         V41_FULL_COMPRESS_RATIOS,
         V41_FULL_INDEX_SOURCE_LAYERS,
         V41_KV_SOURCE_LAYERS,
+        DeepSeekV41DebugConfig,
     )
 
-    return _make_v41_config(
+    config = _make_v41_config(
         n_layers=40,
         compress_ratios=V41_FULL_COMPRESS_RATIOS,
         kv_source_layers=V41_KV_SOURCE_LAYERS,
@@ -655,6 +662,24 @@ def deepseek_v41_debugmodel_config(
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         widths=_DEBUG_WIDTHS,
     )
+
+    return _attach_engram(config, DeepSeekV41DebugConfig().engram)
+
+
+def _attach_engram(config, engram):
+    from .engram_config import _make_engram_configs
+
+    if any(layer_id >= len(config.layers) or layer_id < 0 for layer_id in engram.layer_ids):
+        raise ValueError("Engram layer IDs must lie inside the decoder")
+    configs = _make_engram_configs(
+        hidden_size=config.dim,
+        hc_mult=config.hc_mult,
+        vocab_size=config.vocab_size,
+        engram=engram,
+    )
+    for layer_id, engram_config in configs.items():
+        config.layers[layer_id].engram = engram_config
+    return config
 
 
 def model_registry(

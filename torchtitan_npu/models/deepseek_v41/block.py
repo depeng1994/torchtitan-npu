@@ -13,6 +13,7 @@ from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.moe import MoE
 
 from .attention import DeepSeekV41Attention, V41AttentionContext, V41CompressionSpec
+from .engram import Engram
 from .mhc import HcPost, HcPre, _make_identity_pre_mix
 
 
@@ -27,12 +28,14 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         hc_ffn_pre: HcPre.Config
         hc_post: HcPost.Config
         layer_id: int = -1
+        engram: Engram.Config | None = None
 
     def __init__(self, config: Config):
         super().__init__()
         cfg = config
         self.moe_enabled = True
         self.layer_id = config.layer_id
+        self.engram = cfg.engram.build() if cfg.engram is not None else None
         self.attention = cfg.attention.build()
         self.attention_norm = cfg.attention_norm.build()
         self.ffn_norm = cfg.ffn_norm.build()
@@ -58,6 +61,8 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         if self.compression_plan is None or self.attention_context is None:
             raise RuntimeError("V4.1 block requires a compression plan and per-forward attention context")
 
+        if self.engram is not None:
+            x = self.engram(x, input_ids, positions, image_mask=image_mask)
         residual = x
         x, post, comb, attn_pre = self.hc_attn_pre.forward_with_pre_mix(x, pre_mix)
         x = self.attention(

@@ -15,7 +15,7 @@ inference layout are outside its scope.
 
 __all__ = ["DispatchHandle", "ElasticBufferHandle"]
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -91,9 +91,11 @@ def _dispatch_op_impl(
         # a non-negative value before allocating the exact receive tensors and routed metadata.
         do_cpu_sync=True,
     )
+    # Tensor input and explicit topk weights select the non-quantized,
+    # weighted overload of ElasticBuffer's union-typed API.
     return (
-        recv_x,
-        recv_scores,
+        cast("torch.Tensor", recv_x),
+        cast("torch.Tensor", recv_scores),
         handle.num_recv_tokens_per_expert,
         DispatchHandle(value=handle),
     )
@@ -179,7 +181,7 @@ def _dispatch_backward_op_impl(
     # synchronization, one rank can observe non-finite values from the
     # combine result, so synchronize once here.
     dist.barrier(elastic_buffer._group)
-    return grad_x, grad_topk_weights
+    return grad_x, cast("torch.Tensor", grad_topk_weights)
 
 
 @_dispatch_backward_op_impl.register_fake
@@ -214,7 +216,7 @@ def _combine_backward_op_impl(
         # and explicitly disable this synchronization.
         do_cpu_sync=False,
     )
-    return grad_x
+    return cast("torch.Tensor", grad_x)
 
 
 @_combine_backward_op_impl.register_fake
