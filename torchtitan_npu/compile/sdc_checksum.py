@@ -45,21 +45,45 @@ def _is_checksum_candidate(node: torch.fx.Node) -> bool:
     )
 
 
+def _insert_checksum_nodes(graph: torch.fx.Graph) -> bool:
+    instrumented_outputs = {
+        node.args[2]
+        for node in graph.nodes
+        if node.op == "call_function" and node.target == _CHECKSUM_OP and len(node.args) >= 3
+    }
+    changed = False
+    for node in tuple(graph.nodes):
+        if not _is_checksum_candidate(node) or node in instrumented_outputs:
+            continue
+        left, right = node.args[:2]
+        with graph.inserting_after(node):
+            check = graph.call_function(_CHECKSUM_OP, args=(left, right, node))
+        # The ordered op has no data result; explicit fake metadata keeps
+        # later passes from treating it as another tensor producer.
+        check.meta["val"] = None
+        changed = True
+    return changed
+
+
+def sdc_checksum_graph_pass(
+    graph_module: torch.fx.GraphModule,
+    _example_inputs: tuple,
+) -> torch.fx.GraphModule:
+    """Instrument a GraphTrainer joint forward-backward graph once."""
+
+    if _insert_checksum_nodes(graph_module.graph):
+        graph_module.graph.lint()
+        graph_module.recompile()
+    return graph_module
+
+
 class _ChecksumPostGradPass(CustomInferenceAwareGraphPass):
     """Instrument only BF16 NPU training matmuls supported by torch-npu checksum."""
 
     def __call__(self, graph: torch.fx.Graph, is_inference: bool) -> None:
         if is_inference:
             return
-        for node in tuple(graph.nodes):
-            if not _is_checksum_candidate(node):
-                continue
-            left, right = node.args[:2]
-            with graph.inserting_after(node):
-                check = graph.call_function(_CHECKSUM_OP, args=(left, right, node))
-            # The ordered op has no data result; explicit fake metadata keeps
-            # later passes from treating it as another tensor producer.
-            check.meta["val"] = None
+        _insert_checksum_nodes(graph)
 
     def uuid(self) -> bytes | None:
         # Tie Inductor's cache key to this instrumentation implementation so a

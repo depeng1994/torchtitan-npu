@@ -6,14 +6,22 @@
 """Initialize compiled SDC and submit accumulated gradients to torch-npu."""
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, fields
+from functools import partial
 from typing import Any
 
 import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
 from torchtitan.config import Configurable
+from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+from torchtitan.experiments.graph_trainer.inductor_passes import (
+    full_inductor_compilation_pass,
+    regional_inductor_pass,
+)
+from torchtitan.experiments.graph_trainer.passes import construct_default_graph_passes
+from torchtitan.experiments.graph_trainer.registry import register_pass_pipeline
 from torchtitan.trainer import Trainer
 
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
@@ -21,6 +29,8 @@ _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
 
 class SDC(Configurable):
     """Configure SDC once after the standard NPU Trainer has built its models."""
+
+    CHECKSUM_GRAPH_PASS_PIPELINE = "npu_sdc_checksum"
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
@@ -58,6 +68,20 @@ class SDC(Configurable):
             ):
                 raise ValueError("non-default --sdc gradient tuning requires --sdc.gradient-enabled=true")
 
+        def prepare_graph(self, compile_config: GraphTrainerCompileConfig) -> None:
+            """Select checksum instrumentation before GraphTrainer traces the model."""
+            if compile_config.mode != "aot_fx_trace" or not self.with_checksum:
+                return
+            if not compile_config.enable_passes:
+                raise ValueError("aot_fx_trace checksum requires compile.enable_passes=true")
+            if compile_config.precompile_artifact_dir:
+                raise ValueError("aot_fx_trace checksum does not support precompiled graph artifacts")
+            if compile_config.pass_pipeline != "default":
+                raise ValueError("aot_fx_trace checksum requires compile.pass_pipeline='default'")
+            if "sdc_checksum_graph_pass" in compile_config.disable_passes:
+                raise ValueError("aot_fx_trace checksum cannot disable sdc_checksum_graph_pass")
+            compile_config.pass_pipeline = SDC.CHECKSUM_GRAPH_PASS_PIPELINE
+
     def __init__(
         self,
         config: Config,
@@ -93,7 +117,9 @@ class SDC(Configurable):
         checker.set_upper_thresh1(config.upper_thresh1)
         checker.set_upper_thresh2(config.upper_thresh2)
         checker.set_grad_sample_interval(config.grad_sample_interval)
-        if config.with_checksum:
+        if config.with_checksum and (
+            getattr(trainer_config.compile, "pass_pipeline", None) != self.CHECKSUM_GRAPH_PASS_PIPELINE
+        ):
             # Model compile wrappers exist, but the first training graph is still lazy.
             from torchtitan_npu.compile.sdc_checksum import install_checksum_pass
 
@@ -119,8 +145,11 @@ class SDC(Configurable):
                 "compiled SDC requires compile.enable=true with 'model' in compile.components; "
                 "use NPU_ASD_CONFIG/NPU_ASD_ENABLE for eager SDC"
             )
-        if compile_config.backend != "inductor":
-            raise ValueError(f"compiled SDC requires compile.backend='inductor'; got {compile_config.backend!r}")
+        if getattr(compile_config, "mode", None) != "aot_fx_trace" and compile_config.backend != "inductor":
+            raise ValueError(
+                "compiled SDC requires compile.mode='aot_fx_trace' or "
+                f"compile.backend='inductor'; got backend={compile_config.backend!r}"
+            )
         if int(config.parallelism.pipeline_parallel_degree) > 1:
             raise ValueError("compiled SDC does not support pipeline parallelism")
 
@@ -175,3 +204,29 @@ class SDC(Configurable):
                     continue
                 canonical = name if len(model_parts) == 1 else f"model_parts.{part_index}.{name}"
                 yield canonical, parameter
+
+
+@register_pass_pipeline(SDC.CHECKSUM_GRAPH_PASS_PIPELINE)
+def _checksum_graph_passes(
+    traced_result,
+    config,
+    *,
+    parallel_dims=None,
+) -> list[Callable]:
+    passes = construct_default_graph_passes(
+        traced_result,
+        config,
+        parallel_dims=parallel_dims,
+    )
+    from torchtitan_npu.compile.sdc_checksum import sdc_checksum_graph_pass
+
+    terminal_passes = {
+        full_inductor_compilation_pass,
+        regional_inductor_pass,
+    }
+    for index, pass_fn in enumerate(passes):
+        base_pass = pass_fn.func if isinstance(pass_fn, partial) else pass_fn
+        if base_pass in terminal_passes:
+            passes.insert(index, sdc_checksum_graph_pass)
+            return passes
+    raise RuntimeError("SDC checksum graph pipeline requires a terminal Inductor pass")

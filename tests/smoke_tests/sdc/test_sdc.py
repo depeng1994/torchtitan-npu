@@ -181,6 +181,10 @@ def test_three_gradient_strikes_activate_checksum_without_recompiling() -> None:
     _run_worker("three-strikes-enable-checksum")
 
 
+def test_graph_checksum_pass_executes_the_inserted_runtime_check() -> None:
+    _run_worker("graph-checksum-pass-runtime")
+
+
 # Worker setup
 
 
@@ -446,6 +450,33 @@ def _check_compiled_consumer_observes_checksum_output_mutation(torch: Any, torch
     assert len(checksum_calls) >= 1
 
 
+def _check_graph_checksum_pass_runtime(torch: Any, torch_npu: Any) -> None:
+    from torchtitan_npu.compile.sdc_checksum import sdc_checksum_graph_pass
+
+    device = torch.device("npu:0")
+    checker, checksum_calls = _install_checksum_output_mutator(torch, torch_npu, device)
+    left = torch.zeros((1, 2), device=device, dtype=torch.bfloat16)
+    right = torch.zeros((2, 2), device=device, dtype=torch.bfloat16)
+
+    graph = torch.fx.Graph()
+    left_node = graph.placeholder("left")
+    right_node = graph.placeholder("right")
+    output_node = graph.call_function(torch.ops.aten.mm.default, args=(left_node, right_node))
+    graph.output(output_node)
+    graph_module = torch.fx.GraphModule(torch.nn.Module(), graph)
+    for node, value in ((left_node, left), (right_node, right), (output_node, torch.mm(left, right))):
+        node.meta["val"] = value
+
+    sdc_checksum_graph_pass(graph_module, ())
+    compiled = torch.compile(graph_module, backend="aot_eager", fullgraph=True)
+    checker.checksum_enable = True
+    output = compiled(left, right)
+    torch.npu.synchronize()
+
+    assert torch.equal(output, torch.full_like(output, 3))
+    assert len(checksum_calls) == 1
+
+
 def _check_real_bf16_gradient(torch: Any, torch_npu: Any) -> None:
     from torchtitan_npu.extensions.components.sdc import SDC
 
@@ -684,6 +715,8 @@ def _run_scenario(torch: Any, torch_npu: Any, scenario: str) -> None:
         _check_checksum_output_mutation(torch, torch_npu)
     elif scenario == "checksum-compiled-consumer-observes-mutation":
         _check_compiled_consumer_observes_checksum_output_mutation(torch, torch_npu)
+    elif scenario == "graph-checksum-pass-runtime":
+        _check_graph_checksum_pass_runtime(torch, torch_npu)
     elif scenario == "real-bf16-gradient":
         _check_real_bf16_gradient(torch, torch_npu)
     elif scenario == "global-hccl-scope":
