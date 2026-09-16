@@ -120,9 +120,8 @@ AdamW 的 `exp_avg`、`exp_avg_sq`（AMSGrad 时还包括 `max_exp_avg_sq`）按
 flat state。每个 bucket 执行 H2D、`WAIT_DEVICE`、上游 AdamW 更新和 D2H，并在当前 bucket
 更新前提交下一个 bucket 的 H2D。
 
-启用 `swap_optimizer` 的 `OptimizerStateSwapContainer` 不支持 optimizer `state_dict()`、
-`load_state_dict()`、完整 optimizer checkpoint 保存或断点续训。需要 checkpoint 互操作时，
-移除该 override 并使用普通 optimizer 路径。
+开启 swap 之后，checkpoint 的存储和加载支持同步模式和基于 CPU snapshot 的异步模式 `async`，暂不支持
+`async_with_pinned_mem`。
 
 
 ## 能力边界
@@ -130,4 +129,4 @@ flat state。每个 bucket 执行 H2D、`WAIT_DEVICE`、上游 AdamW 更新和 D
 当前方案适合 DSV4 单机 8 卡、TP/PP=1、EP/DP-shard 并行的实验和训练。尚未证明：
 
 - TP>1 或 PP>1 的 DistMuon；
-- swap 开启时的 optimizer checkpoint 保存、加载和断点续训；
+- `async_with_pinned_mem`、跨 world size 恢复及更复杂并行拓扑下的 swap checkpoint；

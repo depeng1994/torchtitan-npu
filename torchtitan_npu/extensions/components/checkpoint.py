@@ -52,6 +52,19 @@ class CheckpointManager(_CheckpointManager):
         extensions: CheckpointExtensions = field(default_factory=CheckpointExtensions)
 
     def __init__(self, config: Config, **kwargs):
+        optimizers = kwargs.get("optimizers")
+        # NovaSwap views share live CPU swap buffers. Pinned-memory staging
+        # overlaps their copy with training, which can reuse those buffers.
+        if (
+            not getattr(optimizers, "supports_async_with_pinned_mem", True)
+            and config.enable
+            and config.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM.value
+        ):
+            raise ValueError(
+                "checkpoint.async_mode='async_with_pinned_mem' is unsupported "
+                "with swap_optimizer; use 'disabled' or 'async'"
+            )
+
         self.verify_hash_manifest = config.extensions.verify_hash_manifest
         super().__init__(config=config, **kwargs)
 
