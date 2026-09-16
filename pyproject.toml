@@ -9,6 +9,11 @@ description = "Ascend NPU overrides for torchtitan"
 requires-python = ">=3.12"
 dependencies = ["torchtitan", "torch-npu"]
 
+[project.optional-dependencies]
+torchft = [
+    "torchft @ git+https://github.com/meta-pytorch/torchft.git@90d7f68961e7c0bcd4278f7ebba83b5cd876c099",
+]
+
 [tool.setuptools.packages.find]
 include = ["torchtitan_npu*"]
 exclude = ["tests*", "CI*", "third_party*"]
