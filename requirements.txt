@@ -1,5 +1,10 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 --extra-index-url https://download.pytorch.org/whl/nightly/cpu
 torch==2.14.0.dev20260719
+torchvision==0.29.0.dev20260720
 --find-links https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torch-npu/index.html
 torch_npu==2.14.0.dev20260808
 torchtitan==0.3.0

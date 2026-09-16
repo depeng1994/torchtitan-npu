@@ -9,14 +9,21 @@
 # pylint: disable=huawei-invalid-name
 
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import cast
 
 import torch
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
 from torchtitan.config import derive, override
-from torchtitan.models import qwen3_5
 from torchtitan.models.common.attention import AttentionMasksType
+
+from torchtitan_npu.models.qwen3_5._fla_compat import ensure_qwen3_5_importable
+
+ensure_qwen3_5_importable()
+
+from torchtitan.models import qwen3_5
 from torchtitan.models.qwen3_5.model import GatedDeltaKernel
 
 from torchtitan_npu.ops.triton.gdn import gated_delta_rule as run_gdn
@@ -53,6 +60,188 @@ class TritonGatedDeltaKernel(GatedDeltaKernel):
 
 @override(target=GatedDeltaKernel.Config, exact=True, description="Use the Triton-Ascend GDN kernel")
 def triton(cfg: GatedDeltaKernel.Config) -> TritonGatedDeltaKernel.Config:
+    return derive(cfg, TritonGatedDeltaKernel.Config)
+
+
+def _causal_conv1d(
+    x_BTD: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    stride=1,
+    padding=0,
+    dilation=1,
+) -> torch.Tensor:
+    """Depthwise causal convolution used when FLA is not installed."""
+    if weight.ndim == 3:
+        weight = weight.squeeze(1)
+    if weight.ndim != 2:
+        raise ValueError(f"Expected depthwise conv weight [channels, kernel], got {weight.shape}")
+    dilation_value = dilation[0] if isinstance(dilation, tuple) else dilation
+    x_BDL = F.pad(x_BTD.transpose(1, 2), ((weight.shape[-1] - 1) * dilation_value, 0))
+    out_BDL = F.conv1d(
+        x_BDL,
+        weight.unsqueeze(1),
+        None,
+        stride,
+        padding,
+        dilation,
+        weight.size(0),
+    )
+    return F.silu(out_BDL).transpose(1, 2)
+
+
+_QWEN3_5_CONV_KERNEL_SIZE = 4
+
+
+def _causal_conv1d_varlen_tensor(
+    x_BTD: torch.Tensor,
+    weight: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    stride=1,
+    padding=0,
+    dilation=1,
+) -> torch.Tensor:
+    """Compile-safe packed causal convolution using device-side offsets."""
+    if weight.ndim == 3:
+        weight = weight.squeeze(1)
+    if weight.ndim != 2:
+        raise ValueError(f"Expected depthwise conv weight [channels, kernel], got {weight.shape}")
+    stride_value = stride[0] if isinstance(stride, tuple) else stride
+    padding_value = padding[0] if isinstance(padding, tuple) else padding
+    dilation_value = dilation[0] if isinstance(dilation, tuple) else dilation
+    if stride_value != 1 or padding_value != 0 or dilation_value != 1 or weight.shape[-1] != _QWEN3_5_CONV_KERNEL_SIZE:
+        raise ValueError("Qwen3.5 compiled varlen convolution requires kernel=4, stride=1, padding=0, dilation=1")
+
+    boundary_indices = cu_seqlens[1:-1].to(device=x_BTD.device, dtype=torch.long)
+    boundary_mask = torch.zeros(x_BTD.shape[1], dtype=torch.bool, device=x_BTD.device)
+    boundary_mask = boundary_mask.scatter(
+        0,
+        boundary_indices,
+        torch.ones_like(boundary_indices, dtype=torch.bool),
+    )
+    segment_ids = boundary_mask.cumsum(dim=0)
+
+    output = x_BTD * weight[:, -1].view(1, 1, -1)
+    for delay in range(1, _QWEN3_5_CONV_KERNEL_SIZE):
+        same_segment = (segment_ids[delay:] == segment_ids[:-delay]).to(x_BTD.dtype).view(1, -1, 1)
+        term = x_BTD[:, :-delay, :] * weight[:, -1 - delay].view(1, 1, -1)
+        output = output + F.pad(term * same_segment, (0, 0, delay, 0))
+    return F.silu(output)
+
+
+def _causal_conv1d_varlen(
+    x_BTD: torch.Tensor,
+    weight: torch.Tensor,
+    cu_seqlens_cpu: torch.Tensor | None,
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    stride=1,
+    padding=0,
+    dilation=1,
+) -> torch.Tensor:
+    """Apply causal convolution independently to each packed document.
+
+    Compiled execution consumes device-side offsets so checkpoint HOP can trace
+    the operation; eager execution retains strict host-metadata validation.
+    """
+    if torch.compiler.is_compiling():
+        if cu_seqlens is None:
+            raise ValueError("Qwen3.5 compiled varlen convolution requires device cu_seqlens metadata.")
+        return _causal_conv1d_varlen_tensor(
+            x_BTD,
+            weight,
+            cu_seqlens,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+        )
+    if cu_seqlens_cpu is None:
+        raise ValueError("Qwen3.5 varlen causal convolution requires CPU cu_seqlens metadata.")
+    offsets = [int(offset) for offset in cu_seqlens_cpu.detach().cpu().tolist()]
+    if len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != x_BTD.shape[1]:
+        raise ValueError(f"Invalid Qwen3.5 cu_seqlens metadata: offsets={offsets}, sequence_length={x_BTD.shape[1]}")
+    outputs = []
+    for start, end in pairwise(offsets):
+        if start < 0 or end <= start:
+            raise ValueError(f"Qwen3.5 cu_seqlens must be monotonic: {offsets}")
+        outputs.append(
+            _causal_conv1d(
+                x_BTD[:, start:end, :],
+                weight,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+            )
+        )
+    return torch.cat(outputs, dim=1) if outputs else x_BTD[:, :0, :]
+
+
+def _npu_causal_conv(
+    self,
+    x_BLD: torch.Tensor,
+    conv,
+    cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Use the NPU-safe reference convolution instead of lazy FLA imports."""
+    stride = conv.stride
+    padding = conv.padding
+    dilation = conv.dilation
+    if cu_seqlens is not None:
+        if isinstance(x_BLD, DTensor):
+
+            def _conv_varlen(x_local_BLD, w_local, cu_seqlens_local):
+                return _causal_conv1d_varlen(
+                    x_local_BLD,
+                    w_local,
+                    cu_seqlens_cpu,
+                    cu_seqlens=cu_seqlens_local,
+                    stride=stride,
+                    padding=padding,
+                    dilation=dilation,
+                )
+
+            return self._local_map_conv(x_BLD, conv, _conv_varlen, cu_seqlens)
+        return _causal_conv1d_varlen(
+            x_BLD,
+            conv.weight,
+            cu_seqlens_cpu,
+            cu_seqlens=cu_seqlens,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+        )
+
+    if isinstance(x_BLD, DTensor):
+
+        def _conv_fixed(x_local_BLD, w_local):
+            return _causal_conv1d(
+                x_local_BLD,
+                w_local,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+            )
+
+        return self._local_map_conv(x_BLD, conv, _conv_fixed)
+    return _causal_conv1d(
+        x_BLD,
+        conv.weight,
+        stride=stride,
+        padding=padding,
+        dilation=dilation,
+    )
+
+
+@override(target=GatedDeltaKernel.Config, exact=True, description="Use the NPU GDN kernel without FLA")
+def npu(cfg: GatedDeltaKernel.Config) -> TritonGatedDeltaKernel.Config:
+    # The upstream GatedDeltaNet config remains the owner of the module.  Only
+    # its kernel config and convolution implementation are replaced, matching
+    # the upstream build contract and keeping pipeline stage metadata unchanged.
+    # FLA availability is not used as a backend selector because its
+    # convolution is not an NPU implementation.
+    qwen3_5.GatedDeltaNet._causal_conv = _npu_causal_conv  # pyrefly: ignore [bad-assignment]
     return derive(cfg, TritonGatedDeltaKernel.Config)
 
 

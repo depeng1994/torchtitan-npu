@@ -160,7 +160,8 @@ torchtitan-npu/
 │   ├── override/
 │   │   ├── common/                # 模型无关的 NPU 组件替换
 │   │   ├── deepseek_v3_2/         # DeepSeek-V3.2 专属 override
-│   │   └── deepseek_v4/           # DeepSeek-V4 专属 override
+│   │   ├── deepseek_v4/           # DeepSeek-V4 专属 override
+│   │   └── qwen3_5/               # Qwen3.5 专属 override
 │   ├── patches/
 │   │   ├── torchtitan/            # 尚未进入当前上游版本的临时补丁
 │   │   └── workaround/            # NPU 运行时兼容处理

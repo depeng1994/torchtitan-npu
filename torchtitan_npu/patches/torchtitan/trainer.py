@@ -1,17 +1,19 @@
+# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3634
+# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3985
+
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3634
-# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3985
-
 import functools
+import inspect
 import logging
 from dataclasses import dataclass, field
 from typing import Any, cast
 
+import torch
 import torchtitan.trainer
 from torchtitan.distributed import full_dtensor
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
@@ -23,6 +25,7 @@ from torchtitan_npu.patches.torchtitan.components.ema import EMAOptimizersContai
 logger = logging.getLogger(__name__)
 
 original_post_dataloading_process = Trainer.post_dataloading_process
+original_pp_forward_backward_step = Trainer.pp_forward_backward_step
 
 
 @functools.wraps(original_post_dataloading_process)
@@ -68,6 +71,62 @@ def patched_post_dataloading_process(self, input_dict, labels):
     return original_post_dataloading_process(self, input_dict, labels)
 
 
+def _run_presplit_pipeline_schedule(
+    schedule,
+    *,
+    arg_mbs,
+    kwarg_mbs,
+    target_mbs,
+    losses,
+    loss_kwargs,
+    return_outputs,
+):
+    """Bridge the NPU Torch pipeline schedule's private microbatch API."""
+    if (
+        schedule._has_backward
+        and getattr(schedule, "_backward_requires_autograd", True)
+        and not torch.is_grad_enabled()
+    ):
+        raise RuntimeError("pipeline backward requires gradients")
+
+    stages = getattr(schedule, "_stages", None)
+    if stages is None:
+        stages = [schedule._stage]
+    for stage in stages:
+        stage.has_backward = schedule._has_backward
+        stage.clear_runtime_states()
+    return schedule._step_microbatches(
+        arg_mbs=arg_mbs,
+        kwarg_mbs=kwarg_mbs,
+        target_mbs=target_mbs,
+        losses=losses,
+        loss_kwargs=loss_kwargs,
+        return_outputs=return_outputs,
+    )
+
+
+@functools.wraps(original_pp_forward_backward_step)
+def patched_pp_forward_backward_step(self, *args, **kwargs):
+    """Adapt older NPU pipeline schedules without changing Trainer semantics."""
+    schedule = self.pp_schedule
+    parameters = inspect.signature(schedule.step).parameters
+    if {"arg_mbs", "kwarg_mbs", "target_mbs"}.issubset(parameters):
+        return original_pp_forward_backward_step(self, *args, **kwargs)
+    if not hasattr(schedule, "_step_microbatches"):
+        raise RuntimeError("installed pipeline schedule has no pre-split API")
+
+    original_step = schedule.step
+    had_instance_step = "step" in vars(schedule)
+    schedule.step = functools.partial(_run_presplit_pipeline_schedule, schedule)
+    try:
+        return original_pp_forward_backward_step(self, *args, **kwargs)
+    finally:
+        if had_instance_step:
+            schedule.step = original_step
+        else:
+            del schedule.step
+
+
 class EMATrainer(Trainer):
     """Trainer with upstream EMA configuration and optimizer wiring."""
 
@@ -90,6 +149,8 @@ class EMATrainer(Trainer):
 def apply() -> None:
     logger.info("[PATCH] Trainer.post_dataloading_process -> patched_post_dataloading_process")
     Trainer.post_dataloading_process = patched_post_dataloading_process
+    logger.info("[PATCH] Trainer.pp_forward_backward_step -> patched_pp_forward_backward_step")
+    Trainer.pp_forward_backward_step = patched_pp_forward_backward_step
     torchtitan.trainer.Trainer = EMATrainer
 
 

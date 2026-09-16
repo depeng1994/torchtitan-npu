@@ -34,7 +34,16 @@ class AscVarlenAttention(VarlenAttention):
             repeats = q_BLNH.size(2) // k_BLNH.size(2)
             k_BLNH, v_BLNH = (tensor.repeat_interleave(repeats, 2) for tensor in (k_BLNH, v_BLNH))
         actual_seq = attention_masks.actual_seq_qlen
-        q_BLNH, k_BLNH, v_BLNH = exchange_sequence_heads((q_BLNH, k_BLNH, v_BLNH), mesh, 2)
+        if k_BLNH.size(1) == q_BLNH.size(1):
+            q_BLNH, k_BLNH, v_BLNH = exchange_sequence_heads((q_BLNH, k_BLNH, v_BLNH), mesh, 2)
+        else:
+            # spmd local_map contract: q stays sequence-sharded on the cp axis
+            # while k/v arrive all-gathered (Replicate on cp) with all heads
+            # local. Exchange only q to the head-sharded view and take this
+            # rank's head slice of k/v without extra collectives.
+            q_BLNH = exchange_sequence_heads((q_BLNH,), mesh, 2)[0]
+            k_BLNH = k_BLNH.chunk(mesh.size(), 2)[mesh.get_local_rank()].contiguous()
+            v_BLNH = v_BLNH.chunk(mesh.size(), 2)[mesh.get_local_rank()].contiguous()
         batch, length, heads, head_dim = q_BLNH.shape
         dtype = q_BLNH.dtype
         query, key, value = (

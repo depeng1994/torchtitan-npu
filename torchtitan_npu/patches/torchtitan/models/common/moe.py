@@ -103,6 +103,11 @@ class HashRouter(TokenChoiceTopKRouter):
         # (torchtitan TokenChoiceTopKRouter pattern).
         with torch.autocast(device_type=x_BLD.device.type, dtype=torch.float32):
             scores = self.gate(x_BLD)
+        if isinstance(scores, DTensor):
+            scores = scores.to_local()
+        if isinstance(expert_bias_E, DTensor):
+            expert_bias_E = expert_bias_E.to_local()
+
         # scores is already float32 from the autocast above.
         if self.score_func == "sigmoid":
             scores = torch.sigmoid(scores)
@@ -164,15 +169,30 @@ class HashMoE(MoE):
         """
         _B, L, _D = x_BLD.shape
         sp_size = getattr(self.routed_experts.token_dispatcher, "sp_size", 1)
+        # Older TorchTitan dispatchers reconstruct the sequence after SP. Keep
+        # the padded local length explicit so the combine operation can restore
+        # the same shape; newer dispatchers ignore these optional arguments.
+        legacy_seq_padding = hasattr(self, "seq_dim_tp_sharded")
+        num_local_tokens_after_seq_dim_padding = None
         if not isinstance(x_BLD, DTensor) and getattr(self, "seq_dim_tp_sharded", False):
             seq_pad = 0
             seq_dim_pad_tokens = 0
+            if legacy_seq_padding:
+                num_local_tokens_after_seq_dim_padding = _B * L
         else:
             seq_pad = sp_size - L if sp_size > L else 0
             if seq_pad:
                 x_BLD = F.pad(x_BLD, (0, 0, 0, seq_pad))
                 L = L + seq_pad
             seq_dim_pad_tokens = (-L) % sp_size
+            if legacy_seq_padding:
+                local_batch_size = x_BLD._local_tensor.shape[0] if isinstance(x_BLD, DTensor) else _B
+                if local_batch_size != _B:
+                    raise NotImplementedError(
+                        "Legacy sequence-dimension padding requires an unsharded batch; "
+                        "DP-sharded DTensor batches are not supported."
+                    )
+                num_local_tokens_after_seq_dim_padding = local_batch_size * (L + seq_dim_pad_tokens) // sp_size
 
         (
             topk_scores_BLK,
@@ -193,13 +213,25 @@ class HashMoE(MoE):
 
         if self.training:
             with torch.no_grad():
-                self.tokens_per_expert_E.add_(num_local_tokens_per_expert_E)
+                token_count = num_local_tokens_per_expert_E
+                if isinstance(self.tokens_per_expert_E, DTensor) and not isinstance(token_count, DTensor):
+                    token_count = DTensor.from_local(
+                        token_count,
+                        self.tokens_per_expert_E.device_mesh,
+                        self.tokens_per_expert_E.placements,
+                        run_check=False,
+                    )
+                self.tokens_per_expert_E.add_(token_count)
 
+        routed_expert_kwargs = {}
+        if num_local_tokens_after_seq_dim_padding is not None:
+            routed_expert_kwargs["num_local_tokens_after_seq_dim_padding"] = num_local_tokens_after_seq_dim_padding
         out_BLD = self.routed_experts(
             x_BLD,
             topk_scores_BLK,
             topk_expert_ids_BLK,
             num_local_tokens_per_expert_E,
+            **routed_expert_kwargs,
         )
 
         shared_out_BLD = self.shared_experts(x_BLD) if self.shared_experts is not None else None
@@ -229,6 +261,8 @@ class _RouterScoreAbsorbingRoutedExperts(RoutedExperts):
         topk_scores_BLK: torch.Tensor,
         topk_expert_ids_BLK: torch.Tensor,
         num_local_tokens_per_expert_E: torch.Tensor,
+        *,
+        num_local_tokens_after_seq_dim_padding: int | None = None,
     ) -> torch.Tensor:
         B, L, D = x_BLD.shape
         K = topk_scores_BLK.size(-1)
@@ -259,7 +293,13 @@ class _RouterScoreAbsorbingRoutedExperts(RoutedExperts):
                 routed_scores_R=routed_scores_R,
             )
 
-        out_TD = dispatcher.combine(routed_output_RD, metadata, x_TD)
+        combine_kwargs = {}
+        if num_local_tokens_after_seq_dim_padding is not None:
+            combine_kwargs = {
+                "num_local_tokens_after_padding": num_local_tokens_after_seq_dim_padding,
+                "local_seq_len_after_padding": num_local_tokens_after_seq_dim_padding // B,
+            }
+        out_TD = dispatcher.combine(routed_output_RD, metadata, x_TD, **combine_kwargs)
         return out_TD.view(B, -1, D)
 
 
@@ -346,6 +386,14 @@ class _ClampFeedForward(FeedForward):
         return self.w2(F.silu(gate) * up)
 
 
+def _as_config(config, config_type, **overrides):
+    """Rebuild a config while retaining fields shared across upstream schemas."""
+    field_names = {config_field.name for config_field in dataclasses.fields(config_type)}
+    values = {name: getattr(config, name) for name in field_names if hasattr(config, name)}
+    values.update(overrides)
+    return config_type(**values)
+
+
 def _clamp_make_routed_experts_config(
     *,
     swiglu_limit: float = 0.0,
@@ -355,21 +403,30 @@ def _clamp_make_routed_experts_config(
     """``make_routed_experts_config`` with the clamp passthrough."""
     cfg = _original_make_routed_experts_config(**kwargs)
     dispatcher_config = cfg.token_dispatcher
-    dispatcher_config = dataclasses.replace(
-        dispatcher_config,
-        absorb_router_scores=absorb_router_scores,
-    )
-    return dataclasses.replace(
-        cfg,
-        inner_experts=dataclasses.replace(cfg.inner_experts, swiglu_limit=swiglu_limit),
-        token_dispatcher=dispatcher_config,
-    )
+    # Only the dispatcher configs extended by the NPU patch understand this
+    # option.  HybridEP and MinimalAsyncEP intentionally retain upstream
+    # schemas, so passing the field to them would fail during config
+    # construction before a model can report which backend is unsupported.
+    dispatcher_fields = {field.name for field in dataclasses.fields(dispatcher_config)}
+    if "absorb_router_scores" in dispatcher_fields:
+        dispatcher_config = dataclasses.replace(
+            dispatcher_config,
+            absorb_router_scores=absorb_router_scores,
+        )
+    inner_experts = cfg.inner_experts
+    if isinstance(inner_experts, _ClampGroupedExperts.Config):
+        inner_experts = dataclasses.replace(inner_experts, swiglu_limit=swiglu_limit)
+    else:
+        inner_experts = _as_config(inner_experts, _ClampGroupedExperts.Config, swiglu_limit=swiglu_limit)
+    return dataclasses.replace(cfg, inner_experts=inner_experts, token_dispatcher=dispatcher_config)
 
 
 def _clamp_make_ffn_config(*, swiglu_limit: float = 0.0, **kwargs):
     """``make_ffn_config`` with the clamp passthrough."""
     cfg = _original_make_ffn_config(**kwargs)
-    return dataclasses.replace(cfg, swiglu_limit=swiglu_limit)
+    if isinstance(cfg, _ClampFeedForward.Config):
+        return dataclasses.replace(cfg, swiglu_limit=swiglu_limit)
+    return _as_config(cfg, _ClampFeedForward.Config, swiglu_limit=swiglu_limit)
 
 
 # Assigned in ``apply()`` before the clamp factories are ever called; declared
