@@ -68,6 +68,14 @@ _HC_PARAM_INIT = {
 }
 
 
+def _parallelize_lora(model, **kwargs):
+    model = parallelize_deepseek_v4(model, **kwargs)
+    for name, parameter in model.named_parameters():
+        if "lora_" not in name:
+            parameter.requires_grad_(False)
+    return model
+
+
 def _register_step_pre_hooks(optimizers, model_parts, parallel_dims) -> None:
     """Register MoE balancing and auxiliary-loss step hooks."""
     register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
@@ -867,8 +875,8 @@ def model_registry(
         name="deepseek_v4",
         flavor=flavor,
         model=config,
-        parallelize_fn=parallelize_deepseek_v4,
+        parallelize_fn=_parallelize_lora if getattr(config, "lora", None) is not None else parallelize_deepseek_v4,
         pipelining_fn=pipeline_llm,
-        post_optimizer_build_fn=_register_step_pre_hooks,
+        post_optimizer_build_fn=None if getattr(config, "lora", None) is not None else _register_step_pre_hooks,
         state_dict_adapter=DeepSeekV4StateDictAdapter,
     )

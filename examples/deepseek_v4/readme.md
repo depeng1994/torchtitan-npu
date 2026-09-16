@@ -227,3 +227,7 @@ Flash 多机 CPT 基线默认启用 `--checkpoint.load-only`，即只负责加�
 ```
 
 当 `checkpoint.folder` 已存在有效的 `step-*` checkpoint 时，TorchTitan 会优先 resume，该情况下 `checkpoint.initial-load-path` 不作为冷启动来源；要从 `initial-load-path` 冷启动，请使用新的或空的 `checkpoint.folder`。
+
+## LoRA 微调
+
+配置、部分参数训练、native checkpoint 恢复和 PEFT 导出见 [LoRA 功能指南](../../docs/feature_guides/deepseek_v4_lora.md)。

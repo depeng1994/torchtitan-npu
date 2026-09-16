@@ -9,6 +9,9 @@ description = "Ascend NPU overrides for torchtitan"
 requires-python = ">=3.12"
 dependencies = ["torchtitan", "torch-npu"]
 
+[project.optional-dependencies]
+peft = ["peft==0.20.0", "transformers==5.17.0"]
+
 [tool.setuptools.packages.find]
 include = ["torchtitan_npu*"]
 exclude = ["tests*", "CI*", "third_party*"]

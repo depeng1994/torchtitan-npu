@@ -4,13 +4,30 @@
 # LICENSE file in the root directory of this source tree.
 
 import re
+from dataclasses import replace
 from typing import Any
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 
+from .lora import (
+    _PEFT_MODULE_SUFFIXES,
+    DEEPSEEK_V4_LORA_TARGETS,
+    DeepSeekV4LoRAConverter,
+    _LoRAOptions,
+    peft_target_modules,
+)
 from .model import DeepSeekV4Model
+
+_PEFT_PREFIX = "base_model.model."
+_ROUTED_EXPERT_PEFT_PARAMETERS = ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
+
+
+def _peft_key(hf_weight_key: str, factor: str) -> str:
+    if not hf_weight_key.endswith(".weight"):
+        raise ValueError(f"PEFT LoRA base key must end in .weight: {hf_weight_key}")
+    return f"{_PEFT_PREFIX}{hf_weight_key.removesuffix('.weight')}.lora_{factor}.weight"
 
 
 class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
@@ -24,6 +41,11 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             hf_assets_path,
         )
         self._num_mtp_layers = len(model_config.mtp_layers)
+        config = getattr(model_config, "lora", DeepSeekV4LoRAConverter.Config(adapt_routed_experts=False))
+        self._lora_config = replace(config)
+        targets = config.target_modules if config.target_modules is not None else DEEPSEEK_V4_LORA_TARGETS
+        self._lora_module_names = tuple(fqn for fqn, _, _, _ in model_config.traverse(_LoRAOptions, recurse=True))
+        self._peft_targets = self._lora_module_names or tuple(targets)
 
         self.from_hf_map = {
             "embed.weight": "tok_embeddings.weight",
@@ -127,6 +149,8 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
         hf_state_dict = {}
 
         for key, value in state_dict.items():
+            if "lora_" in key:
+                continue
             if any(t in key for t in ("compressor", "indexer", "tid2eid")):
                 new_key = to_hf_map[key]
                 if "tid2eid" in key:
@@ -179,6 +203,88 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                     hf_state_dict[key] = value
 
         return hf_state_dict
+
+    def to_peft(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        peft_state_dict = {}
+        for key, value in state_dict.items():
+            if "lora_" not in key:
+                continue
+            if key.startswith("mtp_layers."):
+                raise NotImplementedError("Transformers DeepSeek-V4 PEFT export does not consume MTP adapters")
+            if key.endswith((".lora_a.weight", ".lora_b.weight")):
+                base_key, factor, _ = key.rsplit(".", 2)
+                for local_suffix, hf_suffix in _PEFT_MODULE_SUFFIXES.items():
+                    if base_key == local_suffix or base_key.endswith(f".{local_suffix}"):
+                        prefix = base_key.removesuffix(local_suffix)
+                        hf_key = f"{prefix}{hf_suffix}.weight"
+                        if hf_suffix != "lm_head":
+                            hf_key = f"model.{hf_key}"
+                        peft_state_dict[_peft_key(hf_key, factor[-1].upper())] = value
+                        break
+                else:
+                    raise ValueError(f"Unsupported PEFT LoRA tensor: {key}")
+            elif ".moe.routed_experts.inner_experts." in key:
+                prefix, factor = key.split(".moe.routed_experts.inner_experts.")
+                if factor not in {"w13_lora_a", "w13_lora_b", "w2_lora_a", "w2_lora_b"}:
+                    raise ValueError(f"Unsupported PEFT LoRA tensor: {key}")
+                prefix = f"model.{prefix}.mlp.experts"
+                # PEFT nests gate_up_proj inside down_proj, in target_parameters order.
+                if factor.startswith("w13_"):
+                    prefix += ".base_layer"
+                if factor.endswith("lora_a"):
+                    value = value.reshape(-1, value.shape[-1])
+                    peft_factor = "A"
+                else:
+                    if factor == "w13_lora_b":
+                        value = torch.cat((value[:, :, 0, :], value[:, :, 1, :]), dim=1)
+                    value = value.permute(1, 2, 0).reshape(value.shape[1], -1)
+                    peft_factor = "B"
+                if isinstance(value, DTensor):
+                    # DCP needs contiguous shards after flattening the expert/rank axes.
+                    value = value.redistribute(placements=[Shard(0)] * value.device_mesh.ndim)
+                peft_state_dict[_peft_key(f"{prefix}.weight", peft_factor)] = value.contiguous()
+            else:
+                raise ValueError(f"Unsupported PEFT LoRA tensor: {key}")
+        if not peft_state_dict:
+            raise ValueError("No LoRA adapter tensors were found for PEFT export")
+        return peft_state_dict
+
+    def peft_adapter_config(self, *, base_model_name_or_path: str | None = None) -> dict[str, Any]:
+        if any(name.startswith("mtp_layers.") for name in self._lora_module_names):
+            raise NotImplementedError("Transformers DeepSeek-V4 PEFT export does not consume MTP adapters")
+        expert_suffix = ".moe.routed_experts.inner_experts"
+        targets = tuple(name for name in self._peft_targets if not name.endswith(expert_suffix))
+        expert_targets = [
+            f"model.{name.removesuffix(expert_suffix)}.{parameter}"
+            for name in self._lora_module_names
+            if name.endswith(expert_suffix)
+            for parameter in _ROUTED_EXPERT_PEFT_PARAMETERS
+        ]
+        peft_targets = peft_target_modules(targets)
+        config = self._lora_config
+        if config.adapt_routed_experts and config.rank_experts != config.rank:
+            raise ValueError(
+                f"PEFT export requires equal rank ({config.rank}) and rank_experts ({config.rank_experts}) "
+                "when adapt_routed_experts=True."
+            )
+        return {
+            "base_model_name_or_path": base_model_name_or_path or self.hf_assets_path or "",
+            "bias": "none",
+            "fan_in_fan_out": False,
+            "inference_mode": True,
+            "init_lora_weights": True,
+            "lora_alpha": config.alpha,
+            "lora_dropout": 0.0,
+            "modules_to_save": None,
+            "peft_type": "LORA",
+            "r": config.rank,
+            "revision": None,
+            "target_modules": [],
+            "target_parameters": [f"{name}.weight" for name in peft_targets] + expert_targets,
+            "task_type": "CAUSAL_LM",
+            "use_dora": False,
+            "use_rslora": False,
+        }
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
         state_dict = {}

@@ -89,6 +89,23 @@ def build_deepseek_v4_checkpoint_resume_test_list() -> list[OverrideDefinitions]
 
 def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
     return [
+        OverrideDefinitions(
+            test_name="dsv4_lora_1rank",
+            test_descr="DeepSeek-V4 LoRA A/B training, native resume and PEFT export 1rank",
+            env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_checkpoint"},
+            override_args=[(*GOLDEN_OVERRIDES,
+                "--training.steps=2", "--training.global-batch-size=2",
+                "--parallelism.data-parallel-shard-degree=1", "--parallelism.expert-parallel-degree=1",
+                "--hf-assets-path=tests/assets/deepseek_v3",
+                "--checkpoint.enable", "--checkpoint.interval=1", "--checkpoint.keep-latest-k=0",
+                *phase,
+            ) for phase in ((), ("--checkpoint.load-step=1",))],
+            ngpu=1,
+            use_golden=True,
+            check_loss=False,
+            check_resume=True,
+            expected_steps=((1, 2), (2,)),
+        ),
         _build_case(
             test_name="dsv4_golden_1rank",
             test_descr="DeepSeek-V4 golden 1rank",
