@@ -1,14 +1,15 @@
 # 静默数据损坏检测（SDC）
 
 SDC（Silent Data Corruption，静默数据损坏）用于检测 Ascend NPU 编译训练中的 gradient、
-HCCL 和 matmul checksum 异常，适用于使用 `torch.compile` 与 Inductor 编译模型的标准 NPU Trainer。
-该能力默认关闭，通过 `TrainerEx.Config.sdc` 对应的 CLI 参数按需启用。
+HCCL 和 matmul checksum 异常，支持标准 NPU Trainer 的 Inductor 编译路径，以及
+GraphTrainer 的 `aot_fx_trace` 路径。该能力默认关闭，通过 `sdc` 对应的 CLI 参数按需启用。
 
 ## 启动入口
 
 所有模式都通过 `torchrun -m torchtitan_npu.train` 启动。该入口会在上游配置加载前安装
 NPU 配置转换，使标准配置构造
-`TrainerEx`。直接使用 `torchrun -m torchtitan.train` 可能构造上游 `Trainer`，不支持作为
+`TrainerEx`，将上游 GraphTrainer 配置转换为 `GraphTrainerEx.Config`。直接使用
+`torchrun -m torchtitan.train` 可能构造上游 Trainer，不支持作为
 NPU SDC 入口。
 
 `scripts/run_train.sh` 和 `scripts/run_train_multinodes.sh` 默认使用
@@ -83,10 +84,28 @@ pass/custom op 调用 `torch_npu.matmul_checksum`，把 native checksum 调用�
 compiled SDC 要求：
 
 - `compile.enable=true`，且 `compile.components` 包含 `model`。
-- `compile.backend=inductor`。
+- 标准 Trainer 要求 `compile.backend=inductor`；GraphTrainer 的 `aot_fx_trace` 路径
+  通过自身图 pass 流水线编译，不用该 backend 字段判断是否采用 Inductor。
 - `parallelism.pipeline_parallel_degree=1`，不支持流水线并行。
 - HCCL 检测在模型构建完成后一次性启用，覆盖此后的 forward、backward 和训练步骤间
   collective，不覆盖 Trainer 构造期间的初始化通信。启用 HCCL SDC 可能带来额外性能损耗。
+
+### GraphTrainer
+
+使用已有、能够正常运行网络的 GraphTrainer 配置，通过上述 NPU 启动入口加载，并按需追加
+`--sdc.gradient-enabled`、`--sdc.with-checksum` 和 `--sdc.hccl-mode`。
+SDC 不修复模型本身的 tracing 或算子兼容性问题。
+
+`compile.mode=aot_fx_trace` 且开启 checksum 时，还要求：
+
+- `compile.enable_passes=true`。
+- 不设置 `compile.precompile_artifact_dir`，不支持直接加载预编译图产物。
+- 输入配置的 `compile.pass_pipeline` 保持 `default`，不支持自定义流水线。
+- `compile.disable_passes` 不包含 `sdc_checksum_graph_pass`。
+
+框架自动选择内部的 `npu_sdc_checksum` 流水线，用户无需手动填写这个名称。
+该流水线复用上游默认 passes，只在区域或全图 Inductor 编译 pass 前插入 checksum pass。
+因此，检测节点的插入不依赖 Inductor 内部 hook，但后续仍使用上游 Inductor 编译 pass。
 
 ## 生命周期
 
@@ -120,8 +139,12 @@ HCCL native gate 读取并缓存 `NPU_ASD_ENABLE`。compiled SDC 在 torch-npu �
 接入时也必须保证设置开关前没有提前触发 native 检测路径。更改模式需要重启 worker。
 SDC 使用进程级 torch-npu 和 Inductor 状态，不提供运行期重配置或卸载接口。
 
-`with_checksum=True` 时，`SDC.__init__()` 安装进程级 Inductor post-grad pass，首次编译
-的训练图即包含由 `checker.checksum_enable` 控制的 checksum custom op。Gradient checker
+标准 Trainer 中，`with_checksum=True` 时，`SDC.__init__()` 安装进程级 Inductor
+post-grad pass。GraphTrainer 的 AOT 路径则在上游初始化前调用
+`config.sdc.prepare_graph(config.compile)` 选择流水线，在前向、反向联合图上插入检测节点，
+不再为该路径安装 Inductor post-grad hook。两种入口复用同一份 checksum 插入逻辑。
+
+首次构建的训练图即包含由 `checker.checksum_enable` 控制的 checksum custom op。Gradient checker
 达到阈值后只打开 native gate，后续 step 直接在原图执行 checksum，不调用
 `torch.compiler.reset()`。
 
@@ -136,8 +159,9 @@ step 结束时恢复或切换；失败 step 的异常直接向上传播，不执
 | 路径 | 职责 |
 | --- | --- |
 | `torchtitan_npu/extensions/trainer.py` | 编排标准 Trainer 与 SDC 生命周期。 |
-| `torchtitan_npu/extensions/components/sdc/sdc.py` | 一次完成配置校验、HCCL、checksum 和 gradient 初始化；在 accumulation 边界直接提交梯度。 |
-| `torchtitan_npu/compile/sdc_checksum.py`、`torchtitan_npu/ops/misc/sdc_checksum.py` | 安装 checksum pass 并注册 custom op。 |
+| `torchtitan_npu/extensions/graph_trainer.py` | 准备 SDC 图配置，复用上游训练流程和 NPU Trainer 生命周期。 |
+| `torchtitan_npu/extensions/components/sdc/sdc.py` | 完成配置校验、图流水线注册、HCCL、checksum 和 gradient 初始化；在 accumulation 边界直接提交梯度。 |
+| `torchtitan_npu/compile/sdc_checksum.py`、`torchtitan_npu/ops/misc/sdc_checksum.py` | 提供 Inductor 和联合图两种 pass 入口，复用检测节点插入逻辑并注册 custom op。 |
 
 ## 验证范围
 
@@ -145,7 +169,13 @@ step 结束时恢复或切换；失败 step 的异常直接向上传播，不执
 通过 native checker 替身验证 typed tuning、参数筛选和累积提交，并检查 `TrainerEx`
 在模型构建后一次初始化 SDC，失败 backward 不提交梯度。
 
+`tests/unit_tests/extensions/test_graph_trainer.py` 覆盖 GraphTrainer 配置适配、checksum
+流水线约束、pass 顺序和检测节点插入等契约。
+
 `tests/smoke_tests/sdc/test_sdc.py` 为每个场景启动独立 Python worker，覆盖 Eager/compiled
 控制与无效配置、BF16 gradient、checksum custom-op 输出修改、编译图 consumer、初始化通信后
 启用 HCCL 的训练路径，以及 three-strikes 后不重新编译的 checksum 激活。该文件是专项 NPU
-冒烟测试，不替代 `tests/integration_tests` 中的完整模型训练验证。
+冒烟测试，并包含手工前向 FX 图的 checksum 插入及执行场景。该场景不覆盖 GraphTrainer
+实际的前向、反向联合图构建和上游编译流水线，也不替代 `tests/integration_tests` 中的完整
+模型训练验证；真实联合图链路仍需验证，不能据此宣称 DeepSeek-V4 GraphTrainer 全网络
+端到端已经验证通过。

@@ -28,6 +28,10 @@ class GraphTrainerEx(TrainerEx, GraphTrainer):
             default_factory=GraphTrainerCompileConfig,
         )
 
+    def __init__(self, config: Config) -> None:
+        config.sdc.prepare_graph(config.compile)
+        super().__init__(config)
+
 
 config_manager.register_config_converter(
     GraphTrainer.Config,
