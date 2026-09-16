@@ -28,7 +28,7 @@ from tests.integration_tests.deepseek_v4 import (
     build_deepseek_v4_checkpoint_resume_test_list,
     build_deepseek_v4_test_list,
 )
-from tests.integration_tests.deepseek_v41 import build_deepseek_v41_test_list
+from tests.integration_tests.deepseek_v41 import build_deepseek_v41_test_list, build_engram_ascendc_test_list
 from tests.integration_tests.ema import assert_ema_checkpoint_written, build_ema_test_list
 from tests.integration_tests.loss_compare import (
     assert_losses_equal,
@@ -57,6 +57,7 @@ _TEST_SUITES_FUNCTION = {
     "deepseek_v4_checkpoint": build_deepseek_v4_checkpoint_resume_test_list,
     "deepseek_v41": build_deepseek_v41_test_list,
     "ema": build_ema_test_list,
+    "engram_ascendc": build_engram_ascendc_test_list,
 }
 
 # Held while a test writes its captured output so concurrent tests do not

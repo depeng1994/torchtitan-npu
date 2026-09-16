@@ -11,16 +11,18 @@ fused kernels do not yet accept the V4.1 ratio-1 shared-KV contract.
 """
 
 import os
+from dataclasses import dataclass
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
+from torchtitan.components.optimizer import LRSchedulersContainer, ParamGroupConfig, default_adamw
 from torchtitan.config import CompileConfig, ParallelismConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.models.common.config_utils import decoder_vocab_size
 
 from torchtitan_npu.config import OptimizerConfig, TrainingConfig
+from torchtitan_npu.extensions.components.optimizer import HostSparseOptimizersContainer
 from torchtitan_npu.extensions.profiler import CANNProfiler
 from torchtitan_npu.extensions.trainer import TrainerEx
 
@@ -30,11 +32,24 @@ from .config import (
     DeepSeekV41FullLayerConfig,
 )
 from .data import SyntheticTokenizer
+from .model import V41Model
 from .model_registry import model_registry
 from .vision_loader import DeepSeekV41SyntheticVisionDataLoader
 
 # The Golden fixture image; override it via a config entry when training on real data.
 DEFAULT_VISION_IMAGE_PATHS = ("tests/assets/dsv4_vit_test.jpeg",)
+
+
+@dataclass(kw_only=True, slots=True)
+class DeepSeekV41TrainerConfig(TrainerEx.Config):
+    """Expose the model switch while ModelSpec is suppressed from the CLI."""
+
+    engram_enabled: bool = True
+
+    def __post_init__(self) -> None:
+        assert self.model_spec is not None and isinstance(self.model_spec.model, V41Model.Config)
+        self.model_spec.model.engram_enabled = self.engram_enabled
+        TrainerEx.Config.__post_init__(self)
 
 
 def _golden_enabled() -> bool:
@@ -55,7 +70,19 @@ def _v41_optimizer_config(model_spec, *, lr: float) -> OptimizerConfig:
     contract of the frozen baseline.
     """
     native = default_adamw(lr=lr, eps=1e-6)
-    return OptimizerConfig(
+    has_engram = any(getattr(layer, "engram", None) is not None for layer in model_spec.model.layers)
+    optimizer_type = HostSparseOptimizersContainer.Config if has_engram else OptimizerConfig
+    groups = native.param_groups
+    if has_engram:
+        groups = [
+            ParamGroupConfig(
+                pattern=r".*\.engram\.table\.weight$",
+                optimizer_name="SparseAdam",
+                optimizer_kwargs={"lr": 5 * lr, "betas": (0.9, 0.95), "eps": 1e-6},
+            ),
+            *groups,
+        ]
+    return optimizer_type(
         lr=lr,
         beta1=0.9,
         beta2=0.95,
@@ -65,7 +92,7 @@ def _v41_optimizer_config(model_spec, *, lr: float) -> OptimizerConfig:
         muon_enable_nesterov=True,
         muon_ns_steps=10,
         muon_adjust_lr_fn="match_rms_adamw",
-        param_groups=native.param_groups,
+        param_groups=groups,
         implementation=native.implementation,
         optimizer_factory_kwargs_by_name=native.optimizer_factory_kwargs_by_name,
     )
@@ -96,7 +123,7 @@ def _build_v41_trainer_config(flavor: str, crop: DeepSeekV41CropConfig) -> Train
         != crop.compress_ratios  # pyrefly: ignore [not-iterable]
     ):  # pyrefly: ignore [not-iterable]
         raise ValueError("registered V4.1 model does not match compression ratios")
-    return TrainerEx.Config(
+    return DeepSeekV41TrainerConfig(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
                 global_vocab_size=decoder_vocab_size(model_spec),
@@ -173,12 +200,7 @@ def deepseek_v41_flash_40layers_16experts_vision() -> TrainerEx.Config:
 
 
 def deepseek_v41_debugmodel() -> TrainerEx.Config:
-    """Reduced-width full-structure V4.1 shape for the golden trajectory tests.
-
-    The real 40-layer compression/source structure and vision depth with
-    debug widths, so the deterministic golden loss guard exercises every
-    V4.1 code path quickly.
-    """
+    """Reduced-width full-structure V4.1 model with Host Engram."""
     return _build_v41_trainer_config(
         "deepseek_v41_debugmodel",
         DeepSeekV41DebugConfig(

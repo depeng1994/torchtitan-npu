@@ -33,6 +33,12 @@ class OverrideDefinitions:
     expected_steps: Sequence[Sequence[int]] | None = None
     check_resume: bool = False
     verify_ema_checkpoint: bool = False
+    requires_engram_ops: bool = False
+    """Case needs the Engram CANN operators from ``cann_ops_transformer``.
+
+    These cases belong to the explicit ``engram_ascendc`` suite and are not
+    included in the default model smoke suite.
+    """
 
     def __repr__(self):
         return self.test_descr

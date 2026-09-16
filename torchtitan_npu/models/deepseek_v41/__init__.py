@@ -21,6 +21,7 @@ from .config import (
     DeepSeekV41CropConfig,
     DeepSeekV41FullLayerConfig,
     DeepSeekV41FullScaleProfile,
+    EngramArgs,
 )
 from .config_registry import (
     deepseek_v41_flash_30layers_16experts_vision,
@@ -48,6 +49,7 @@ __all__ = [
     "DeepSeekV41FullLayerConfig",
     "DeepSeekV41FullScaleProfile",
     "DeepSeekV41StateDictAdapter",
+    "EngramArgs",
     "V41AttentionContext",
     "V41CompressionSpec",
     "V41Model",
