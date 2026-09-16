@@ -97,7 +97,13 @@ class LocalTokenDispatcher(TorchTitanLocalTokenDispatcher):
         routed_output_RD: torch.Tensor,
         metadata: LocalDispatchMetadata,
         x_TD: torch.Tensor,
+        *,
+        num_local_tokens_after_padding: int | None = None,
+        local_seq_len_after_padding: int | None = None,
     ) -> torch.Tensor:
+        # Local dispatch has no SP all-gather. Accept the legacy arguments so
+        # the shared MoE compatibility path can call both dispatcher variants.
+        del num_local_tokens_after_padding, local_seq_len_after_padding
         out_TD = torch.zeros_like(x_TD)
         # Patch override: the config is the single source of truth; skip the
         # multiply when grouped experts applied scores before down projection.
@@ -253,6 +259,9 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
         routed_output_RD: torch.Tensor,
         metadata: AllToAllDispatchMetadata | LocalDispatchMetadata,
         x_TD: torch.Tensor,
+        *,
+        num_local_tokens_after_padding: int | None = None,
+        local_seq_len_after_padding: int | None = None,
     ) -> torch.Tensor:
         if self.ep_mesh is None:
             assert isinstance(metadata, LocalDispatchMetadata)
@@ -280,7 +289,23 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
         if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
             routed_output_RD = spmd.reinterpret_mesh(routed_output_RD, spmd.current_mesh())
 
-        out_TD = torch.zeros_like(x_TD)
+        legacy_seq_padding = num_local_tokens_after_padding is not None
+        if legacy_seq_padding:
+            if local_seq_len_after_padding is None:
+                raise ValueError("local_seq_len_after_padding is required with legacy SP padding")
+            out_TD = torch.zeros(
+                num_local_tokens_after_padding * getattr(self, "sp_size", 1),
+                x_TD.shape[-1],
+                device=x_TD.device,
+                dtype=x_TD.dtype,
+            )
+            token_indices_experts_sorted_N = self._sp_global_token_indices(  # pyrefly: ignore [missing-attribute]
+                metadata.token_indices_experts_sorted_N,
+                local_seq_len_after_padding,
+            )
+        else:
+            out_TD = torch.zeros_like(x_TD)
+            token_indices_experts_sorted_N = metadata.token_indices_experts_sorted_N
         # Patch override: use the dispatcher config instead of a per-call flag;
         # grouped experts may have absorbed scores before the down projection.
         if not self.absorb_router_scores:
@@ -288,7 +313,6 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
                 routed_output_RD.to(torch.float32) * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
             ).to(routed_output_RD.dtype)
 
-        token_indices_experts_sorted_N = metadata.token_indices_experts_sorted_N
         assert isinstance(token_indices_experts_sorted_N, torch.Tensor)
         return deterministic_scatter_add(
             out_TD,

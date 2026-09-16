@@ -11,6 +11,7 @@ from dataclasses import replace
 
 from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
 from torchtitan.hf_datasets.text_datasets import ChatDataLoader
+from torchtitan.models.qwen3_5 import config_registry as _upstream_config_registry
 from torchtitan.models.qwen3_5 import model_registry
 from torchtitan.models.qwen3_5.config_registry import qwen35_27b
 from torchtitan.models.qwen3_5.parallelize import parallelize_qwen3_5
@@ -19,6 +20,14 @@ from torchtitan.trainer import Trainer
 from torchtitan_npu.override.qwen3_5.parallelize import parallelize_qwen3_5_cp
 
 _TEXT_SPECIAL_TOKEN_IDS = {"image_id": -1, "video_id": -1}
+
+
+# Keep upstream debug and benchmark recipes available through the NPU module.
+# The recipe objects remain upstream-owned; NPU-specific behavior is selected
+# explicitly through ``override.imports`` or the launcher defaults.
+for _name, _factory in vars(_upstream_config_registry).items():
+    if _name.startswith("qwen35_") and callable(_factory) and _name not in globals():
+        globals()[_name] = _factory
 
 
 def _messages(sample):
@@ -48,6 +57,9 @@ def _parallelize_text(model, **kwargs):
 
 def _parallelize_long_text(model, **kwargs):
     model.register_forward_pre_hook(_text_inputs, with_kwargs=True)
+    # Long-text SFT is text-only: detach the VL vision encoder so the CP
+    # sequence-metadata adapter only ever sees pure-text varlen masks.
+    model.vision_encoder = None
     return parallelize_qwen3_5_cp(model, **kwargs)
 
 

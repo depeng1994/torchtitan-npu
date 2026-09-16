@@ -1,9 +1,18 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 pytest==8.3.2
 pytest-cov
 pre-commit
 pyrefly==0.45.1
 transformers==4.57.6
 # Test dependencies
+# Qwen3.5 adapter tests import TorchTitan's multimodal image helper.
+# Keep this pin aligned with requirements.txt; the matching nightly wheel is
+# hosted on the PyTorch nightly CPU index rather than the default PyPI mirror.
+--extra-index-url https://download.pytorch.org/whl/nightly/cpu
+torchvision==0.29.0.dev20260720
 einops
 expecttest
 tomli_w

@@ -30,6 +30,9 @@ class OverrideDefinitions:
     env_vars: Mapping[str, str] | None = None
     use_golden: bool = True
     check_loss: bool = True
+    # Model-specific launchers may provide their own dataset/assets defaults.
+    train_script: str = "scripts/run_train.sh"
+    train_args: Sequence[str] | None = None
     expected_steps: Sequence[Sequence[int]] | None = None
     check_resume: bool = False
     verify_ema_checkpoint: bool = False

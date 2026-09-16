@@ -37,6 +37,7 @@ from tests.integration_tests.loss_compare import (
     log_print,
     read_losses_from_file,
 )
+from tests.integration_tests.qwen3_5 import build_qwen3_5_test_list
 
 
 def build_models_test_list() -> list[OverrideDefinitions]:
@@ -46,6 +47,7 @@ def build_models_test_list() -> list[OverrideDefinitions]:
         build_deepseek_v4_test_list()
         + build_deepseek_v41_test_list()
         + build_deepseek_v3_2_test_list()
+        + build_qwen3_5_test_list()
     )
 
 
@@ -57,6 +59,7 @@ _TEST_SUITES_FUNCTION = {
     "deepseek_v4_checkpoint": build_deepseek_v4_checkpoint_resume_test_list,
     "deepseek_v41": build_deepseek_v41_test_list,
     "ema": build_ema_test_list,
+    "qwen3_5": build_qwen3_5_test_list,
 }
 
 # Held while a test writes its captured output so concurrent tests do not
@@ -144,13 +147,8 @@ class GPUPool:
             conc[holders] = conc.get(holders, 0.0) + duration
             npu_seconds += duration * level
             sequential_seconds += duration * holders
-        histogram = ", ".join(
-            f"{level}/{self.total} busy {busy[level]:.1f}s"
-            for level in sorted(busy, reverse=True)
-        )
-        allocations = ", ".join(
-            f"{count}x({n} NPU)" for n, count in sorted(self._alloc_counts.items(), reverse=True)
-        )
+        histogram = ", ".join(f"{level}/{self.total} busy {busy[level]:.1f}s" for level in sorted(busy, reverse=True))
+        allocations = ", ".join(f"{count}x({n} NPU)" for n, count in sorted(self._alloc_counts.items(), reverse=True))
         capacity = self.total * window
         pool_line = (
             f"pool: window {window:.1f}s, utilization {100 * npu_seconds / capacity:.0f}% "
@@ -362,8 +360,7 @@ def _check_phase_results(
         expected_steps = set(test_flavor.expected_steps[idx])
         if set(test_losses) != expected_steps:
             raise RuntimeError(
-                f"{test_name} phase {idx}: expected steps {sorted(expected_steps)}, "
-                f"got {sorted(test_losses)}"
+                f"{test_name} phase {idx}: expected steps {sorted(expected_steps)}, got {sorted(test_losses)}"
             )
     if test_flavor.check_loss:
         assert golden_losses is not None
@@ -372,9 +369,7 @@ def _check_phase_results(
         try:
             assert_losses_equal(golden_losses, test_losses)
         except AssertionError:
-            mismatch_body = "\n".join(
-                f"[GOLDEN_MISMATCH] {step} {test_losses[step]}" for step in sorted(test_losses)
-            )
+            mismatch_body = "\n".join(f"[GOLDEN_MISMATCH] {step} {test_losses[step]}" for step in sorted(test_losses))
             _emit_block(
                 test_name,
                 f"[GOLDEN_MISMATCH] {test_name} — dumping actual losses for regeneration:\n",
@@ -400,13 +395,9 @@ def run_single_test(
     case_dir = Path(output_dir) / test_name
     all_ranks = ",".join(map(str, range(test_flavor.ngpu)))
 
-    if test_flavor.expected_steps is not None and len(test_flavor.expected_steps) != len(
-        test_flavor.override_args
-    ):
+    if test_flavor.expected_steps is not None and len(test_flavor.expected_steps) != len(test_flavor.override_args):
         raise ValueError(f"Expected one step sequence per phase for {test_name}")
-    if test_flavor.check_resume and (
-        test_flavor.expected_steps is None or len(test_flavor.override_args) != 2
-    ):
+    if test_flavor.check_resume and (test_flavor.expected_steps is None or len(test_flavor.override_args) != 2):
         raise ValueError(f"Resume comparison requires two phases with expected steps for {test_name}")
 
     # When running in parallel, pin each test to a disjoint subset of physical
@@ -436,11 +427,12 @@ def run_single_test(
         golden_losses = read_losses_from_file(golden_file)
 
     for idx, override_arg in enumerate(test_flavor.override_args):
-        # torchtitan-npu override: launch run_train.sh directly with an argv
-        # list and pass per-case settings through the environment; no shell
-        # is involved, so tokens are never re-split or interpolated.
-        cmd = ["bash", "scripts/run_train.sh", "--dump_folder", str(case_dir / "test_run")]
-        cmd += list(DEFAULT_TRAIN_ARGS)
+        # torchtitan-npu override: launch the case-specific training script
+        # directly with an argv list and pass settings through the environment;
+        # no shell is involved, so tokens are never re-split or interpolated.
+        cmd = ["bash", test_flavor.train_script, "--dump_folder", str(case_dir / "test_run")]
+        train_args = DEFAULT_TRAIN_ARGS if test_flavor.train_args is None else test_flavor.train_args
+        cmd += list(train_args)
         if test_flavor.check_loss or test_flavor.check_resume:
             cmd += list(DETERMINISTIC_ARGS)
         if override_arg:

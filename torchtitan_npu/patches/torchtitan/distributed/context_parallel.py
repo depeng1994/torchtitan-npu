@@ -21,6 +21,17 @@ from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
 logger = logging.getLogger(__name__)
 
 
+def _varlen_from_masks(masks):
+    """Return the shared VarlenMetadata behind a bare mask or an all-varlen dict."""
+    if isinstance(masks, VarlenMetadata):
+        return masks
+    if isinstance(masks, dict):
+        values = [value for value in masks.values() if value is not None]
+        if values and all(isinstance(value, VarlenMetadata) for value in values):
+            return values[0]
+    return None
+
+
 @functools.wraps(original_cp_shard)
 def patched_cp_shard(
     cp_mesh: DeviceMesh,
@@ -32,7 +43,8 @@ def patched_cp_shard(
     """Build rank-local varlen metadata after sharding inputs for CP."""
     load_balancer_type = args[0] if args else kwargs.get("load_balancer_type", "headtail")
     input_seq_dim = args[1] if len(args) > 1 else kwargs.get("input_seq_dim", 1)
-    is_varlen = isinstance(attention_masks, VarlenMetadata)
+    varlen_metadata = _varlen_from_masks(attention_masks)
+    is_varlen = varlen_metadata is not None
     batch_size = inputs[0].size(0)
     seq_len = inputs[0].size(input_seq_dim)
 
@@ -44,14 +56,14 @@ def patched_cp_shard(
         **kwargs,
     )
 
-    if is_varlen:
+    if varlen_metadata is not None:
         assert load_balancer_type in (
             None,
             "headtail",
         ), f"varlen only support headtail as load balancer, got ({load_balancer_type})"
 
-        output_masks = CPVarlenMetadata.from_global(
-            attention_masks,
+        cp_metadata = CPVarlenMetadata.from_global(
+            varlen_metadata,
             cp_mesh,
             batch_size,
             seq_len,
@@ -61,15 +73,51 @@ def patched_cp_shard(
                 else None
             ),
         )
+        if isinstance(attention_masks, dict):
+            # Hybrid attention stacks carry one shared varlen metadata under
+            # multiple mask keys; keep the dict shape so each block can still
+            # select its mask by key after CP sharding.
+            output_masks = {
+                key: cp_metadata if isinstance(value, VarlenMetadata) else value
+                for key, value in attention_masks.items()
+            }
+        else:
+            output_masks = cp_metadata
 
-    return inputs, output_masks
+    return inputs, output_masks  # pyrefly: ignore [bad-return]
 
 
 def apply() -> None:
-    import torchtitan.distributed.context_parallel.api as context_parallel_api
+    try:
+        import torchtitan.distributed.context_parallel.api as context_parallel_api
+    except ImportError:
+        import torchtitan.distributed.context_parallel as context_parallel_api
+
+    # Qwen3.5 vision masks are created after NPU initialization.  Torch's
+    # compiled helper starts a worker process, which cannot reinitialize NPU;
+    # use the eager helper for this CP path.
+    try:
+        import torch.distributed.tensor.experimental._context_parallel._attention as cp_attention
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        def _eager_create_block_mask(*args, **kwargs):
+            kwargs.pop("separate_full_blocks", None)
+            kwargs["_compile"] = False
+            return create_block_mask(*args, **kwargs)
+
+        cp_attention._compiled_create_block_mask = _eager_create_block_mask  # pyrefly: ignore [bad-assignment]
+    except (ImportError, AttributeError):
+        logger.debug("CP eager block-mask workaround is unavailable", exc_info=True)
 
     logger.info("[PATCH] torchtitan.distributed.context_parallel.api.cp_shard -> patched_cp_shard")
     context_parallel_api.cp_shard = patched_cp_shard  # pyrefly: ignore [bad-assignment]
+
+    try:
+        import torchtitan.distributed.context_parallel as context_parallel_root
+
+        context_parallel_root.cp_shard = patched_cp_shard  # pyrefly: ignore [bad-assignment]
+    except ImportError:
+        pass
 
 
 apply()
