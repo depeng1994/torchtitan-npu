@@ -52,6 +52,9 @@ fi
 git -C "${TORCHTITAN_DIR}" fetch --depth 1 origin "${TORCHTITAN_COMMIT}"
 git -C "${TORCHTITAN_DIR}" checkout --detach --quiet "${TORCHTITAN_COMMIT}"
 pip install --no-deps -e "${TORCHTITAN_DIR}"
+source "${PROJECT_ROOT}/.ci/setup_torchtitan.sh"
+_install_torchft
+pip install --no-deps -e .
 
 python -c 'from torchtitan.distributed.context_parallel.api import cp_shard; print(cp_shard.__module__)'
 python -m pytest -v --tb=short tests/unit_tests
