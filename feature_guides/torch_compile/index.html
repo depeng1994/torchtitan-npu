@@ -218,17 +218,11 @@ Host 下发和中间 Tensor 读写。<code>torch.compile</code> 使用 TorchDyna
 避免为同一目标维护多套 wrapper。</p>
 <h2 id="2">2. 用户使用场景与对外接口</h2>
 <h3 id="21-ascendc-autofuse">2.1 启用 AscendC AutoFuse</h3>
-<p>仓库脚本提供最短启用方式：</p>
+<p>使用 TorchTitan 原生 CLI 配置编译：</p>
 <pre><code class="language-bash">TORCHINDUCTOR_NPU_BACKEND=ascendc \
-COMPILE_BACKEND=inductor \
-bash scripts/run_train.sh &lt;训练参数&gt;
-</code></pre>
-<p>也可以直接使用 TorchTitan CLI：</p>
-<pre><code class="language-bash">export TORCHINDUCTOR_NPU_BACKEND=ascendc
-
 bash scripts/run_train.sh \
   --compile.enable \
-  --compile.components model,loss \
+  --compile.components model \
   --compile.backend inductor \
   &lt;训练参数&gt;
 </code></pre>
@@ -238,20 +232,23 @@ export TORCHINDUCTOR_NPU_BACKEND=ascendc
 
 NODE_IPS=192.168.1.10,192.168.1.11 \
 NGPU=16 \
-COMPILE_BACKEND=inductor \
 bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
-  --compile.components model,loss \
+  --compile.backend inductor \
+  --compile.components model loss \
   --training.steps 5
 </code></pre>
 <p>该 wrapper 最终调用 <code>scripts/run_train_multinodes.sh</code>；同一节点上的 <code>torchrun</code> 子进程会继承启动 shell
 的环境变量。如果脚本无法自动识别本机地址，设置对应的 <code>LOCAL_HOST</code>。</p>
 <h3 id="22-aot_eager">2.2 使用 <code>aot_eager</code> 检查编译兼容性</h3>
-<pre><code class="language-bash">COMPILE_BACKEND=aot_eager \
-bash scripts/run_train.sh &lt;训练参数&gt;
+<pre><code class="language-bash">bash scripts/run_train.sh \
+  --compile.enable \
+  --compile.components model \
+  --compile.backend aot_eager \
+  &lt;训练参数&gt;
 </code></pre>
 <p><code>aot_eager</code> 可检查 Dynamo、AOTAutograd、FakeTensor 和训练反向是否可用，但不会把完整模型交给 AscendC
-AutoFuse。当前 DeepSeek-V4 示例默认使用 <code>aot_eager</code>；验证 AutoFuse 功能或性能时，需要显式设置
-<code>COMPILE_BACKEND=inductor</code>。</p>
+AutoFuse。DeepSeek-V4 Flash A3/A5 示例默认使用 <code>inductor</code>；可在命令末尾追加
+<code>--compile.backend aot_eager</code> 检查编译兼容性。</p>
 <p>含 FlexAttention 的模型在 <code>aot_eager</code> 下可能由上游 regional Inductor 单独编译 FlexAttention 区域。
 这仍不等同于完整 TransformerBlock 使用 <code>inductor</code> 编译。</p>
 <h3 id="23">2.3 配置和环境变量</h3>
@@ -288,8 +285,9 @@ AutoFuse。当前 DeepSeek-V4 示例默认使用 <code>aot_eager</code>；验证
 </tbody>
 </table>
 <p>当前固定的上游基线实际消费 <code>model</code> 和 <code>loss</code>。配置中写入其他名称，不代表对应组件已经编译。
-<code>COMPILE_BACKEND</code> 便捷入口会显式选择 <code>model</code>；需要同时编译 loss 时，在脚本末尾追加
-<code>--compile.components model,loss</code> 覆盖该默认值。</p>
+通用启动脚本直接透传 CLI，不自动启用编译。Flash 示例通过 CLI 默认启用 <code>model</code> 编译；
+需要同时编译 loss 时，追加 <code>--compile.components model loss</code>；关闭编译使用 <code>--compile.no-enable</code>。
+仅设置 <code>--compile.backend</code> 不会自动启用编译，通用入口还需传入 <code>--compile.enable</code>。</p>
 <p>仓库相关环境变量如下：</p>
 <table>
 <thead>
@@ -299,10 +297,6 @@ AutoFuse。当前 DeepSeek-V4 示例默认使用 <code>aot_eager</code>；验证
 </tr>
 </thead>
 <tbody>
-<tr>
-<td><code>COMPILE_BACKEND</code></td>
-<td>非空时，启动脚本追加 model compile CLI</td>
-</tr>
 <tr>
 <td><code>TORCHINDUCTOR_NPU_BACKEND</code></td>
 <td>选择 Inductor 内部的 NPU Codegen</td>
