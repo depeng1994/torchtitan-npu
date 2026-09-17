@@ -351,8 +351,7 @@ bash scripts/run_train.sh \
   --checkpoint.initial-load-path /absolute/path/to/dsv4_checkpoint/checkpoint/step-100 \
   --checkpoint.no-initial-load-model-only
 </code></pre>
-<p>如果 <code>{dump_folder}/{checkpoint.folder}</code> 已经存在可用 checkpoint，框架会优先从该目录
-优先从该目录加载，并忽略 <code>initial_load_path</code>。从新权重启动实验时，应使用新的 <code>dump-folder</code> 或
+<p>如果 <code>{dump_folder}/{checkpoint.folder}</code> 已经存在可用 checkpoint，框架会优先从该目录加载，并忽略 <code>initial_load_path</code>。从新权重启动实验时，应使用新的 <code>dump-folder</code> 或
 清理旧的 checkpoint 目录。</p>
 <p>如只需要模型和部分训练状态，可以排除不需要的键：</p>
 <pre><code class="language-bash">bash scripts/run_train.sh \
