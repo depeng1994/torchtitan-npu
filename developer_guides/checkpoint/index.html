@@ -202,7 +202,7 @@ dataloader 和训练状态，适合断点续训以及改变并行切分后的加
 <code>model.safetensors.index.json</code>，也应准备对应的 tokenizer 和 <code>config.json</code> 等配置文件。
 该格式只表示模型权重，不包含优化器、学习率调度器和训练步数。</p>
 <h2 id="_2">常用配置项</h2>
-<p>配置类型来自上游 <code>torchtitan.config.Checkpoint</code>，Python 配置使用下划线命名，命令行
+<p>配置类型来自上游 <code>torchtitan.components.checkpointer.base</code>，Python 配置使用下划线命名，命令行
 使用 tyro 的连字符命名：</p>
 <table>
 <thead>
