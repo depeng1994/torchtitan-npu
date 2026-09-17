@@ -43,19 +43,11 @@ class CPVarlenMetadata:
         batch_size: int,
         seq_length: int,
         load_balancer: _LoadBalancer | None = None,
-        *,
-        precomputed_rearrange_indices: torch.Tensor | None = None,
-        precomputed_restore_indices: torch.Tensor | None = None,
     ) -> "CPVarlenMetadata":
         """Build rank-local metadata from global self-attention boundaries.
 
         Q is sharded and K/V are assumed to be all-gathered. Each contiguous
         Q run becomes a causal segment. Construction uses one host transfer.
-
-        ``precomputed_rearrange_indices`` / ``precomputed_restore_indices``
-        are an optional fast path for callers that derive metadata for several
-        CP ranks from the same load-balancer layout. Ordinary callers can omit
-        them and retain the original behavior.
         """
         if isinstance(global_metadata, CPVarlenMetadata):
             raise ValueError(
@@ -92,15 +84,11 @@ class CPVarlenMetadata:
         tok_indices_per_batch: torch.Tensor
         restore_per_batch: torch.Tensor | None = None
         if load_balancer is None:
-            if precomputed_rearrange_indices is not None or precomputed_restore_indices is not None:
-                raise ValueError("precomputed load-balance indices require a non-None load_balancer")
             tok_indices_per_batch = (
                 torch.arange(seq_length, device=device, dtype=dtype).unsqueeze(0).expand(batch_size, -1)
             )
         else:
-            rearrange_indices = precomputed_rearrange_indices
-            if rearrange_indices is None:
-                rearrange_indices = load_balancer._generate_indices(restore=False)
+            rearrange_indices = load_balancer._generate_indices(restore=False)
             if rearrange_indices is None:
                 raise ValueError(
                     "load_balancer._generate_indices() returned None; a load balancer must return a tensor."
@@ -115,31 +103,12 @@ class CPVarlenMetadata:
                     f"{tuple(rearrange_indices.shape)}."
                 )
             rearrange_indices = rearrange_indices.to(dtype)
-
-            restore_indices = precomputed_restore_indices
-            if restore_indices is not None:
-                if restore_indices.ndim != 2 or restore_indices.shape[0] not in (
-                    1,
-                    batch_size,
-                ):
-                    raise ValueError(
-                        "restore indices must have shape (1, seq_length) "
-                        "or (batch_size, seq_length); got "
-                        f"{tuple(restore_indices.shape)}."
-                    )
-                restore_indices = restore_indices.to(dtype)
-
             if rearrange_indices.shape[0] == 1:
                 tok_indices_per_batch = rearrange_indices.expand(batch_size, -1)
-                if restore_indices is None:
-                    restore_per_batch = torch.argsort(rearrange_indices, dim=-1).expand(batch_size, -1)
-                else:
-                    restore_per_batch = restore_indices.expand(batch_size, -1)
+                restore_per_batch = torch.argsort(rearrange_indices, dim=-1).expand(batch_size, -1)
             else:
                 tok_indices_per_batch = rearrange_indices
-                restore_per_batch = (
-                    torch.argsort(rearrange_indices, dim=-1) if restore_indices is None else restore_indices
-                )
+                restore_per_batch = torch.argsort(rearrange_indices, dim=-1)
 
         # Map rank-local Q slots to sequence positions.
         rank_q_indices = tok_indices_per_batch[:, cp_rank * shard_len : (cp_rank + 1) * shard_len]
