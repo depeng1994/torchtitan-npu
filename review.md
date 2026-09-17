@@ -314,3 +314,103 @@ Reducer 自检：
 - [x] 已复核既有 R1-R10，未把旧 review 结论机械继承；
 - [x] 已给出 P0/P1/P2、Test Reduction Matrix 与约 30% 删减方案；
 - [x] 本次只允许修改 `pr_833/review.md`；不修改生产代码、测试、`master`，不 approve/merge/close PR。
+
+质疑者review结论:
+
+> 范围：严格按 `torchtitan-npu-reviewer-skills/Challenger.md` 对 GitHub PR #15 当前 head `b8db3fe9f785f5a85fe815855611d7c4aa336cee` 做独立静态审查；未执行测试。固定依赖为 `torchtitan==0.3.0` / `attn-gym==0.0.9`。同时核对了 V4.1 source branch `sdmyzlp/torchtitan:br_dpsk_v4_1`、Attention Gym v0.0.9、TorchTitan 已合入的 PR #3864（merge commit `183efed45d7d8d2cd880dd3803a3334ed47aba60`）与 CANN `sparse_lightning_indexer_kl_loss_grad` reference。GitHub 镜像没有历史 human inline review / review submission；作者在 PR 描述中的运行记录只作为 claim，不作为本 reviewer 的执行证据。
+
+**Challenger 结论：暂停并澄清，不建议当前 head 合入。** 最关键的新问题不是 `IndexerKLLoss` 的 closed-form 本身——`Z * Y - p` 已由 source branch 与 CANN reference 相互印证——而是它接入的 **AuxLoss 框架并不是 source/upstream 要求的那套语义**。当前 backport 用 global batch size 归一化 token-additive KL，并在多层同名 loss 汇总时覆盖而不是累加；这会同时改变训练梯度尺度和 `indexer_kl_loss/mean` 的含义。另一个 correctness 缺口是 packed-document：`doc_ids` 只能保证“已经正确分组的 compressed entries”不跨文档，不能修复 compressor 本身跨 document boundary pooling；source branch 明确要求每个 document segment 对齐 compression grid，而本仓模型接口没有建立这个前置条件。
+
+**测试执行：未执行（仅静态审查）。** 当前 GitHub mirror head 也没有可见 commit status / workflow run；PR 描述中的 “CI unit/smoke 均绿”无法从该 mirror head 独立复核。
+
+## 1. Claim Traceability Matrix
+
+| Claim | 实际生产路径 | Challenger verdict | 依据 |
+| --- | --- | --- | --- |
+| V4.1 跨层状态已从 mutable context 收敛为显式数据流 | `V41Model.forward -> block -> Attention/Indexer` 显式传 `cmp_k/idx_k/topk_indices/topk_scores/candidates` | **SUPPORTED** | 当前实现没有重新写回 module-level mutable attention context；UT 也覆盖 source/reuse/reindex threading。 |
+| CSA2 改用 Attention Gym 后 LSE 可用于 marginal-weighted KL teacher | `CompressedSparseInnerAttention2 -> selected_attention(... return_aux=AuxRequest(lse=True)) -> IndexerKLLoss` | **SUPPORTED** | attn-gym v0.0.9 的 LSE 明确覆盖 sparse + local window + sink 全分母；shape 为 `[B,H,L]`。 |
+| Indexer distillation 的梯度契约是 `Z*Y-p` | `IndexerKLLoss._teacher/_kl` | **SUPPORTED** | V4.1 source branch同样定义 marginal `p` 与 token-summed KL；CANN reference 明确计算 `p_reduce = p.sum(...)`、`ds = softmax * p_reduce - p`。之前“kernel 可能是 `Y-p`”的质疑已排除。 |
+| 本 PR 对齐上游/source 的 Indexer KL 训练语义 | `IndexerKLLoss -> LoggedAuxLoss.inject` | **CONTRADICTED** | source branch 与 TorchTitan merged #3864 都按 step 的 `global_valid_tokens` 归一化；本仓 patch 按 `global_batch_size` 归一化，token-additive raw sum 的系数随每序列有效 token 数放大。详见 CHAL-01。 |
+| `indexer_kl_loss/mean` 表示所有 consumer layer 的平均值 | `register_aux_loss_zero_hook -> LoggedAuxLoss.zero_all -> collect_aux_loss_metrics` | **CONTRADICTED** | 当前 `_step_acc[key] = module._acc.item()` 对同一 key 反复覆盖；V4.1 多个 `IndexerKLLoss` 同 key，最终只保留最后一层，再除以实例数。详见 CHAL-01。 |
+| `doc_ids` 足以替代旧 metadata 并保证 packed-document isolation | `get_attention_masks -> Compressor -> Indexer._selection_mask -> selected_attention` | **PARTIAL / CONTRADICTED ON MISALIGNED PACKING** | source branch明确声明每个 document segment 必须是 `compress_ratio` 的整数倍；本仓 compressor 直接按全局 token grid `unflatten`，模型没有验证任意 packed boundary 对齐。详见 CHAL-02。 |
+| 2P NPU ST 覆盖推荐/默认的 V4.1 分布式训练入口 | example / config 默认 `spmd_types`；integration case 强制 `partial_dtensor` | **PARTIAL** | 两条入口使用不同 SPMD backend，而 `parallelize_deepseek_v4_1` 与 `Module.parallelize` 对 backend 有不同路径。详见 CHAL-03。 |
+| NPU ST 可守护新增 KL/MoE 数值语义 | `dsv41_debugmodel_2p_ep2_fsdp2` | **UNVERIFIED** | `check_loss=False`、无 `expected_steps`，runner 对该 case 只要求子进程 rc=0；不会检查 aux metric 或数值轨迹。详见 CHAL-04。 |
+| Common MoE default-off 不改变 V4/V3.2 | package auto patch + existing model configs | **PARTIAL** | CPU config/行为检查支持 default-off；作者声称 V4/V3.2 anchor 一致，但本 reviewer 未执行，mirror 也无 workflow 证据。 |
+| checkpoint/state adapter 已覆盖新 namespace | real V4.1 `state_dict` -> adapter | **UNVERIFIED** | 现有 UT 仍以手写子集为主，真实 model full-state round-trip 未形成。 |
+
+## 2. Challenger Findings
+
+| ID | 严重度 | Claim / Semantic Unit | 位置 | Claimed behavior | Actual path / 问题 | Trigger / Impact | Evidence | Fix | Verification |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| CHAL-01 | **Blocker** | Indexer KL normalization + metric aggregation | `torchtitan_npu/patches/torchtitan/models/common/aux_loss.py`；`patches/.../decoder.py`；`models/deepseek_v4_1/indexer.py` | PR 声称 `coeff=0.01` 对齐 source/upstream，指标为 `indexer_kl_loss/mean`。 | `IndexerKLLoss._kl()` 是对 token rows 的 raw **sum**；当前 `LoggedAuxLoss.inject()` 却用 `_mesh_scale_factor / global_batch_size`，而 source branch 与 merged TorchTitan #3864 都用 main loss 相同的 **global valid-token count**。因此 aux gradient 的有效系数随序列有效 token 数变化；当前 512-token recipe 下相对 source 约放大到“每序列有效 token 数”这一量级。与此同时 `zero_all()` 用 `_step_acc[key] = module._acc.item()`，多个同名 `IndexerKLLoss` 会互相覆盖，`collect_aux_loss_metrics()` 再除 `_group_counts[key]`，得到的是“最后一层 / 层数”，不是 layer mean。 | **训练总是触发**：V4.1 从第一个 selection consumer 起即挂多个 per-layer KL。影响不只是日志：归一化差异直接改变 24 个 indexer 参数的新增梯度尺度；metric 又不能准确反映实际各层 aux loss。 | source branch `IndexerKLLoss` 明写 “summed over rows and normalized by step global valid-token count”；TorchTitan merged #3864 的 trainer 调 `AuxLoss.set_step_denominator(global_valid_tokens)`，`group_acc[key] += instance_acc`；本仓 patch仍是旧 `global_batch_size` + overwrite 实现。现有 `test_indexer_distill_loss` 主要用 `global_batch_size=1` 和极小 token case，无法区分这两种 step normalization，也没有两个同名 loss 的 roll-up oracle。 | 直接按 **merged #3864 / V4.1 source branch** 更新这个 temporary upstream patch：trainer 用 global valid-token denominator；group accumulator 对每个 instance 做 `+=`；移除为 global batch size 注入而新增的 decoder monkey patch。由于 #3864 已合入 upstream，patch 应保持与其可机械对照，而不是继续维护 forked semantics。 | 新增/复用 upstream-style CPU test：同一 per-token loss 重复成 2× token 数后，归一化后的参数梯度保持不变；构造两个同 key 的 aux loss，值分别 `a/b`，step metric 必须是 `(a+b)/2`（含 reduce 后语义）。V4.1 ST 至少检查真实 `indexer_kl_loss/mean` 存在且 finite。 |
+| CHAL-02 | **High** | Packed-document isolation | `compressor.py::Compressor.forward`；`indexer.py::_selection_mask`；`model.py::get_attention_masks`；`vision_loader.py` | PR/代码注释描述 `doc_ids` 替代旧 metadata 后可做 document isolation。 | Compressor 先对整条序列按固定 `compress_ratio` 直接 `unflatten`/pool；如果 document boundary 落在 group 中间，该 compressed entry 已经混入两个 document。Indexer 随后用 `doc_ids[:, ::ratio]` 给 entry 贴上起始 token 的 doc id，只能 mask selection，无法把已混合的 KV 拆开；Attention Gym 文档也明确 `doc_ids` 只约束 local-window branch，sparse indices 的跨文档合法性由 caller 负责。 | `compress_ratio=2` 时，只要 packed positions 在奇数 offset reset（例如一个 3-token doc 后接下一个 doc）就触发。影响是 compressed KV 跨 document 内容混合，后续 sparse attention 可能产生跨样本信息泄漏/错误 teacher mass。 | V4.1 source branch 的 indexer module docstring明确写出：每个 document segment 必须是 `compress_ratio` 的整数倍，这也是 compressor reshape segment-exact 的前提。本仓 `_document_alignment()` 只保证**当前 synthetic loader 的整行长度**对齐，且该 loader 一行只有一个 document；`test_index_selection_mask_is_document_isolated_and_causal` 使用的是 4+4 token、ratio=2 的已对齐边界，未覆盖反例。 | 两种方案二选一：A) 若暂不支持任意 packed docs，在真实模型/dataloader boundary 对每个 document segment 验证其长度对所有 active compression ratios 对齐，并在 docs 明确 contract；B) 若要支持任意 packing，则 compressor 必须按 doc segment 分组/pad，不能按全局 token grid reshape。不要只在 synthetic loader 校验 row length。 | CPU UT 用 ratio=2、document lengths `3 + 3`（或 positions `[0,1,2,0,1,2]`）构造明显不同的 KV，确认要么入口明确拒绝，要么 compressed entries 绝不混 doc；再保留一个 aligned positive case。 |
+| CHAL-03 | **High** | Distributed backend support boundary | `config_registry.py`；`examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh`；`tests/integration_tests/deepseek_v4_1.py`；`parallelize.py` | README/example 是 V4.1 推荐训练入口，现有 2P case 被描述为该真实训练路径的 ST。 | `_v41_trainer_config()` 没有覆盖 upstream `ParallelismConfig.spmd_backend`，因此默认是 `spmd_types`；推荐 8P shell 又显式 `SPMD_BACKEND="spmd_types"`。但唯一 V4.1 integration case 强制 `--parallelism.spmd-backend=partial_dtensor`。`parallelize_deepseek_v4_1()` 对 `full_dtensor/spmd_types` 与 partial+EP 走不同分支，state/input redistribution 也不是同一机制。 | 任何按默认 config/example 使用 `spmd_types` 的真实用户路径。影响是现有 NPU ST 不能证明推荐入口的 sharding/redistribution/typecheck 路径可运行；同时 config 没有拒绝 `full_dtensor`，支持矩阵边界不清晰。 | TorchTitan v0.3.0 `ParallelismConfig.spmd_backend` 默认 `spmd_types`；example 显式同值；integration case 明确改成 `partial_dtensor`。当前 UT 不能证明真实 HCCL/NPU distributed backend。 | 先定义单一支持面：若产品入口就是 `spmd_types`，把**现有同一个** 2P ST 调成 `spmd_types`，无需新增第二 case；若只支持 `partial_dtensor`，则 recipe/example/docs 统一 pin partial，并在 model config 对其它 backend fail-fast。若确实支持两者，再分别说明必要性和独立路径，但不要默认无边界地都接受。 | 静态检查最终 recipe 与 ST backend 完全一致；真实 2P NPU 完成 forward/backward/optimizer step。若保留 `spmd_types`，开启其 typechecking 的最小 CPU/设备测试覆盖新增 multimodal/router metadata。 |
+| CHAL-04 | **High** | NPU ST oracle | `tests/integration_tests/deepseek_v4_1.py`；`run_tests.py` | PR 描述声称 30/30 steps、loss 下降且 `indexer_kl_loss` 全程有限，并据此支撑新 KL/MoE 路径。 | case 设置 `check_loss=False`、`expected_steps=None`。runner 的 `_check_phase_results()` 在这两个条件下直接 return，因此自动门禁既不检查 30 个 step 是否真的记录，也不读取 loss/aux metric；只要训练子进程 rc=0 就算通过。 | Aux loss 即使按 CHAL-01 错尺度训练、metric 即使只记录最后一层/层数，只要没有立刻 NaN/崩溃，当前 ST 仍会通过。 | `tests/integration_tests/README.md` 自己也把该 case 定义为 smoke、无 loss compare；`run_tests.py` 的逻辑与此一致。 | 不增加 ST 数量。复用 `dsv41_debugmodel_2p_ep2_fsdp2`：至少设置 `expected_steps` 或等价完成检查；解析并要求 `indexer_kl_loss/mean` 出现且 finite；在 CHAL-01 修复后，为明确改变的 MoE/KL 新语义建立短 deterministic trajectory guard。 | CI runner 自动失败于缺 step、缺 aux metric、非 finite；记录实际 backend/override/seed。不要把一次人工日志观察继续当门禁。 |
+| CHAL-05 | **Medium** | Upstream/source reproducibility | PR 描述、README、patch headers | PR 多次使用“上游 V4.1 / 对齐上游”及逐位 A/B 数字。 | 官方 `pytorch/torchtitan` 默认分支当前没有 `deepseek_v4_1`；实际可核对实现来自开发 branch（例如 `sdmyzlp/torchtitan:br_dpsk_v4_1`），但仓内没有固定 source commit。与此同时本仓实际依赖的 AuxLoss 已经与该 source/merged upstream 分叉。 | 后续 source branch 继续变化、或 reviewer 想复现“逐位无损”数字时触发。影响是“对齐上游”的对象和精度基准无法稳定重放。 | source branch 可直接找到 `HierarchicalIndexer.Mode`、packing-alignment contract 和 token-normalized `AuxLoss`；这些已经与当前移植形态存在可见差异。 | 在 PR/README 固定 reference repo + commit SHA，并列出有意偏离点。凡放入 `patches/torchtitan` 的 upstream backport，必须引用实际包含相同实现的 merged/pending PR/commit。 | re-review 时按固定 source commit 做 compare；A/B 数字注明命令、commit、dtype/backend 和比较对象。 |
+
+## 3. Coverage Matrix
+
+| Dimension | 状态 | Challenger 结论 |
+| --- | --- | --- |
+| Claim | **DEEP** | 关键 KL “对齐 upstream/source” claim 被 CHAL-01 反证；其余逐项追踪。 |
+| E2E | **DEEP** | 主要 forward 可静态闭合，但推荐 `spmd_types` 入口与 ST backend 不一致。 |
+| Numerics | **DEEP** | KL closed-form 正确；step normalization 错位，MoE 新 arithmetic 又无 NPU numeric guard。 |
+| Bwd | **DEEP** | KL 新增 backward 路径存在独立小例子；但 step-level gradient scale 不符合 source framework。 |
+| Dist | **DEEP** | EP2 case 存在，但使用 `partial_dtensor`；默认/recommended `spmd_types` 未被该 ST 证明。 |
+| State | **DEEP** | 显式 runtime state 是改进；full state adapter/checkpoint 仍缺真实 round-trip。 |
+| Compile | **PASS / N/A** | V4.1 明确拒绝 compile，边界清楚。 |
+| Checkpoint | **DEEP** | integration 关闭 checkpoint，adapter 仅子集 oracle。 |
+| Kernel | **PASS** | 当前 fused distill op未接入，边界明确；CANN reference 只用于核对公式，不把它算作本 PR NPU kernel coverage。 |
+| Perf | **N/A / UNVERIFIED** | 本 PR 未提供可独立验证的性能目标；8P example 不是性能门禁。 |
+| Compat | **DEEP** | Common default-off 有静态/CPU证据；patch lifecycle、source pin 和 backend support仍不完整。 |
+| UT | **DEEP** | 算法小例子较强，但遗漏 aux framework normalization、多实例 metric、misaligned packed boundary。 |
+| ST | **DEEP** | 唯一 V4.1 ST 为不同 backend 的 completion smoke，且不检查目标 metric。 |
+| Docs | **DEEP** | “packed isolation”“上游对齐”“4k/512”等 contract 仍有漂移。 |
+| Historical | **PASS** | GitHub mirror 无 human review thread/submission，不虚构历史人工结论。 |
+
+## 4. Test Evidence Matrix
+
+| 测试 / 证据 | 能证明什么 | 不能证明什么 | Challenger 判定 |
+| --- | --- | --- | --- |
+| `test_indexer_distill_loss.py::test_student_gradient_is_z_times_y_minus_p` | 单行、小 K 下 `Z*Y-p` 与 loss value | Trainer step denominator、不同 seq_len 下 coefficient invariance、多层 metric 聚合 | **有效但范围窄** |
+| `test_indexer_distill_loss.py::test_per_layer_losses_sum_to_the_pooled_teacher` | shared student logits 上多个 teacher gradient 的线性叠加 | `LoggedAuxLoss.zero_all()` 是否把多个实例 metric 正确相加 | **有效但不覆盖 framework** |
+| `test_attention_policy.py::test_index_selection_mask_is_document_isolated_and_causal` | 对齐的 4+4 token、ratio=2 下 selection mask | document boundary 不落 compression grid 时 compressor 是否跨文档 pooling | **反例未覆盖** |
+| `test_training_contract.py::test_full_ac_preserves_image_routing` | FullAC 下 image mask 传递、same-implementation output/grad 一致 | 独立 MoE oracle、真实 EP/HCCL、recommended `spmd_types` | **CPU contract 有效** |
+| `test_baseline_contract.py::test_v41_moe_rides_the_common_stack_with_an_opt_in_vision_bias` | Common router default-off 与 V4.1 opt-in config/CPU行为 | 真实分布式 score alignment / NPU numeric equivalence | **部分证据** |
+| `dsv41_debugmodel_2p_ep2_fsdp2` 定义 | 静态上能进入 V4.1、2P FSDP2+EP2、reference operator path | reviewer 未执行；且 runner 无 step/loss/aux metric oracle，backend 还是 partial_dtensor | **只可计为定义完整的 smoke case** |
+| PR 描述中的 CPU/NPU/CI 数字 | 作者自验证背景 | 当前 reviewer 的独立通过证据 | **不计作执行证据** |
+
+## 5. Historical Human Review Traceability
+
+GitHub PR #15 当前查询到的 issue comments、inline review comments / review submissions 均为空，因此**没有历史 human review 可标记为 RESOLVED / STILL_OPEN**。`review.md` 里已有 Maintainer/Reducer 章节属于本镜像上的审查报告，不冒充 human review。
+
+对已有报告中与本次 Challenger 复核重叠的技术项：R2 `BatchedLinear` provenance、R3 RoPE override ownership、R4 入口 source-of-truth、R5 ST numeric guard、R7 real state round-trip、R8 private AC API 均仍可从当前 head 静态复现，状态为 **STILL_OPEN**；Reducer 对 patch placement 的 RED-01/02 也未被后续 production commit 修改。CHAL-01/02 是在这些既有项之外新增的 correctness finding。
+
+## 6. UNVERIFIED / Review Boundary
+
+- **未执行任何测试。** 不能把 PR 描述的 69/246/4 passed、2×910C 30 steps、CI green 当成本次 review 的通过结果。
+- 当前 GitHub mirror head `b8db3fe9...` 没有可见 commit status / workflow run；CI claim 只能标记为作者声明。
+- 推荐 8P `spmd_types` 路径未由现有 V4.1 integration case覆盖；8P 稳定性/性能未验证。
+- 若 `full_dtensor` 也被视为支持，目前 config没有拒绝、ST也未覆盖，支持结论为 UNVERIFIED。
+- checkpoint/save-resume、真实 full-state HF round-trip 未验证。
+- `.agents` / test-review 基线要求读取 `.ci/lint.sh`，但当前 branch 的 `.ci` 不存在该文件；本次只能以 `requirements.txt`、`.ci/unit_test.sh`、`.ci/smoke_test.sh` 固定 TorchTitan v0.3.0。该规则/文件漂移应另行清理，但不把它伪装成本 PR 的运行结论。
+
+## 7. Re-review Conditions
+
+1. **先修 CHAL-01。** 将 AuxLoss backport 对齐 merged TorchTitan #3864 / 固定 V4.1 source commit：global-valid-token normalization、多实例 group sum、对应 trainer hook；删除旧 global-batch-size monkey-patch 语义。没有这一条，不应继续用当前 `coeff=0.01` 声称与 source 对齐。
+2. **明确 CHAL-02 的 packing contract。** 要么模型/真实 dataloader 对每个 document segment 做 compression-grid alignment fail-fast，要么 compressor 改成 segment-aware；补 misaligned boundary oracle。
+3. **统一 distributed backend。** 默认 config、推荐 example、唯一 2P ST 使用同一个被声明支持的 SPMD backend；不支持的 backend 在 config 入口拒绝。
+4. **增强现有 ST，不新增组合。** 同一 `dsv41_debugmodel_2p_ep2_fsdp2` 自动检查 expected steps、`indexer_kl_loss/mean` 存在且 finite，并在新语义确定后加入最小 deterministic numeric guard。
+5. 同时关闭既有仍 open 的 R2/R3/R4/R7 等架构项：patch provenance、Override ownership、单一 config/CLI source-of-truth、真实 full-state round-trip。
+6. README/PR 固定 V4.1 source repo + commit，并同步 packing alignment、SPMD backend、512/4k 与 checkpoint 支持边界。
+
+完成以上 P0/P1 后再进行 Challenger re-review；当前 head 不满足合入条件。
+
+Challenger self-check：
+
+- [x] 在读取既有最终结论前先按生产路径独立核对了 KL、Attention Gym、MoE、sharding、state、tests；
+- [x] 核对了 PR metadata、完整 changed-file 集、固定依赖、`.agents/AGENTS.md`、test-review skills、UT/ST runner/README/example；
+- [x] 核对了 pinned TorchTitan v0.3.0、Attention Gym v0.0.9、V4.1 source branch、merged TorchTitan #3864、CANN KL reference；
+- [x] `tests/` 结论严格按仓内 developer-tests-review 的静态 `review测试` 边界，不声称执行；
+- [x] 已将被证伪的早期 KL-kernel 怀疑移除：CANN reference 支持 `Z*Y-p`；
+- [x] 仅追加 `pr_833/review.md`，不修改生产代码/测试/`master`，不 approve/merge/close PR。
