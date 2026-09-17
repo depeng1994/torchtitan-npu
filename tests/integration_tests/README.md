@@ -59,6 +59,11 @@ MTP+CP 场景下的实际构图、编译和训练执行路径；单卡、EP2 和
 `deepseek_v4_debugmodel`、CP2 和 headtail，在 C4 packed sequence 上执行完整的
 MTP forward、chunked loss 和 backward。
 
+`dsv4_mtp_smla_cp2_headtail` 额外配置 `num_workers=1`、`prefetch_factor=8`，只承担
+StatefulDataLoader multiprocessing 与 CP/HeadTail/MTP 训练路径的兼容性 smoke。该用例仍为
+1 step，因此不声称覆盖 steady-state prefetch overlap；1M 场景下 step1+ 的等待时间与
+host/shared-memory 压力应由专门的长序列性能复现实验验证。
+
 `dsv4_muon_swap_ep2_fsdp2` 使用 NPU 融合算子：Ascend RMSNorm、complex RoPE、sparse
 attention、MHC 和 MoE token dispatcher；两卡 EP2/FSDP2，并追加 `--optimizer.name=Muon`
 和 `swap_optimizer` override。它运行两步，覆盖 DistMuon 与 AdamW fallback 在融合训练路径中
