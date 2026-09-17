@@ -183,36 +183,43 @@ def _routing_geometry(
     """The alltoallv routing of one exchange.
 
     ``foreign_all[r]`` = rank r's foreign positions (permuted-stream
-    coordinates, in its per-segment receive order).  Returns per rank
-    ``(send_indices, send_splits, recv_splits, recv_offsets)``: the send
-    payload rows grouped by receiver (receiver order), the per-receiver /
-    per-sender split sizes, and each receive position's flat offset in
-    the all_to_all output layout (cat over senders of [my rows from that
-    sender]).
+    coordinates, in its per-segment receive order).  The old implementation
+    rescanned every receiver's positions once per source rank.  Build the same
+    routing in two linear passes over each receiver instead.
     """
-    routing: list[tuple[list[int], list[int], list[int], list[int]]] = []
-    for r in range(cp_size):
-        send_indices: list[int] = []
-        send_splits = [0] * cp_size
-        for j in range(cp_size):
-            for p in foreign_all[j]:
-                if p // shard_len == r:
-                    send_indices.append(p % shard_len)
-                    send_splits[j] += 1
-        recv_splits = [0] * cp_size
-        for p in foreign_all[r]:
-            recv_splits[p // shard_len] += 1
-        starts = [0]
-        for n in recv_splits:
-            starts.append(starts[-1] + n)
+    send_indices: list[list[int]] = [[] for _ in range(cp_size)]
+    send_splits: list[list[int]] = [[0] * cp_size for _ in range(cp_size)]
+    recv_splits_all: list[list[int]] = []
+    recv_offsets_all: list[list[int]] = []
+
+    for dst, positions in enumerate(foreign_all):
+        counts = [0] * cp_size
+        for p in positions:
+            src = p // shard_len
+            send_indices[src].append(p % shard_len)
+            send_splits[src][dst] += 1
+            counts[src] += 1
+
+        starts = [0] * cp_size
+        total = 0
+        for src, n in enumerate(counts):
+            starts[src] = total
+            total += n
+
         seen = [0] * cp_size
         recv_offsets: list[int] = []
-        for p in foreign_all[r]:
-            o = p // shard_len
-            recv_offsets.append(starts[o] + seen[o])
-            seen[o] += 1
-        routing.append((send_indices, send_splits, recv_splits, recv_offsets))
-    return routing
+        for p in positions:
+            src = p // shard_len
+            recv_offsets.append(starts[src] + seen[src])
+            seen[src] += 1
+
+        recv_splits_all.append(counts)
+        recv_offsets_all.append(recv_offsets)
+
+    return [
+        (send_indices[r], send_splits[r], recv_splits_all[r], recv_offsets_all[r])
+        for r in range(cp_size)
+    ]
 
 
 def _row_order(rows: list[int], *, rank: int, shard_len: int) -> tuple[list[int], int]:
@@ -251,28 +258,50 @@ def _build_exchange_plan(row, device) -> ExchangePlan:
 
 
 def _container_slots(segs_all, seg_blocks_all, *, ratio: int):
-    """The ``(doc_start, block) -> container slot`` map and the uniform
-    container width ``max_kept``.
+    """Build dense first-owner slots for compressed document blocks.
 
-    A rank's kept blocks fill the leading slots of its padded container
-    (per segment the plan blocks after the strip — the borrow-source
-    blocks are dropped); ownership follows the start-owner rule (the
-    first rank claiming a block).  The container width is uniform
-    (``max_kept``) so every rank's container is a valid ``S(1)`` shard of
-    the all-gathered ``[cp * max_kept, D]``, and a block's slot is
-    ``owner * max_kept + local_offset``.
+    The previous tuple-key dictionary performed a Python hash lookup for every
+    compressed block (about 262K entries at 1M tokens with ratio=4).  Document
+    starts are already stable identities, so assign each document a dense block
+    range and keep first-owner/local-offset state in flat Python lists instead.
     """
-    local: dict[tuple[int, int], tuple[int, int]] = {}
+    doc_nblocks: dict[int, int] = {}
+    for segs, blocks in zip(segs_all, seg_blocks_all, strict=True):
+        for seg, (_A, block_end, _strip) in zip(segs, blocks, strict=True):
+            nblocks = max(block_end // ratio, seg[2] // ratio)
+            if nblocks > doc_nblocks.get(seg[0], 0):
+                doc_nblocks[seg[0]] = nblocks
+
+    doc_base: dict[int, int] = {}
+    total_blocks = 0
+    for doc, nblocks in doc_nblocks.items():
+        doc_base[doc] = total_blocks
+        total_blocks += nblocks
+
+    owner = [-1] * total_blocks
+    local_offset = [0] * total_blocks
     max_kept = 0
     for rr, (segs, blocks) in enumerate(zip(segs_all, seg_blocks_all, strict=True)):
         off = 0
         for seg, (A, block_end, strip) in zip(segs, blocks, strict=True):
-            for b in range(A // ratio + strip, block_end // ratio):
-                local.setdefault((seg[0], b), (rr, off))
+            b0 = A // ratio + strip
+            b1 = block_end // ratio
+            if b1 <= b0:
+                continue
+            base = doc_base[seg[0]]
+            for b in range(b0, b1):
+                idx = base + b
+                if owner[idx] < 0:
+                    owner[idx] = rr
+                    local_offset[idx] = off
                 off += 1
         max_kept = max(max_kept, off)
-    slots = {(doc, b): owner * max_kept + off for (doc, b), (owner, off) in local.items()}
-    return slots, max_kept
+
+    slots = [-1] * total_blocks
+    for i, block_owner in enumerate(owner):
+        if block_owner >= 0:
+            slots[i] = block_owner * max_kept + local_offset[i]
+    return slots, doc_base, max_kept
 
 
 def _assemble_window_plan(
@@ -327,7 +356,6 @@ def _assemble_block_plan(
     rows: list[int] = []
     for seg, (A, block_end, _strip) in zip(segs, my_blocks, strict=True):
         rows += docs[seg[0]][A:block_end]
-    block_total = len(rows)
     order, n_foreign = _row_order(rows, rank=rank, shard_len=shard_len)
     # The plan blocks of one rank never overlap, so every foreign row is
     # received exactly once (the recv_offsets length is the receive count).
@@ -354,8 +382,12 @@ def _assemble_block_plan(
     rem = [seg[2] % ratio for seg in segs]
     cu_cmp_t = torch.tensor([0, *cu_cmp], dtype=torch.int32, device=device).cumsum(0, dtype=torch.int32)
     # ---- compressed-level gather: ownership + assembly ----
-    slots, max_kept = _container_slots(segs_all, seg_blocks_all, ratio=ratio)
-    cmp_k_global_gather_indices = [slots[(seg[0], b)] for seg in segs for b in range(seg[2] // ratio)]
+    slots, doc_base, max_kept = _container_slots(segs_all, seg_blocks_all, ratio=ratio)
+    cmp_k_global_gather_indices = [
+        slots[doc_base[seg[0]] + b]
+        for seg in segs
+        for b in range(seg[2] // ratio)
+    ]
     return CompressedBlockLayout(
         cu_seqlens_cmp_k=cu_cmp_t,
         block_remainder=torch.tensor(rem, dtype=torch.int32, device=device),
@@ -390,12 +422,24 @@ def build_cp_plan(
     global_cu = global_varlen.cu_seq_q
     device = global_cu.device
     seq_len = int(global_cu[-1].item())
-    rearrange = (
-        load_balancer._generate_indices(restore=False).reshape(-1)
-        if load_balancer is not None
-        else torch.arange(seq_len, device=device)
-    )
-    restore = torch.argsort(rearrange)
+
+    if load_balancer is not None:
+        rearrange_indices = load_balancer._generate_indices(restore=False)
+        if rearrange_indices is None:
+            raise ValueError("load_balancer._generate_indices() returned None")
+        rearrange_indices = rearrange_indices.to(global_cu.dtype)
+        rearrange = rearrange_indices.reshape(-1)
+        # Invert the permutation once with O(S) scatter instead of running an
+        # O(S log S) argsort once per CP rank inside ``from_global``.
+        restore = torch.empty_like(rearrange)
+        restore[rearrange] = torch.arange(seq_len, dtype=rearrange.dtype, device=device)
+        restore_indices = restore.view_as(rearrange_indices)
+    else:
+        rearrange_indices = None
+        restore_indices = None
+        rearrange = torch.arange(seq_len, dtype=global_cu.dtype, device=device)
+        restore = rearrange
+
     varlens = [
         CPVarlenMetadata.from_global(
             # The ``_RankMesh`` shim implements the ``DeviceMesh`` contract
@@ -405,6 +449,8 @@ def build_cp_plan(
             1,
             seq_len,
             load_balancer,
+            precomputed_rearrange_indices=rearrange_indices,
+            precomputed_restore_indices=restore_indices,
         )
         for r in range(cp_size)
     ]
@@ -413,11 +459,12 @@ def build_cp_plan(
     # The full permuted document slices, keyed by the segment's doc
     # identity (the permuted doc start): every row a plan consumes — the
     # window range or the plan blocks — is a slice of one document's slice.
+    restore_host = restore.tolist()
+    global_cu_host = global_cu.tolist()
     docs: dict[int, list[int]] = {}
-    for d in range(len(global_cu) - 1):
-        d0, d1 = int(global_cu[d].item()), int(global_cu[d + 1].item())
+    for d0, d1 in zip(global_cu_host[:-1], global_cu_host[1:], strict=True):
         if d1 > d0:
-            docs[int(restore[d0].item())] = restore[d0:d1].tolist()
+            docs[restore_host[d0]] = restore_host[d0:d1]
 
     # ---- the window plan (ratio-independent) ----
     win_foreign: list[list[int]] = [[] for _ in range(cp_size)]
@@ -476,7 +523,7 @@ def build_cp_plan(
 #
 # A plain ``Configurable`` (no learnable state): one instance on the
 # ``Attention`` (the window gather of the post-RoPE ``swa_k`` rows) and one
-# per ``Compressor`` (the block gather of the projected kv/score rows),
+# per ``Compressor`` (the block gather of kv/score),
 # wired to the CP mesh by their owners' ``parallelize``.  The two
 # plan-driven ops: ``gather`` (a local gather without an exchange — the
 # plan's ``gather_indices`` over the local stream; a remote gather +
