@@ -97,7 +97,20 @@ def test_upstream_dispatcher_config_rejects_absorption_option():
 def test_standard_dispatchers_reuse_torchtitan_helpers():
     assert issubclass(LocalTokenDispatcher, dispatcher_patch.TorchTitanLocalTokenDispatcher)
     assert issubclass(AllToAllTokenDispatcher, dispatcher_patch.TorchTitanAllToAllTokenDispatcher)
-    assert LocalTokenDispatcher._local_reorder is dispatcher_patch.TorchTitanLocalTokenDispatcher._local_reorder
+    # Patch override: _local_reorder swaps the stable argsort for the
+    # compile-friendly one-hot stable-rank formulation (aten sort kernels do
+    # not survive dynamo fake-eval under the spmd_types stack), so assert
+    # behavioral equivalence with the upstream helper instead of identity.
+    fake_self = SimpleNamespace(num_experts=4, top_k=2)
+    x_TD = torch.randn(8, 3)
+    scores_TK = torch.rand(8, 2)
+    expert_ids_TK = torch.tensor([[3, 1], [0, 0], [2, 1], [1, 3], [0, 2], [3, 3], [1, 0], [2, 2]])
+    upstream = dispatcher_patch.TorchTitanLocalTokenDispatcher._local_reorder(
+        fake_self, x_TD, scores_TK, expert_ids_TK
+    )
+    patched = LocalTokenDispatcher._local_reorder(fake_self, x_TD, scores_TK, expert_ids_TK)
+    for got, want in zip(patched, upstream, strict=True):
+        torch.testing.assert_close(got, want)
     assert (
         AllToAllTokenDispatcher._token_count_exchange
         is dispatcher_patch.TorchTitanAllToAllTokenDispatcher._token_count_exchange

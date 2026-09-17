@@ -12,7 +12,13 @@ from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.moe import MoE
 
-from .attention import DeepSeekV41Attention, V41AttentionContext, V41CompressionSpec
+from . import attention as _v41_attention
+from .attention import (
+    DeepSeekV41Attention,
+    V41AttentionContext,
+    V41CompressionSpec,
+    V41SharedInputs,
+)
 from .mhc import HcPost, HcPre, _make_identity_pre_mix
 
 
@@ -52,28 +58,36 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         *,
         pre_mix: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shared: V41SharedInputs | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, tuple]:
         if pre_mix is None:
             pre_mix = _make_identity_pre_mix(x, self.hc_attn_pre.hc_mult)
-        if self.compression_plan is None or self.attention_context is None:
-            raise RuntimeError("V4.1 block requires a compression plan and per-forward attention context")
+        if _v41_attention._SHARED_INPUTS and shared is None:
+            raise RuntimeError("V4.1 block requires per-forward shared inputs (V41SharedInputs)")
 
         residual = x
         x, post, comb, attn_pre = self.hc_attn_pre.forward_with_pre_mix(x, pre_mix)
-        x = self.attention(
-            self.attention_norm(x),
-            attention_masks,
-            positions,
-            layer_id=self.layer_id,
-            plan=self.compression_plan,
-            context=self.attention_context,
-        )
+        published = None
+        if _v41_attention._SHARED_INPUTS:
+            assert shared is not None
+            x, published = self.attention(self.attention_norm(x), attention_masks, positions, shared=shared)
+        else:
+            x = self.attention(
+                self.attention_norm(x),
+                attention_masks,
+                positions,
+                layer_id=self.layer_id,
+                plan=self.compression_plan,
+                context=self.attention_context,
+            )
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
         x, post, comb, ffn_pre = self.hc_ffn_pre.forward_with_pre_mix(x, attn_pre)
         x = self.moe(self.ffn_norm(x), input_ids=input_ids, image_mask=image_mask)
         x = self.hc_post(x, residual, post, comb)
+        if _v41_attention._SHARED_INPUTS:
+            return x, ffn_pre, published  # pyrefly: ignore [bad-return]
         return x, ffn_pre
 
     def collapse_pre_mix(self, x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:

@@ -16,6 +16,7 @@ the per-forward shared state in :class:`V41AttentionContext` (reset by
 the model at every forward; never carried across batches).
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -101,13 +102,64 @@ def build_v41_compression_spec(
     )
 
 
+_SHARED_INPUTS = os.environ.get("TTNPU_V41_SHARED_INPUTS", "0") == "1"
+"""Select the shared-inputs dataflow for cross-layer state.
+
+The eager default keeps the historical context side-channel (the block
+boundary stays free of the published tensors, preserving the recorded
+loss trajectories bit-for-bit); ``_apply_compile_v41`` switches to the
+shared-inputs flow, which is what whole-graph compilation traces (the
+per-layer bundles arrive as forward arguments and stay correct under
+activation-checkpoint recompute).
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class V41SharedInputs:
+    """Per-layer shared inputs resolved by the model outside the compiled region.
+
+    Replaces the in-forward ``layer_id``/plan role resolution: every field is
+    a tensor, ``None`` or a role-level constant, so layers sharing a topology
+    role share one compiled graph.
+    """
+
+    kv: Any | None = None
+    """Compressed KV published by the latest KV source at or below this layer."""
+
+    index_key: Any | None = None
+    """Indexer key published by the latest index source strictly below this layer."""
+
+    index_key_ratio: int = 1
+    """Ratio of the index source owning ``index_key`` (external-key override)."""
+
+    topk: Any | None = None
+    """Materialized top-k published by the latest index source at or below this layer."""
+
+    candidates: Any | None = None
+    """Candidate block mask (only layers after the candidate source)."""
+
+    compute_candidates: bool = False
+    """Whether this layer owns the candidate selection (the candidate source)."""
+
+    active_ratio: int = 1
+    """Ratio of the consumed KV source (the layer's own ratio when it consumes none)."""
+
+    candidate_topk_blocks: int = 0
+    """Candidate selection budget; resolved from the model spec (never defaulted)."""
+
+    candidate_block_size: int = 0
+    """Candidate block size; resolved from the model spec (never defaulted)."""
+
+
 @dataclass(slots=True)
 class V41AttentionContext:
-    """Per-forward shared state for V4.1 compression and index stages.
+    """Model-side shared-state records for V4.1 compression and index stages.
 
-    The model resets it before every forward; layers publish their
-    compressed KV / index keys / materialized top-k and consumers resolve
-    the most recent source at or below their layer id.
+    The model resets it before every forward, resolves each layer's
+    :class:`V41SharedInputs` from the records and absorbs the values the
+    layer returned.  Blocks no longer read or write this object inside the
+    compiled region: shared inputs arrive as forward arguments, which stay
+    correct under activation-checkpoint recompute.
     """
 
     compressed_kv: dict[int, Any]
@@ -124,6 +176,22 @@ class V41AttentionContext:
         self.index_keys.clear()
         self.topk_indices.clear()
         self.candidates = None
+
+    def absorb(self, layer_id: int, published: tuple[Any | None, ...]) -> None:
+        """Record the values a layer published via its forward return."""
+        cmp_k, index_key, topk, candidates = published
+        if cmp_k is not None:
+            self.compressed_kv[layer_id] = cmp_k
+        if index_key is not None:
+            self.index_keys[layer_id] = index_key
+        if topk is not None:
+            self.topk_indices[layer_id] = topk
+        if candidates is not None:
+            self.candidates = candidates
+
+    def publish(self, layer_id: int, published: tuple[Any | None, ...]) -> None:
+        """Side-channel publish for the eager dataflow (alias of absorb)."""
+        self.absorb(layer_id, published)
 
     def put_source(
         self,
@@ -159,6 +227,31 @@ class V41AttentionContext:
             None if kv_source is None else self.compressed_kv.get(kv_source),
             None if index_source is None else self.index_keys.get(index_source),
             None if index_source is None else self.topk_indices.get(index_source),
+        )
+
+    def resolve_shared(self, spec: tuple) -> V41SharedInputs:
+        """Build the layer's shared inputs from the precomputed layer spec."""
+        (
+            kv_source,
+            index_source,
+            index_before,
+            after_candidate,
+            compute_candidates,
+            active_ratio,
+            index_key_ratio,
+            candidate_topk_blocks,
+            candidate_block_size,
+        ) = spec
+        return V41SharedInputs(
+            kv=None if kv_source is None else self.compressed_kv.get(kv_source),
+            index_key=None if index_before is None else self.index_keys.get(index_before),
+            index_key_ratio=index_key_ratio,
+            topk=None if index_source is None else self.topk_indices.get(index_source),
+            candidates=self.candidates if after_candidate else None,
+            compute_candidates=compute_candidates,
+            active_ratio=active_ratio,
+            candidate_topk_blocks=candidate_topk_blocks,
+            candidate_block_size=candidate_block_size,
         )
 
 
@@ -275,6 +368,9 @@ class DeepSeekV41Attention(BaseAttention):
         self.compressor = cfg.compressor.build() if cfg.compressor is not None else None
         self.indexer = cfg.indexer.build() if cfg.indexer is not None else None
         self.compressed_sparse_attention = cfg.compressed_sparse_attention.build()
+        # Layer id used to key the eager side-channel publishes (assigned by
+        # the model; only read on the un-compiled eager path).
+        self.publish_layer_id: int = -1
 
     @property
     def inner_attention(self):
@@ -313,7 +409,107 @@ class DeepSeekV41Attention(BaseAttention):
         swa_k = torch.cat([kv_nope, kv_rope], dim=-1)
         return swa_k
 
-    def _build_long_range_context(
+    def _build_long_range_context_shared(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        attention_masks,
+        positions: torch.Tensor,
+        *,
+        shared: V41SharedInputs,
+    ):
+        """Build the layer's materialized long-range inputs (CSA2 policy).
+
+        All layer-dependent roles resolve from module structure and the
+        model-resolved ``shared`` bundle -- nothing reads ``layer_id`` here,
+        so layers sharing a topology role share one compiled graph.  Returns
+        the long-range inputs plus the ``(cmp_k, idx_k, topk, candidates)``
+        tuple the model records for downstream layers.
+        """
+        cmp_k = None
+        compressor_latent = None
+        idx_q = idx_k = idx_w = None
+        shared_topk = None
+        published_candidates = None
+
+        # A KV source is exactly a layer that owns a compressor.
+        is_kv_source = self.compressor is not None
+        if not is_kv_source:
+            cmp_k = shared.kv
+            shared_topk = shared.topk
+        else:
+            if self.compressor is None:
+                raise ValueError("V4.1 KV source requires a compressor")
+            pooled, compressor_latent = self.compressor(
+                x,
+                attention_masks,
+                positions=positions,
+                return_pre_rope=True,
+            )
+            if self.compress_ratio == 1:
+                cmp_k = pooled
+            else:
+                cmp_k = pack_container(pooled, attention_masks.plans[self.compress_ratio])
+
+        # An index source is exactly a layer that owns an indexer.
+        if self.indexer is not None:
+            shared_index_k = shared.index_key
+            indexer_kwargs = {
+                "positions": positions,
+                "attention_masks": attention_masks,
+            }
+            if shared_index_k is not None:
+                indexer_kwargs["key_override"] = shared_index_k
+            if compressor_latent is not None:
+                indexer_kwargs["latent"] = compressor_latent
+            idx_q, idx_k, idx_w = self.indexer(
+                x.detach(),
+                qr.detach(),
+                **indexer_kwargs,
+            )
+
+            index_ratio = self.compress_ratio if shared_index_k is None else shared.index_key_ratio
+            index_plan = attention_masks.plans[index_ratio]
+            if index_plan.gather_indices is not None and shared_index_k is None:
+                idx_k = pack_container(idx_k, index_plan)
+
+            # The reference tier owns the materialized index layouts; V4.1
+            # explicitly materializes ratio 1.
+            ratio_layout = attention_masks.reference.ratios.get(index_ratio)
+            dense_mask = None if ratio_layout is None else ratio_layout.dense_mask
+            if dense_mask is None:
+                raise ValueError(f"V4.1 requires a materialized reference index mask for ratio={index_ratio}")
+
+            shared_topk, index_scores = Indexer.select(
+                idx_q,
+                idx_k,
+                idx_w,
+                dense_mask,
+                # index_topk is a required field on the sparse core and is set
+                # unconditionally in its __init__, so direct access fails
+                # loudly on a misconfigured module.
+                self.compressed_sparse_attention.inner_attention.index_topk,
+                candidate_mask=shared.candidates,
+            )
+            if shared.compute_candidates:
+                compress_lens = dense_mask.squeeze(1).sum(dim=-1)
+                published_candidates = select_candidate_blocks(
+                    index_scores,
+                    compress_lens,
+                    shared.candidate_topk_blocks,
+                    shared.candidate_block_size,
+                )
+
+        return {
+            "compressed_kv": cmp_k,
+            "index_q": idx_q,
+            "index_k": idx_k,
+            "index_weight": idx_w,
+            "sparse_indices": shared_topk,
+            "compress_ratio": shared.active_ratio,
+        }, (cmp_k, idx_k, shared_topk, published_candidates)
+
+    def _build_long_range_context_legacy(
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
@@ -446,7 +642,25 @@ class DeepSeekV41Attention(BaseAttention):
         o = o.reshape(bsz, seqlen, -1)
         return self.wo_b(o)
 
-    def forward(
+    def forward(  # pyrefly: ignore [bad-param-name-override]
+        self,
+        x,
+        attention_masks,
+        positions,
+        *,
+        layer_id: int | None = None,
+        plan: V41CompressionSpec | None = None,
+        context: V41AttentionContext | None = None,
+        shared: V41SharedInputs | None = None,
+    ):
+        """Dispatch on the dataflow: legacy (eager default) vs shared (compiled)."""
+        if _SHARED_INPUTS:
+            assert shared is not None
+            return self._forward_shared(x, attention_masks, positions, shared=shared)
+        assert layer_id is not None and plan is not None and context is not None
+        return self._forward_legacy(x, attention_masks, positions, layer_id=layer_id, plan=plan, context=context)
+
+    def _forward_legacy(
         self,
         x,
         attention_masks,
@@ -458,7 +672,7 @@ class DeepSeekV41Attention(BaseAttention):
     ):
         qr, q = self._project_q(x, positions)
         swa_k = self._project_window_kv(x, attention_masks, positions)
-        long_range = self._build_long_range_context(
+        long_range = self._build_long_range_context_legacy(
             x,
             qr,
             attention_masks,
@@ -469,3 +683,23 @@ class DeepSeekV41Attention(BaseAttention):
         )
         o = self._apply_sparse_attention(q, swa_k, long_range, attention_masks)
         return self._project_output(o, positions)
+
+    def _forward_shared(
+        self,
+        x,
+        attention_masks,
+        positions,
+        *,
+        shared: V41SharedInputs,
+    ):
+        qr, q = self._project_q(x, positions)
+        swa_k = self._project_window_kv(x, attention_masks, positions)
+        long_range, published = self._build_long_range_context_shared(
+            x,
+            qr,
+            attention_masks,
+            positions,
+            shared=shared,
+        )
+        o = self._apply_sparse_attention(q, swa_k, long_range, attention_masks)
+        return self._project_output(o, positions), published
