@@ -51,66 +51,23 @@ def dense_token_ids_sequence_parallel_placement():
     )
 
 
-def set_compressed_sparse_attention_sharding(wrapper_cfg) -> None:
+def set_inner_attention_sharding(inner_cfg) -> None:
+    """Placement for Attention Gym's ``selected_attention`` call."""
     q = dense_activation_placement(tp=spmd.S(2))
     replicated_activation = dense_activation_placement(tp=spmd.R)
 
-    input_shardings = {
+    placements = {
         "q": q,
         "swa_k": replicated_activation,
         "cmp_k": replicated_activation,
+        "topk_indices": replicated_activation,
         "attn_sink": _attn_sink_placement,
-        "idx_q": replicated_activation,
-        "idx_k": replicated_activation,
-        "idx_w": replicated_activation,
-        "sparse_indices": replicated_activation,
     }
-    output_shardings = dict(input_shardings)
-    for name in ("cmp_k", "idx_k"):
-        output_shardings[name] = dense_activation_placement(tp=spmd.R, cp=spmd.R)
-    grad_placements = [
-        q,
-        dense_activation_placement(tp=spmd.P),
-        dense_activation_placement(tp=spmd.P),
-        dense_activation_placement(tp=spmd.P),
-        dense_activation_placement(tp=spmd.P),
-        dense_activation_placement(tp=spmd.P),
-        _attn_sink_placement,
-    ]
-
-    from torchtitan.protocols.sharding import LocalMapConfig
-
-    wrapper_cfg.sharding_config = ShardingConfig(
-        in_src_shardings=input_shardings,
-        in_dst_shardings=output_shardings,
+    inner_cfg.sharding_config = ShardingConfig(
+        in_src_shardings=placements,
+        in_dst_shardings=placements,
         out_src_shardings=q,
         out_dst_shardings=q,
-    )
-
-    wrapper_cfg.inner_attention.sharding_config = ShardingConfig(
-        in_src_shardings={
-            "q": q,
-            "swa_k": replicated_activation,
-            "cmp_k": replicated_activation,
-            "idx_q": replicated_activation,
-            "idx_k": replicated_activation,
-            "idx_w": replicated_activation,
-            "sparse_indices": replicated_activation,
-            "attn_sink": _attn_sink_placement,
-        },
-        in_dst_shardings={
-            "q": q,
-            "swa_k": replicated_activation,
-            "cmp_k": replicated_activation,
-            "idx_q": replicated_activation,
-            "idx_k": replicated_activation,
-            "idx_w": replicated_activation,
-            "sparse_indices": replicated_activation,
-            "attn_sink": _attn_sink_placement,
-        },
-        out_src_shardings=q,
-        out_dst_shardings=q,
-        local_map=LocalMapConfig(in_grad_placements=tuple(grad_placements)),
     )
 
 
@@ -165,7 +122,7 @@ def set_v41_attention_sharding(attention_cfg, *, enable_sp: bool):
         state_shardings={"attn_sink": _attn_sink_placement},
     )
 
-    set_compressed_sparse_attention_sharding(at.compressed_sparse_attention)
+    set_inner_attention_sharding(at.inner_attention)
 
     at.wq_a.sharding_config = _replicate_weight
     at.q_norm.sharding_config = _replicate_weight
@@ -178,9 +135,9 @@ def set_v41_attention_sharding(attention_cfg, *, enable_sp: bool):
         state_shardings={"cache": _dense_param_rep},
     )
 
-    if at.compressor is not None:
+    if at.compressor.is_source:
         set_compressor_sharding(at.compressor)
-    if at.indexer is not None:
+    if at.indexer.is_source:
         set_indexer_sharding(at.indexer)
 
 
@@ -220,7 +177,7 @@ def set_v41_layer_sharding(layer_cfg, *, enable_sp: bool, enable_ep: bool) -> No
     ] = input_ids_dst_placement
 
 
-def set_deepseek_v41_sharding_config(
+def set_deepseek_v4_1_sharding_config(
     config,
     *,
     enable_sp: bool,

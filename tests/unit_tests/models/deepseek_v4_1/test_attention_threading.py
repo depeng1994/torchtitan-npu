@@ -1,0 +1,327 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""The V4.1 cross-layer attention state is threaded, not stored.
+
+The shared tensors (the compressed KV container, the index keys, the selected
+container slots, the indexer's student logits and the candidate pool) travel
+through the block and attention forward signatures.  These tests pin the
+producer -> consumer chain and the loud failure of a consumer that is handed
+nothing; the same path runs end to end in the 2-card integration case
+``dsv41_debugmodel_2p_ep2_fsdp2``.
+"""
+
+import importlib
+from dataclasses import replace
+
+import pytest
+import torch
+from torch.utils.checkpoint import DefaultDeviceType
+
+from tests.unit_tests.models.mtp_test_utils import build_cpu_model
+from torchtitan_npu.models.deepseek_v4_1 import (
+    V41_CANDIDATE_SOURCE_LAYER,
+    V41_FULL_INDEX_SOURCE_LAYERS,
+    V41_KV_SOURCE_LAYERS,
+)
+from torchtitan_npu.models.deepseek_v4_1.indexer import IndexerKLLoss
+
+_TOKENS = torch.arange(128).remainder(32).unsqueeze(0)
+_POSITIONS = torch.arange(128).unsqueeze(0)
+# Block return slots: (x, pre_mix, cmp_k, idx_k, topk_indices, topk_scores, candidates).
+_CMP_K, _IDX_K, _TOPK, _TOPK_SCORES, _CANDIDATES = 2, 3, 4, 5, 6
+
+
+def _tiny_debug_model(monkeypatch):
+    """The registered debug flavor at CPU-sized widths, entered through the registry."""
+    monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
+    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
+    monkeypatch.setattr(
+        registry,
+        "_DEBUG_WIDTHS",
+        replace(
+            registry._DEBUG_WIDTHS,
+            dim=8,
+            n_heads=2,
+            head_dim=8,
+            rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=4,
+            n_groups=1,
+            index_n_heads=2,
+            index_head_dim=4,
+            moe_inter_dim=16,
+            vision_dim=8,
+            vision_heads=2,
+            vision_inter_dim=16,
+        ),
+    )
+    config = registry.model_registry("deepseek_v4_1_debugmodel").model
+    config.vocab_size = config.tok_embeddings.num_embeddings = config.lm_head.out_features = 64
+    # The trainer's update_from_config fills the aux-loss denominators before the run.
+    for _, loss_cfg, _, _ in config.traverse(IndexerKLLoss.Config):
+        loss_cfg.global_batch_size = 1
+    with torch.random.fork_rng(devices=[]):
+        model = build_cpu_model(config)
+    return model, config
+
+
+def _record_module_forwards(model):
+    """Record each block's incoming/outgoing thread and the sparse core's inputs."""
+    blocks_in, blocks_out, cores_in, handles = {}, {}, {}, []
+    for name, layer in model.layers.items():
+
+        def record_block(module, args, kwargs, output, *, name=name):
+            blocks_in[name] = dict(kwargs)
+            blocks_out[name] = output
+
+        handles.append(layer.register_forward_hook(record_block, with_kwargs=True))
+
+        def record_core(module, args, kwargs, output, *, name=name):
+            cores_in[name] = (args[2], kwargs.get("topk_indices"))
+
+        handles.append(
+            layer.attention.inner_attention.register_forward_hook(record_core, with_kwargs=True)
+        )
+    return blocks_in, blocks_out, cores_in, handles
+
+
+def test_cross_layer_state_is_threaded_from_source_to_consumer(monkeypatch) -> None:
+    """Each consumer receives the object its source published, not a copy."""
+    model, _ = _tiny_debug_model(monkeypatch)
+    blocks_in, blocks_out, cores_in, handles = _record_module_forwards(model)
+    try:
+        _, _, kwargs = model.build_attention_masks(_TOKENS, _TOKENS, {"positions": _POSITIONS})
+        model(_TOKENS, **kwargs)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    # Window-only layers own no compressed KV and are handed none.
+    for name in ("0", "1"):
+        assert blocks_in[name]["cmp_k"] is None
+        assert blocks_out[name][_CMP_K] is None
+
+    # Layer 2 is the first KV/index source: it publishes, its group consumes the same objects.
+    first_container = blocks_out["2"][_CMP_K]
+    first_index_key = blocks_out["2"][_IDX_K]
+    first_selection = blocks_out["2"][_TOPK]
+    assert blocks_in["2"]["cmp_k"] is None
+    assert first_container is not None and first_index_key is not None and first_selection is not None
+    for name in ("3", "4", "5", "6", "7"):
+        assert blocks_in[name]["cmp_k"] is first_container
+        assert blocks_in[name]["idx_k"] is first_index_key
+        assert blocks_in[name]["topk_indices"] is first_selection
+        assert blocks_out[name][_CMP_K] is first_container
+
+    # A source supersedes what is in flight: each group's source receives the previous
+    # group's container and publishes its own, which its own group then consumes.
+    for source, group in (("8", ("9", "10", "11", "12", "13")), ("14", ("15", "16", "17", "18", "19"))):
+        assert blocks_in[source]["cmp_k"] is not None
+        group_container = blocks_out[source][_CMP_K]
+        assert group_container is not first_container
+        for name in group:
+            assert blocks_in[name]["cmp_k"] is group_container
+            assert blocks_out[name][_CMP_K] is group_container
+
+    # The ratio-1 group shares the layer-20 global-KV container through to the last layer.
+    container = blocks_out["20"][_CMP_K]
+    assert blocks_in["20"]["cmp_k"] is not container
+    for name in (str(layer_id) for layer_id in range(21, 40)):
+        assert blocks_in[name]["cmp_k"] is container
+        assert blocks_out[name][_CMP_K] is container
+
+    # A re-indexing layer returns the shared keys unchanged and publishes a fresh selection.
+    shared_index_key = blocks_out["20"][_IDX_K]
+    shared_selection = blocks_out["20"][_TOPK]
+    for name in ("21", "22", "23"):
+        assert blocks_in[name]["idx_k"] is shared_index_key
+        assert blocks_in[name]["topk_indices"] is shared_selection
+    assert blocks_in["24"]["idx_k"] is shared_index_key
+    assert blocks_out["24"][_IDX_K] is shared_index_key
+    reselected = blocks_out["24"][_TOPK]
+    assert reselected is not shared_selection
+    for name in ("25", "26", "27"):
+        assert blocks_in[name]["idx_k"] is shared_index_key
+        assert blocks_in[name]["topk_indices"] is reselected
+
+    # The candidate pool is built once, at layer 20, and reaches the layers inside its window.
+    pool = blocks_out["20"][_CANDIDATES]
+    assert pool is not None
+    for name in ("21", "22", "23"):
+        assert blocks_out[name][_CANDIDATES] is pool
+    for name in ("24", "28", "32", "36", "39"):
+        assert blocks_in[name]["candidates"] is pool
+        assert blocks_out[name][_CANDIDATES] is pool
+
+    # The distillation loss attaches to every layer that consumes a selection, so the
+    # index source publishes the student logits and its group scores the same tensor
+    # against its own attention mass; the window-only layers own none.
+    for name in ("0", "1"):
+        assert blocks_in[name]["topk_scores"] is None
+        assert blocks_out[name][_TOPK_SCORES] is None
+    source_scores = blocks_out["2"][_TOPK_SCORES]
+    assert source_scores is not None
+    for name in ("3", "4", "5", "6", "7"):
+        assert blocks_in[name]["topk_scores"] is source_scores
+        assert blocks_out[name][_TOPK_SCORES] is source_scores
+    shared_scores = blocks_out["20"][_TOPK_SCORES]
+    assert shared_scores is not None
+    assert blocks_in["24"]["topk_scores"] is shared_scores
+
+    # The sparse core receives the threaded objects themselves.
+    core_container, core_selection = cores_in["0"]
+    assert core_container is None and core_selection is None
+    core_container, core_selection = cores_in["4"]
+    assert core_container is first_container
+    assert core_selection is first_selection
+    core_container, core_selection = cores_in["21"]
+    assert core_container is container
+    assert core_selection is shared_selection
+    core_container, core_selection = cores_in["30"]
+    assert core_container is container
+    assert core_selection is blocks_out["28"][_TOPK]
+
+
+def test_candidate_pool_reaches_only_its_window_indexers(monkeypatch) -> None:
+    """The pool built at layer 20 is the mask the later indexers actually select with."""
+    model, _ = _tiny_debug_model(monkeypatch)
+    indexer_module = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.indexer")
+    registered_forward = indexer_module.Indexer.forward
+    observed_masks = []
+
+    def record_forward(self, x, qr, positions, attention_masks, **kwargs):
+        observed_masks.append(kwargs.get("candidates"))
+        return registered_forward(self, x, qr, positions, attention_masks, **kwargs)
+
+    monkeypatch.setattr(indexer_module.Indexer, "forward", record_forward)
+    _, _, kwargs = model.build_attention_masks(_TOKENS, _TOKENS, {"positions": _POSITIONS})
+    with torch.no_grad():
+        model(_TOKENS, **kwargs)
+
+    # One call per layer, in layer order: the pool is built at layer 20 and reaches
+    # every later layer, whatever role that layer plays.
+    assert len(observed_masks) == len(model.layers)
+    pool_source = V41_CANDIDATE_SOURCE_LAYER
+    assert all(mask is None for mask in observed_masks[: pool_source + 1])
+    pool = observed_masks[pool_source + 1]
+    assert pool is not None
+    assert all(mask is pool for mask in observed_masks[pool_source + 1 :])
+
+
+def test_metadata_document_ids_restart_per_packed_document(monkeypatch) -> None:
+    """The only varlen metadata is a document id per token, derived from the positions."""
+    model, _ = _tiny_debug_model(monkeypatch)
+    positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3, 0, 1]], dtype=torch.long)
+
+    metadata = model.get_attention_masks(positions)
+
+    # torch.cumsum promotes the int32 input, so the document ids come back int64.
+    torch.testing.assert_close(
+        metadata.doc_ids_BL,
+        torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1, 2, 2]], dtype=torch.int64),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_weightless_compressor_passes_the_container_through(monkeypatch) -> None:
+    """Every layer compresses; a non-source one holds no weights and returns its input."""
+    model, config = _tiny_debug_model(monkeypatch)
+    kv_sources = set(V41_KV_SOURCE_LAYERS)
+    for layer_id, layer in model.layers.items():
+        compressor = layer.attention.compressor
+        assert compressor.is_source == (int(layer_id) in kv_sources)
+        if int(layer_id) not in kv_sources:
+            assert not list(compressor.parameters())
+
+    # A window-only layer owns nothing and is handed nothing.
+    returned, latent = model.layers["0"].attention.compressor(torch.zeros(1, 128, config.dim), _POSITIONS)
+    assert returned is None
+    assert latent is None
+
+    # A reuse layer hands back the very container it was given, with no latent.
+    handed = torch.zeros(1, 64, config.layers[3].attention.head_dim)
+    returned, latent = model.layers["3"].attention.compressor(
+        torch.zeros(1, 128, config.dim),
+        _POSITIONS,
+        handed,
+    )
+    assert returned is handed
+    assert latent is None
+
+
+def test_student_logits_are_training_only(monkeypatch) -> None:
+    """Inference skips the gather-and-score half: no loss consumes it there."""
+    model, _ = _tiny_debug_model(monkeypatch)
+    blocks_in, blocks_out, _, handles = _record_module_forwards(model)
+    try:
+        _, _, kwargs = model.build_attention_masks(_TOKENS, _TOKENS, {"positions": _POSITIONS})
+        model.eval()
+        with torch.no_grad():
+            model(_TOKENS, **kwargs)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert blocks_in["2"]["topk_scores"] is None
+    for output in blocks_out.values():
+        assert output[_TOPK_SCORES] is None
+
+
+def test_weightless_indexer_passes_the_selection_through(monkeypatch) -> None:
+    """Every layer indexes; a reuse layer holds no weights and returns its inputs."""
+    model, config = _tiny_debug_model(monkeypatch)
+    index_sources = set(V41_FULL_INDEX_SOURCE_LAYERS)
+    for layer_id, layer in model.layers.items():
+        indexer = layer.attention.indexer
+        assert indexer.is_source == (int(layer_id) in index_sources)
+        if int(layer_id) not in index_sources:
+            assert not list(indexer.parameters())
+
+    hidden = torch.zeros(1, 128, config.dim)
+    qr = torch.zeros(1, 128, config.layers[0].attention.q_lora_rank)
+
+    # A window-only layer owns nothing and is handed nothing.
+    assert model.layers["0"].attention.indexer(hidden, qr, _POSITIONS, None) == (None, None, None, None)
+
+    # A reuse layer hands back the very tensors it was given.
+    shared_key = torch.zeros(1, 64, config.layers[4].attention.indexer.index_head_dim)
+    shared_selection = torch.zeros(1, 128, 4, dtype=torch.long)
+    returned = model.layers["4"].attention.indexer(
+        hidden,
+        qr,
+        _POSITIONS,
+        None,
+        idx_k=shared_key,
+        topk_indices=shared_selection,
+    )
+    assert returned[0] is shared_key
+    assert returned[1] is shared_selection
+    assert returned[2] is None
+    assert returned[3] is None
+
+
+def test_reuse_layer_without_the_shared_tensor_fails_loudly(monkeypatch) -> None:
+    """A consumption contract that is not met is an error, not a silent empty reuse."""
+    model, config = _tiny_debug_model(monkeypatch)
+    _, _, kwargs = model.build_attention_masks(_TOKENS, _TOKENS, {"positions": _POSITIONS})
+    attention_masks = kwargs["attention_masks"]
+    hidden = torch.zeros(1, _TOKENS.shape[1], config.dim)
+
+    # A layer that reuses the compressed KV must be handed one.
+    with pytest.raises(AssertionError, match="reuses the compressed KV"):
+        model.layers["3"].attention(hidden, _POSITIONS, attention_masks)
+
+    # A re-indexing layer must be handed the shared index keys; its compressed KV is
+    # already in flight, so only the key is missing.
+    head_dim = config.layers[24].attention.head_dim
+    with pytest.raises(AssertionError, match="re-indexing layer"):
+        model.layers["24"].attention(
+            hidden,
+            _POSITIONS,
+            attention_masks,
+            cmp_k=torch.zeros(1, _TOKENS.shape[1], head_dim),
+        )

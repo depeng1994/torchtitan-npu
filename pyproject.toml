@@ -7,7 +7,7 @@ name = "torchtitan-npu"
 version = "0.1.0"
 description = "Ascend NPU overrides for torchtitan"
 requires-python = ">=3.12"
-dependencies = ["torchtitan", "torch-npu"]
+dependencies = ["torchtitan", "torch-npu", "attn-gym==0.0.9"]
 
 [tool.setuptools.packages.find]
 include = ["torchtitan_npu*"]
@@ -25,6 +25,8 @@ markers = [
 [tool.pyrefly]
 project-excludes = ["**/tests/**", "CI", "torchtitan_npu/ops/pypto", "torchtitan_npu/ops/triton", "scripts"]
 ignore-missing-imports = [
+    "attn_gym",
+    "attn_gym.*",
     "torchao.*",
     "torchao_npu.*",
     "torchft",
@@ -94,7 +96,7 @@ max-line-length = 120
 
 [tool.ruff.lint.isort]
 known-first-party = ["torchtitan_npu", "tests"]
-known-third-party = ["torchtitan"]
+known-third-party = ["attn_gym", "torchtitan"]
 
 [tool.ruff.format]
 quote-style = "double"

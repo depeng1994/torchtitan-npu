@@ -52,6 +52,10 @@ git -C "${TORCHTITAN_DIR}" checkout --detach --quiet "${TORCHTITAN_COMMIT}"
 
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir -e "${TORCHTITAN_DIR}"
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir -e "${PROJECT_ROOT}"
+
+# The image predates wheels added to requirements.txt; install only the missing wheel,
+# never the whole file, whose torch/torch_npu pins differ from the image build.
+"${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir attn-gym==0.0.9
 "${PYTHON_BIN}" -c 'import torchtitan, torchtitan_npu'
 
 export MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}"

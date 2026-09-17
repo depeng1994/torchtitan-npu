@@ -16,11 +16,11 @@ V4_MODULE = re.compile(r"torchtitan_npu\.(?:models|override)\.deepseek_v4(?:\b|\
 
 
 def test_v41_package_has_no_v4_references():
-    paths = list((REPO / "torchtitan_npu/models/deepseek_v41").rglob("*.py"))
-    paths += list((REPO / "tests/unit_tests/models/deepseek_v41").rglob("*.py"))
+    paths = list((REPO / "torchtitan_npu/models/deepseek_v4_1").rglob("*.py"))
+    paths += list((REPO / "tests/unit_tests/models/deepseek_v4_1").rglob("*.py"))
     paths += [
-        REPO / "tests/integration_tests/deepseek_v41.py",
-        REPO / "examples/deepseek_v41/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh",
+        REPO / "tests/integration_tests/deepseek_v4_1.py",
+        REPO / "examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh",
     ]
     for path in paths:
         if path == Path(__file__):
@@ -88,14 +88,17 @@ sys.meta_path.insert(0, Blocker())
 from dataclasses import replace
 import importlib
 import torch
-registry = importlib.import_module("torchtitan_npu.models.deepseek_v41.model_registry")
+registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
 registry._DEBUG_WIDTHS = replace(
     registry._DEBUG_WIDTHS, dim=8, n_heads=2, head_dim=8, rope_head_dim=4,
     q_lora_rank=8, o_lora_rank=4, n_groups=1, index_n_heads=2,
     index_head_dim=4, moe_inter_dim=16, vision_dim=8, vision_heads=2, vision_inter_dim=16,
 )
-cfg = registry.model_registry("deepseek_v41_debugmodel").model
+cfg = registry.model_registry("deepseek_v4_1_debugmodel").model
 cfg.vocab_size = cfg.tok_embeddings.num_embeddings = cfg.lm_head.out_features = 64
+from torchtitan_npu.models.deepseek_v4_1.indexer import IndexerKLLoss
+for _, loss_cfg, _, _ in cfg.traverse(IndexerKLLoss.Config):
+    loss_cfg.global_batch_size = 1
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 model = build_cpu_model(cfg)
 tokens = torch.arange(128).remainder(32).unsqueeze(0)
@@ -117,7 +120,7 @@ import sys
 import torch.nn.functional as functional
 v4 = importlib.import_module("torchtitan_npu.models.deepseek_v4")
 moe = importlib.import_module("torchtitan.models.common.moe")
-assert "torchtitan_npu.models.deepseek_v41" not in sys.modules
+assert "torchtitan_npu.models.deepseek_v4_1" not in sys.modules
 
 def identities():
     return (v4.attention.Attention, v4.attention.Attention.forward,
@@ -132,8 +135,8 @@ def config_contract():
             for layer in cfg.layers]
 
 before, config_before = identities(), config_contract()
-v41 = importlib.import_module("torchtitan_npu.models.deepseek_v41")
-v41.model_registry("deepseek_v41_debugmodel")
+v41 = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
+v41.model_registry("deepseek_v4_1_debugmodel")
 assert identities() == before
 assert config_contract() == config_before
 """)

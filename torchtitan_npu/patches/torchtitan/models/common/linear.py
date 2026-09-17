@@ -26,6 +26,9 @@ class BatchedLinear(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.out_features = config.out_features
+        # Upstream names this count ``n_batches``; the config keeps the ``n_heads`` name
+        # the model builders use, so expose both.
+        self.n_batches = config.n_heads
         self.weight = nn.Parameter(
             torch.empty(
                 config.n_heads * config.out_features,

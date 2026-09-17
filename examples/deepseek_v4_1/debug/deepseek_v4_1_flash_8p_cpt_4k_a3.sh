@@ -6,10 +6,10 @@
 
 # Run this script on a single node.
 # Append CLI arguments to override the defaults below:
-#   ./examples/deepseek_v41/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh --training.steps 5
-# USE_GOLDEN=1 is the only currently supported operator path. USE_GOLDEN=0
-# (AscendC) is rejected until the ratio-1 shared/global-KV contract is
-# implemented by the fused sparse-attention kernels.
+#   ./examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh --training.steps 5
+# The eager/reference operator path is what V4.1 runs: the AscendC fused
+# sparse-attention kernels do not yet accept the ratio-1 shared/global-KV
+# contract of CSA2 layers 20-39.
 
 set -euo pipefail
 
@@ -17,8 +17,8 @@ NGPU="${NGPU:-8}"
 WORLD_SIZE="${NGPU}"
 
 # Model
-MODULE="${MODULE:-torchtitan_npu.models.deepseek_v41}"
-CONFIG="${CONFIG:-deepseek_v41_flash_40layers_16experts_vision}"
+MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4_1}"
+CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_16experts_vision}"
 
 # Dataloader & Checkpoint
 DATASET="${DATASET:-c4_test}"
@@ -43,14 +43,6 @@ GBS=8
 STEPS=40
 
 # Debug
-export USE_GOLDEN="${USE_GOLDEN:-1}"
-if [[ "${USE_GOLDEN}" != "1" ]]; then
-    echo "FATAL: DeepSeek-V4.1 currently supports the golden/reference path only."
-    echo "The AscendC sparse-attention path does not yet accept the V4.1"
-    echo "ratio-1 shared global KV contract (CSA2 layer 20-39)."
-    echo "Set USE_GOLDEN=1 (default) or unset USE_GOLDEN."
-    exit 2
-fi
 DEBUG_ARGS="
     --debug.no-moe-force-load-balance
     --debug.print-config

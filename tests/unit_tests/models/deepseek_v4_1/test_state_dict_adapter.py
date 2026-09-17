@@ -7,14 +7,14 @@
 
 import torch
 
-from torchtitan_npu.models.deepseek_v41.model_registry import deepseek_v41_debugmodel_config
-from torchtitan_npu.models.deepseek_v41.state_dict_adapter import DeepSeekV41StateDictAdapter
-from torchtitan_npu.models.deepseek_v41.vision_state_dict import DeepSeekV41VisionStateDictAdapter
+from torchtitan_npu.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_config
+from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
+from torchtitan_npu.models.deepseek_v4_1.vision_state_dict import DeepSeekV41VisionStateDictAdapter
 
 
 def _build_model_config():
     """A minimal local V4.1 fixture (the debugmodel topology, tiny widths)."""
-    config = deepseek_v41_debugmodel_config()
+    config = deepseek_v4_1_debugmodel_config()
     config.vocab_size = 32
     config.tok_embeddings.num_embeddings = 32
     config.lm_head.out_features = 32

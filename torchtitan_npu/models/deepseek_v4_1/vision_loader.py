@@ -8,11 +8,29 @@ import torch
 from torch.utils.data import IterableDataset
 from torchtitan.components.dataloader import ParallelAwareDataloader
 
-from torchtitan_npu.models.deepseek_v41.vision_data import (
+from torchtitan_npu.models.deepseek_v4_1.vision_data import (
     ImagePatchProcessor,
     build_image_token_layout,
     build_shifted_labels,
 )
+
+
+def _validate_document_alignment(seq_len: int, document_alignment: int) -> None:
+    """Check that every emitted document sits on the pooling grid.
+
+    Each row this dataset emits is one document, so the row edge is the document
+    edge a compressed-attention pool of k tokens must not straddle: the row
+    length has to be a multiple of k.  A row cannot be padded after it is cut,
+    so the requirement is checked when the dataset is built.
+    """
+    if document_alignment < 1:
+        raise ValueError("document_alignment must be positive")
+    if seq_len % document_alignment != 0:
+        raise ValueError(
+            f"seq_len ({seq_len}) must be a multiple of document_alignment "
+            f"({document_alignment}): every row is one document, so the row edge "
+            "is the document edge the compressed-attention pool must not straddle."
+        )
 
 
 class _SyntheticVisionDataset(IterableDataset):
@@ -26,8 +44,11 @@ class _SyntheticVisionDataset(IterableDataset):
         image_paths: tuple[str, ...] = (),
         tokenizer_path: str | None = None,
         text: str = "Describe the image.",
+        document_alignment: int = 1,
     ):
+        _validate_document_alignment(seq_len, document_alignment)
         self.vocab_size = vocab_size
+        self.document_alignment = document_alignment
         self.seq_len = seq_len
         self.patch_count = patch_count
         self.span_start = span_start
@@ -104,6 +125,13 @@ class DeepSeekV41SyntheticVisionDataLoader(ParallelAwareDataloader):
         tokenizer_path: str | None = None
         text: str = "Describe the image."
         infinite: bool = True
+        document_alignment: int = 1
+        """Multiple every emitted document (row) must be aligned to.
+
+        Each row of this loader is a single document, so a model that pools k
+        consecutive tokens needs ``seq_len`` to be a multiple of k; the value is
+        derived from the model's compression ratios by the config registry.
+        """
 
     def __init__(
         self,
@@ -125,6 +153,7 @@ class DeepSeekV41SyntheticVisionDataLoader(ParallelAwareDataloader):
             image_paths=config.image_paths,
             tokenizer_path=config.tokenizer_path,
             text=config.text,
+            document_alignment=config.document_alignment,
         )
         super().__init__(
             dataset,

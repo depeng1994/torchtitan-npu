@@ -30,7 +30,7 @@ def apply_activation_checkpointing(model, ac_config, dump_folder):
     model.apply_activation_checkpointing_extensions(policy)
 
 
-def parallelize_deepseek_v41(
+def parallelize_deepseek_v4_1(
     model,
     *,
     parallel_dims: ParallelDims,

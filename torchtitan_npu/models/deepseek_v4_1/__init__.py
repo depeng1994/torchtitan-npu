@@ -3,12 +3,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The V4.1 model registry: direct construction of the V4.1 config.
+"""DeepSeek-V4.1 model configuration: builders, flavors and the model registry.
 
-No ``_make_v4_config`` detour — every layer, projection, MoE block and
-init strategy is constructed here against the local V4.1 classes.  The
-width sets and topology constants match the frozen
-``dsv41_golden_2p_ep2_fsdp2`` baseline.
+Following torchtitan's model-directory layout, the model configuration lives in
+this package entry point: the per-layer `Config` builders, the real V4.1
+topology constants, the flavor factories and `model_registry` are all defined
+here.  The trainer-facing recipes stay in `config_registry.py`, and every
+component keeps its own `Config` in its own module.
+
+The width sets and topology constants match the frozen
+the registered 40-layer V4.1 shape.
 """
 
 from __future__ import annotations
@@ -19,12 +23,13 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 import torch.nn as nn
-from torchtitan.config import derive
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import Embedding, Linear, RMSNorm
 from torchtitan.models.common.config_utils import (
     make_ffn_config,
+    make_moe_config,
     make_routed_experts_config,
+    make_router_config,
 )
 from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.models.utils import validate_converter_order
@@ -33,22 +38,21 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan_npu.override.common.rope import WorkaroundComplexRoPE
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
-from .attention import CompressedSparseAttention, DeepSeekV41Attention
-from .block import DeepSeekV41TransformerBlock
-from .compressor import Compressor, Indexer
+from .attention import Attention, CompressedSparseInnerAttention2
+from .compressor import Compressor
+from .indexer import Indexer, IndexerKLLoss
 from .mhc import HcPost, HcPre
-from .model import V41Model
-from .moe import V41MoE, V41Router
-from .reference import ReferenceMetadataExtension
-from .sparse_attention import V41SparseAttention
+from .model import DeepSeekV41TransformerBlock, V41Model
+from .state_dict_adapter import DeepSeekV41StateDictAdapter
 from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings
 
 # std=1.0 mirrors the reference debug initialization; the marker values
-# are pinned by the frozen dsv41_golden_2p_ep2_fsdp2 trajectory, so changing
-# the std re-anchors the guard.
+# are the reference marker values, so changing the std changes the marker
+# parameterization.
 _MARKER_INIT = {name: partial(nn.init.normal_, std=1.0) for name in ("image_start", "image_newline", "image_end")}
 
 if TYPE_CHECKING:
+    from torchtitan.models.common.moe import MoE
     from torchtitan.protocols.model import ModelConfigConverter
 
 
@@ -125,6 +129,21 @@ _HC_PARAM_INIT = {
     "hc_scale": partial(nn.init.trunc_normal_, std=0.02),
 }
 _SWIGLU_LIMIT = 10.0
+# Positions per candidate block of the hierarchical indexer.
+_CANDIDATE_BLOCK_SIZE = 8
+
+
+# The real V4.1 text-backbone topology: the compression ratio of every layer
+# and the layers that own the shared compressed KV, the index selection and
+# the candidate pool.  The 30-layer crop keeps the same source layers and
+# truncates the trailing ratio-1 group; the 40-layer shapes are the frozen
+# registered 40-layer V4.1 topology.
+V41_CANDIDATE_SOURCE_LAYER = 20
+V41_COMPRESS_RATIOS = (0, 0) + (2,) * 18 + (1,) * 10
+V41_FULL_COMPRESS_RATIOS = (0, 0) + (2,) * 18 + (1,) * 20
+V41_KV_SOURCE_LAYERS = (2, 8, 14, 20)
+V41_INDEX_SOURCE_LAYERS = (2, 8, 14, 20, 24, 28)
+V41_FULL_INDEX_SOURCE_LAYERS = (2, 8, 14, 20, 24, 28, 32, 36)
 
 
 def _output_linear_init(dim: int) -> dict:
@@ -154,37 +173,49 @@ def _make_compressor_config(
     *,
     dim: int,
     head_dim: int,
-    rope_head_dim: int,
     compress_ratio: int,
     norm_eps: float,
-    coff: int,
-    rope: WorkaroundComplexRoPE.Config,
+    is_source: bool,
+    rope: WorkaroundComplexRoPE.Config | None,
 ) -> Compressor.Config:
+    """Main-KV compressor config. A reusing layer holds no weights of its own.
+
+    ``head_dim`` sizes the projections and the norm; the rotated span of the rope is
+    carried by the rope config's own ``dim``/``split``.
+    """
     return Compressor.Config(
-        rope=dataclasses.replace(rope),
-        head_dim=head_dim,
-        rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
-        wkv=Linear.Config(
-            in_features=dim,
-            out_features=coff * head_dim,
-            bias=False,
-            param_init=_LINEAR_INIT,
-        ),
-        wgate=(
-            None
-            if compress_ratio == 1
-            else Linear.Config(
+        is_source=is_source,
+        rope=dataclasses.replace(rope) if rope is not None else None,
+        wkv=(
+            Linear.Config(
                 in_features=dim,
-                out_features=coff * head_dim,
+                out_features=head_dim,
                 bias=False,
                 param_init=_LINEAR_INIT,
             )
+            if is_source
+            else None
         ),
-        norm=RMSNorm.Config(
-            normalized_shape=head_dim,
-            eps=norm_eps,
-            param_init=_NORM_INIT,
+        # The softmax gate only exists when there is more than one token to pool.
+        wgate=(
+            Linear.Config(
+                in_features=dim,
+                out_features=head_dim,
+                bias=False,
+                param_init=_LINEAR_INIT,
+            )
+            if is_source and compress_ratio > 1
+            else None
+        ),
+        norm=(
+            RMSNorm.Config(
+                normalized_shape=head_dim,
+                eps=norm_eps,
+                param_init=_NORM_INIT,
+            )
+            if is_source
+            else None
         ),
     )
 
@@ -192,52 +223,78 @@ def _make_compressor_config(
 def _make_indexer_config(
     *,
     dim: int,
-    num_index_heads: int,
-    index_head_dim: int,
-    rope_head_dim: int,
     q_lora_rank: int,
+    head_dim: int,
+    index_head_dim: int,
+    num_index_heads: int,
+    index_topk: int,
     compress_ratio: int,
     norm_eps: float,
-    rope: WorkaroundComplexRoPE.Config,
-    source_key: bool,
-    source_head_dim: int | None,
+    is_source: bool,
+    owns_k: bool,
+    is_candidate_source: bool,
+    uses_candidates: bool,
+    candidate_topk_blocks: int,
+    candidate_block_size: int,
+    needs_selection_scores: bool,
+    rope: WorkaroundComplexRoPE.Config | None,
 ) -> Indexer.Config:
-    config_kwargs = dict(
-        rope=dataclasses.replace(rope),
+    """Lightning-indexer config. Only an index source carries the projections; its keys
+    come from its own compressor latent, or from the shared ones otherwise."""
+    owns_index_k = owns_k and is_source
+    return Indexer.Config(
         num_index_heads=num_index_heads,
         index_head_dim=index_head_dim,
-        rope_head_dim=rope_head_dim,
+        index_topk=index_topk,
         compress_ratio=compress_ratio,
-        wq_b=Linear.Config(
-            in_features=q_lora_rank,
-            out_features=num_index_heads * index_head_dim,
-            bias=False,
-            param_init=_LINEAR_INIT,
+        is_source=is_source,
+        owns_k=owns_index_k,
+        is_candidate_source=is_candidate_source,
+        uses_candidates=uses_candidates,
+        candidate_topk_blocks=candidate_topk_blocks,
+        candidate_block_size=candidate_block_size,
+        needs_selection_scores=needs_selection_scores,
+        rope=dataclasses.replace(rope) if rope is not None else None,
+        wq_b=(
+            Linear.Config(
+                in_features=q_lora_rank,
+                out_features=num_index_heads * index_head_dim,
+                bias=False,
+                param_init=_LINEAR_INIT,
+            )
+            if is_source
+            else None
         ),
-        weights_proj=Linear.Config(
-            in_features=dim,
-            out_features=num_index_heads,
-            bias=False,
-            param_init=_LINEAR_INIT,
+        weights_proj=(
+            Linear.Config(
+                in_features=dim,
+                out_features=num_index_heads,
+                bias=False,
+                param_init=_LINEAR_INIT,
+            )
+            if is_source
+            else None
         ),
-    )
-    if source_key:
-        if source_head_dim is None:
-            raise ValueError("source-key indexer requires source_head_dim")
-        config_kwargs.update(  # pyrefly: ignore [no-matching-overload]
-            wk=Linear.Config(
-                in_features=source_head_dim,
+        wk=(
+            Linear.Config(
+                in_features=head_dim,
                 out_features=index_head_dim,
                 bias=False,
                 param_init=_LINEAR_INIT,
-            ),
-            k_norm=RMSNorm.Config(
+            )
+            if owns_index_k
+            else None
+        ),
+        k_norm=(
+            RMSNorm.Config(
                 normalized_shape=index_head_dim,
                 eps=norm_eps,
                 param_init=_NORM_INIT,
-            ),
-        )
-    return Indexer.Config(**config_kwargs)
+            )
+            if owns_index_k
+            else None
+        ),
+    )
 
 
 def _make_v41_attn_config(
@@ -260,60 +317,81 @@ def _make_v41_attn_config(
     owns_indexer: bool,
     source_key: bool,
     external_key: bool,
-) -> DeepSeekV41Attention.Config:
+    is_candidate_source: bool,
+    uses_candidates: bool,
+    candidate_topk_blocks: int,
+    candidate_block_size: int,
+    layer_id: int,
+    index_source_layers: tuple[int, ...],
+    indexer_loss_coeff: float | None,
+) -> Attention.Config:
     if source_key and external_key:
         raise ValueError("an indexer cannot own its source-key projection and consume an external key at the same time")
+    if is_candidate_source and not owns_compressor:
+        raise ValueError("the candidate-pool source must own the compressed KV it scores")
 
     hd = head_dim
+    # Every rope config rotates the trailing ``rope_head_dim`` channels of its site's
+    # head, so each site carries the un-rotated prefix width of that head.
+    attention_rope = dataclasses.replace(rope, split=hd - rope_head_dim)
+    indexer_rope = dataclasses.replace(rope, split=index_head_dim - rope_head_dim)
     per_group_in = (n_heads * hd) // n_groups
     per_group_out = n_groups * o_lora_rank
     softmax_scale = head_dim**-0.5
-    compressor_cfg = None
-    indexer_cfg = None
-
-    if owns_compressor:
-        compressor_cfg = _make_compressor_config(
-            dim=dim,
-            head_dim=hd,
-            rope_head_dim=rope_head_dim,
-            compress_ratio=compress_ratio,
-            norm_eps=norm_eps,
-            coff=1,
-            rope=rope,
-        )
-    if owns_indexer:
-        indexer_cfg = _make_indexer_config(
-            dim=dim,
-            num_index_heads=index_n_heads,
-            index_head_dim=index_head_dim,
-            rope_head_dim=rope_head_dim,
-            q_lora_rank=q_lora_rank,
-            compress_ratio=compress_ratio,
-            norm_eps=norm_eps,
-            rope=rope,
-            source_key=source_key,
-            source_head_dim=hd if (source_key or external_key) else None,
-        )
-
-    inner_attention_cfg = V41SparseAttention.Config(
-        window_size=window_size,
-        compress_ratio=compress_ratio,
-        softmax_scale=softmax_scale,
-        index_topk=index_topk,
-    )
-    return DeepSeekV41Attention.Config(
-        n_heads=n_heads,
-        head_dim=head_dim,
-        rope_head_dim=rope_head_dim,
-        q_lora_rank=q_lora_rank,
-        n_groups=n_groups,
+    # Every layer carries a compressor; only the sources carry its weights and its rope.
+    compressor_cfg = _make_compressor_config(
+        dim=dim,
+        head_dim=hd,
         compress_ratio=compress_ratio,
         norm_eps=norm_eps,
+        is_source=owns_compressor,
+        rope=attention_rope if owns_compressor else None,
+    )
+    # The distillation loss is attached on every layer that consumes the selection:
+    # the teacher is rebuilt from that layer's own attention mass, and because ``dI`` is
+    # affine in the teacher, the per-layer losses sum to the pooled-teacher objective.
+    compresses = compress_ratio > 0
+    aux_loss = None
+    if indexer_loss_coeff is not None and compresses and any(source <= layer_id for source in index_source_layers):
+        aux_loss = IndexerKLLoss.Config(
+            coeff=indexer_loss_coeff,
+            reduce_mesh="batch",
+            softmax_scale=softmax_scale,
+        )
+    needs_selection_scores = owns_indexer and aux_loss is not None
+
+    # Every layer carries an indexer; only a source carries its weights and its rope.
+    indexer_cfg = _make_indexer_config(
+        dim=dim,
+        q_lora_rank=q_lora_rank,
+        head_dim=hd,
+        index_head_dim=index_head_dim,
+        num_index_heads=index_n_heads,
+        index_topk=index_topk,
+        compress_ratio=compress_ratio,
+        norm_eps=norm_eps,
+        is_source=owns_indexer,
+        owns_k=source_key,
+        is_candidate_source=is_candidate_source,
+        uses_candidates=uses_candidates,
+        candidate_topk_blocks=candidate_topk_blocks,
+        candidate_block_size=candidate_block_size,
+        needs_selection_scores=needs_selection_scores,
+        rope=indexer_rope if owns_indexer else None,
+    )
+
+    inner_attention_cfg = CompressedSparseInnerAttention2.Config(
+        window_size=window_size,
+        softmax_scale=softmax_scale,
+        aux_loss=aux_loss,
+    )
+    return Attention.Config(
+        n_heads=n_heads,
+        head_dim=head_dim,
+        q_lora_rank=q_lora_rank,
+        compress_ratio=compress_ratio,
         inner_attention=inner_attention_cfg,
-        compressed_sparse_attention=CompressedSparseAttention.Config(
-            inner_attention=inner_attention_cfg,
-        ),
-        rope=dataclasses.replace(rope),
+        rope=attention_rope,
         wq_a=Linear.Config(
             in_features=dim,
             out_features=q_lora_rank,
@@ -373,59 +451,46 @@ def _make_v41_moe_config(
     load_balance_coeff: float,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None,
-):
-    from .moe import V41FeedForward, V41GroupedExperts, V41RoutedExperts
-
-    # The golden experts are the native V4.1 expert computation: derive the
-    # factory configs onto the golden classes (the frozen baseline ran with
-    # exactly these through the golden_moe override; here they are the
-    # default, no class swap involved).
-    routed = make_routed_experts_config(
+) -> MoE.Config:
+    # Every block carries the same MoE stack, so one config serves them all; the common
+    # factories build it exactly as upstream's V4.1 does (the plugin patch gives them the
+    # ``sqrtsoftplus`` score function and the ``swiglu_limit`` passthrough).
+    router = make_router_config(
         dim=dim,
-        hidden_dim=moe_inter_dim,
         num_experts=num_experts,
+        gate_param_init=_depth_init(layer_id),
         top_k=top_k,
-        param_init=_depth_experts_init(layer_id),
-        comm_backend=moe_comm_backend,
-        non_blocking_capacity_factor=non_blocking_capacity_factor,
-        swiglu_limit=_SWIGLU_LIMIT,  # pyrefly: ignore [unexpected-keyword]
+        score_func="sqrtsoftplus",  # pyrefly: ignore [bad-argument-type]
+        route_norm=route_norm,
+        route_scale=route_scale,
     )
-    routed = derive(
-        routed,
-        V41RoutedExperts.Config,
-        inner_experts=derive(routed.inner_experts, V41GroupedExperts.Config),
-    )
-    shared = (
-        make_ffn_config(
-            dim=dim,
-            hidden_dim=moe_inter_dim * num_shared_experts,
-            w1_param_init=_LINEAR_INIT,
-            w2w3_param_init=_depth_init(layer_id),
-            swiglu_limit=_SWIGLU_LIMIT,  # pyrefly: ignore [unexpected-keyword]
-        )
-        if num_shared_experts > 0
-        else None
-    )
-    if shared is not None:
-        shared = derive(shared, V41FeedForward.Config)
-    return V41MoE.Config(
+    # The plugin's two router extensions: the image-masked vision bias and the
+    # reference's descending selection order.
+    router = dataclasses.replace(router, vision_enabled=True, sorted_topk=True)
+    return make_moe_config(
         num_experts=num_experts,
-        router=V41Router.Config(
+        router=router,
+        routed_experts=make_routed_experts_config(
+            dim=dim,
+            hidden_dim=moe_inter_dim,
             num_experts=num_experts,
-            gate=Linear.Config(
-                in_features=dim,
-                out_features=num_experts,
-                bias=False,
-                param_init=_depth_init(layer_id),
-            ),
             top_k=top_k,
-            score_func="sqrtsoftplus",
-            route_scale=route_scale,
-            route_norm=route_norm,
-            vision_enabled=True,
+            param_init=_depth_experts_init(layer_id),
+            comm_backend=moe_comm_backend,
+            non_blocking_capacity_factor=non_blocking_capacity_factor,
+            swiglu_limit=_SWIGLU_LIMIT,  # pyrefly: ignore [unexpected-keyword]
         ),
-        routed_experts=routed,
-        shared_experts=shared,
+        shared_experts=(
+            make_ffn_config(
+                dim=dim,
+                hidden_dim=moe_inter_dim * num_shared_experts,
+                w1_param_init=_LINEAR_INIT,
+                w2w3_param_init=_depth_init(layer_id),
+                swiglu_limit=_SWIGLU_LIMIT,  # pyrefly: ignore [unexpected-keyword]
+            )
+            if num_shared_experts > 0
+            else None
+        ),
         load_balance_coeff=load_balance_coeff,
     )
 
@@ -439,8 +504,47 @@ def _make_v41_config(
     candidate_source_layer: int,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None,
+    indexer_loss_coeff: float | None = 0.01,
     widths: _V41Widths = _FLASH_WIDTHS,
 ) -> V41Model.Config:
+    # Per-layer source invariants. A reusing layer derives its container grid and its
+    # index mask from its own ``compress_ratio``, so the ratio of a layer must equal the
+    # ratio of the source it consumes; a topology that breaks this would silently read
+    # another ratio's plan.
+    if n_layers not in (30, 40):
+        raise ValueError(f"the supported V4.1 layer counts are 30 or 40, got {n_layers}")
+    if len(compress_ratios) != n_layers:
+        raise ValueError(f"compress_ratios must match n_layers ({n_layers}), got {len(compress_ratios)}")
+    for name, sources in (("kv_source_layers", kv_source_layers), ("index_source_layers", index_source_layers)):
+        outside = sorted({source for source in sources if source < 0 or source >= n_layers})
+        if outside:
+            raise ValueError(f"{name} outside the {n_layers}-layer crop: {outside}")
+    for layer_id, ratio in enumerate(compress_ratios):
+        kv_source = max((source for source in kv_source_layers if source <= layer_id), default=None)
+        if ratio > 0 and kv_source is None:
+            raise ValueError(f"layer {layer_id} has compress_ratio={ratio} but no KV source precedes it")
+        if kv_source is not None and compress_ratios[kv_source] != ratio:
+            raise ValueError(
+                f"layer {layer_id} (compress_ratio={ratio}) consumes the compressed KV of layer "
+                f"{kv_source} (compress_ratio={compress_ratios[kv_source]}); the ratios must match"
+            )
+        if layer_id in index_source_layers and layer_id not in kv_source_layers:
+            index_source = max((source for source in index_source_layers if source < layer_id), default=None)
+            if index_source is None:
+                raise ValueError(f"re-indexing layer {layer_id} has no preceding index source")
+            if compress_ratios[index_source] != ratio:
+                raise ValueError(
+                    f"layer {layer_id} (compress_ratio={ratio}) scores the shared index keys of layer "
+                    f"{index_source} (compress_ratio={compress_ratios[index_source]}); the ratios must match"
+                )
+    if candidate_source_layer not in set(index_source_layers):
+        raise ValueError(
+            "the candidate-pool source must also be an index source: "
+            f"layer {candidate_source_layer} is not in index_source_layers"
+        )
+    if widths.candidate_topk_blocks <= 0 or _CANDIDATE_BLOCK_SIZE <= 0:
+        raise ValueError("candidate block parameters must be positive")
+
     vocab_size = 129280
     source_key_indexer_layers = tuple(layer_id for layer_id in index_source_layers if layer_id in kv_source_layers)
     external_key_indexer_layers = tuple(
@@ -490,6 +594,18 @@ def _make_v41_config(
             owns_indexer=layer_id in index_source_layers,
             source_key=layer_id in source_key_indexer_layers,
             external_key=layer_id in external_key_indexer_layers,
+            is_candidate_source=layer_id == candidate_source_layer,
+            # Only an index source selects, so only it can consult the pool.
+            uses_candidates=(
+                layer_id in index_source_layers
+                and layer_id != candidate_source_layer
+                and 0 <= candidate_source_layer < layer_id
+            ),
+            candidate_topk_blocks=widths.candidate_topk_blocks,
+            candidate_block_size=_CANDIDATE_BLOCK_SIZE,
+            layer_id=layer_id,
+            index_source_layers=index_source_layers,
+            indexer_loss_coeff=indexer_loss_coeff,
         )
         moe_cfg = _make_v41_moe_config(
             layer_id=layer_id,
@@ -506,7 +622,6 @@ def _make_v41_config(
         )
         layers.append(
             DeepSeekV41TransformerBlock.Config(
-                layer_id=layer_id,
                 attention=attn_cfg,
                 attention_norm=RMSNorm.Config(
                     normalized_shape=widths.dim,
@@ -523,7 +638,7 @@ def _make_v41_config(
                     hc_mult=hc_mult,
                     dim=widths.dim,
                     sinkhorn_iters=20,
-                    eps=1e-6,
+                    hc_eps=1e-6,
                     norm_eps=norm_eps,
                     param_init=_HC_PARAM_INIT,
                 ),
@@ -531,7 +646,7 @@ def _make_v41_config(
                     hc_mult=hc_mult,
                     dim=widths.dim,
                     sinkhorn_iters=20,
-                    eps=1e-6,
+                    hc_eps=1e-6,
                     norm_eps=norm_eps,
                     param_init=_HC_PARAM_INIT,
                 ),
@@ -554,7 +669,6 @@ def _make_v41_config(
             param_init=_output_linear_init(widths.dim),
         ),
         layers=layers,
-        window_size=window_size,
         hc_mult=hc_mult,
         compress_ratios=compress_ratios,
         n_layers=n_layers,
@@ -562,16 +676,7 @@ def _make_v41_config(
         index_source_layers=index_source_layers,
         candidate_source_layer=candidate_source_layer,
         candidate_topk_blocks=widths.candidate_topk_blocks,
-        candidate_block_size=8,
-        metadata_extension=ReferenceMetadataExtension.Config(
-            window_size=window_size,
-            num_heads=widths.n_heads,
-            head_dim=widths.head_dim,
-            index_n_heads=widths.index_n_heads,
-            index_head_dim=widths.index_head_dim,
-            index_topk=widths.index_topk,
-            materialized_ratios=(1,),
-        ),
+        candidate_block_size=_CANDIDATE_BLOCK_SIZE,
         vision_encoder=DeepSeekV41VisionEncoder.Config(
             dim=widths.vision_dim,
             num_layers=32,
@@ -588,69 +693,52 @@ def _make_v41_config(
     )
 
 
-def deepseek_v41_flash_30layers_16experts_vision_config(
+def deepseek_v4_1_flash_30layers_16experts_vision_config(
     *,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
 ):
-    from .config import (
-        V41_COMPRESS_RATIOS,
-        V41_INDEX_SOURCE_LAYERS,
-        V41_KV_SOURCE_LAYERS,
-    )
-
+    """Thirty of the forty decoder layers, for fast single-node validation."""
     return _make_v41_config(
         n_layers=30,
         compress_ratios=V41_COMPRESS_RATIOS,
         kv_source_layers=V41_KV_SOURCE_LAYERS,
         index_source_layers=V41_INDEX_SOURCE_LAYERS,
-        candidate_source_layer=20,
+        candidate_source_layer=V41_CANDIDATE_SOURCE_LAYER,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
     )
 
 
-def deepseek_v41_flash_40layers_16experts_vision_config(
+def deepseek_v4_1_flash_40layers_16experts_vision_config(
     *,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
 ):
     """Full 40-layer V4.1 backbone with the single-node 16-expert crop."""
-    from .config import (
-        V41_FULL_COMPRESS_RATIOS,
-        V41_FULL_INDEX_SOURCE_LAYERS,
-        V41_KV_SOURCE_LAYERS,
-    )
-
     return _make_v41_config(
         n_layers=40,
         compress_ratios=V41_FULL_COMPRESS_RATIOS,
         kv_source_layers=V41_KV_SOURCE_LAYERS,
         index_source_layers=V41_FULL_INDEX_SOURCE_LAYERS,
-        candidate_source_layer=20,
+        candidate_source_layer=V41_CANDIDATE_SOURCE_LAYER,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
     )
 
 
-def deepseek_v41_debugmodel_config(
+def deepseek_v4_1_debugmodel_config(
     *,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
 ):
     """Reduced-width shape retaining the real 40-layer compression topology."""
-    from .config import (
-        V41_FULL_COMPRESS_RATIOS,
-        V41_FULL_INDEX_SOURCE_LAYERS,
-        V41_KV_SOURCE_LAYERS,
-    )
-
     return _make_v41_config(
         n_layers=40,
         compress_ratios=V41_FULL_COMPRESS_RATIOS,
         kv_source_layers=V41_KV_SOURCE_LAYERS,
         index_source_layers=V41_FULL_INDEX_SOURCE_LAYERS,
-        candidate_source_layer=20,
+        candidate_source_layer=V41_CANDIDATE_SOURCE_LAYER,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         widths=_DEBUG_WIDTHS,
@@ -658,19 +746,18 @@ def deepseek_v41_debugmodel_config(
 
 
 def model_registry(
-    flavor: str = "deepseek_v41_flash_30layers_16experts_vision",
+    flavor: str = "deepseek_v4_1_flash_30layers_16experts_vision",
     *,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
-    from .parallelize import parallelize_deepseek_v41
-    from .state_dict_adapter import DeepSeekV41StateDictAdapter
+    from .parallelize import parallelize_deepseek_v4_1
 
     config_factories = {
-        "deepseek_v41_flash_30layers_16experts_vision": deepseek_v41_flash_30layers_16experts_vision_config,
-        "deepseek_v41_flash_40layers_16experts_vision": deepseek_v41_flash_40layers_16experts_vision_config,
-        "deepseek_v41_debugmodel": deepseek_v41_debugmodel_config,
+        "deepseek_v4_1_flash_30layers_16experts_vision": deepseek_v4_1_flash_30layers_16experts_vision_config,
+        "deepseek_v4_1_flash_40layers_16experts_vision": deepseek_v4_1_flash_40layers_16experts_vision_config,
+        "deepseek_v4_1_debugmodel": deepseek_v4_1_debugmodel_config,
     }
     if flavor not in config_factories:
         raise ValueError(f"Unknown DeepSeek V4.1 flavor: {flavor}")
@@ -683,10 +770,10 @@ def model_registry(
         for converter_cfg in converters:
             config = converter_cfg.build().convert(config)
     return ModelSpec(
-        name="deepseek_v41",
+        name="deepseek_v4_1",
         flavor=flavor,
         model=config,
-        parallelize_fn=parallelize_deepseek_v41,
+        parallelize_fn=parallelize_deepseek_v4_1,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=_register_step_pre_hooks,
         state_dict_adapter=DeepSeekV41StateDictAdapter,
@@ -697,4 +784,27 @@ def _register_step_pre_hooks(optimizers, model_parts, parallel_dims) -> None:
     """Register MoE balancing and auxiliary-loss step hooks."""
     from torchtitan.components.optimizer import register_moe_load_balancing_hook
 
+    from torchtitan_npu.patches.torchtitan.models.common.aux_loss import register_aux_loss_zero_hook
+
     register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
+    register_aux_loss_zero_hook(optimizers, model_parts, parallel_dims)
+
+
+# Public surface: the model config, its component classes and the model-config
+# factories.  ``config_registry`` imports this module (never the reverse), so
+# the trainer recipes are not re-exported here.
+__all__ = [
+    "V41_CANDIDATE_SOURCE_LAYER",
+    "V41_COMPRESS_RATIOS",
+    "V41_FULL_COMPRESS_RATIOS",
+    "V41_FULL_INDEX_SOURCE_LAYERS",
+    "V41_INDEX_SOURCE_LAYERS",
+    "V41_KV_SOURCE_LAYERS",
+    "Attention",
+    "DeepSeekV41StateDictAdapter",
+    "V41Model",
+    "deepseek_v4_1_debugmodel_config",
+    "deepseek_v4_1_flash_30layers_16experts_vision_config",
+    "deepseek_v4_1_flash_40layers_16experts_vision_config",
+    "model_registry",
+]
