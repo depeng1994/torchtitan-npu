@@ -414,3 +414,182 @@ Challenger self-check：
 - [x] `tests/` 结论严格按仓内 developer-tests-review 的静态 `review测试` 边界，不声称执行；
 - [x] 已将被证伪的早期 KL-kernel 怀疑移除：CANN reference 支持 `Z*Y-p`；
 - [x] 仅追加 `pr_833/review.md`，不修改生产代码/测试/`master`，不 approve/merge/close PR。
+
+Maintainer最终review结论:
+
+> **本节是 PR #15 的最终权威 Maintainer 结论。** 前面的 Maintainer、Reducer、Challenger 内容全部原样保留，供追溯使用；若旧章节与本节冲突，以本节为准。本次 final review 严格按 `torchtitan-npu-reviewer-skills/Maintainer.md` 收口，对 reviewer 结论重新做事实核验、root-cause 去重、冲突仲裁、changed-file 覆盖和最终 merge gate，而不是对既有报告做机械汇总。
+
+## 1. Final Decision
+
+**合入建议：修改后重新 Review。**
+
+当前不是「补测试即可合入」：至少存在三项 P0。第一，新增 `IndexerKLLoss` 接入了与其 token-additive 目标不兼容的旧 AuxLoss 语义，实际改变训练梯度尺度，并且同名多层 metric 会覆盖；第二，本 PR 修改的 Common MoE / Linear patch 含没有对应 TorchTitan upstream PR 的实现，违反本仓 `patches/torchtitan` 硬边界；第三，默认/推荐入口走 `spmd_types`，唯一 V4.1 NPU integration case 却强制 `partial_dtensor`，且没有 step / aux metric / numeric oracle，因此关键默认分布式训练路径没有有效 NPU 门禁。
+
+PR 的主方向仍保留：V4.1 与 V4 model-specific 实现解耦、跨层共享状态显式穿参、Attention Gym 复用、mHC 修正、每层 Compressor/Indexer 的 source/reuse 生命周期，都是应继续保留的结构。需要修改的是它们周边的训练语义、patch ownership、入口和验证边界，而不是退回旧 mutable context / golden 专用实现。
+
+**测试执行：未执行（仅静态审查）。** PR 描述中的 CPU/NPU/CI 结果仅作为作者自验证背景；当前 GitHub mirror 的 final-review head 没有可见 commit status/check run，本 review 不将这些声明计作独立通过证据。
+
+## 2. Final Review Baseline
+
+| 项目 | Final review 事实 |
+| --- | --- |
+| PR | GitHub #15 / GitCode !833 mirror |
+| base | `master@5ffd25ecc173eed7f92f8178f8796738bbdf8368` |
+| final-review 输入 head | `pr_833@92df773ddb30e074c0eadf6bf0c55b562841f4e8` |
+| current PR files | 50 个；其中 `review.md` 是 review-only 追加，production/test/docs 主改动仍来自 `7b1bf45c3d71594b40d39f1d57b44ab84058c0ac` |
+| 固定 TorchTitan | `requirements.txt` / `.ci/unit_test.sh` / `.ci/smoke_test.sh` 均指向 `torchtitan==0.3.0` / `v0.3.0` |
+| Attention Gym | `attn-gym==0.0.9` |
+| V4.1 reference source | 实际可核对来源是 `sdmyzlp/torchtitan:br_dpsk_v4_1`，但仓内未固定用于本次移植的 commit；moving branch 不能作为可重放 source-of-truth |
+| CI 状态 | 当前 mirror head 无可见 status/check run；作者的 CI green 声明未独立复核 |
+| baseline 规则漂移 | `.agents/AGENTS.md` 要求从 `.ci/lint.sh` 读取固定 upstream，但当前 branch 不存在该文件；本 review 以 requirements + unit/smoke CI 固定 `v0.3.0`，并把 lint 文件缺失记录为已有规则漂移，不伪装成 PR 测试结果 |
+
+## 3. Reviewer Completeness Gate
+
+| Reviewer | Mandatory delivery | Final gate |
+| --- | --- | --- |
+| Challenger | `质疑者review结论:`，含 Claim Traceability、Findings、Coverage、Historical、Test Evidence | **COMPLETE** |
+| Reducer | `删减者review结论:`，含 Reducer Findings、Reduction Inventory、Historical Fix Reduction、Top Reduction Plan | **COMPLETE** |
+| Architect | Maintainer.md 要求正式 `架构师review结论:`，并至少含 Architecture Findings / Boundary Matrix / Entry / Patch / Upgrade Risk | **REVIEW-GAP**：当前 `review.md` 没有正式 `架构师review结论:` 交付；不能用前面的旧 Maintainer 章节冒充 Architect delivery |
+
+Architect delivery 缺失不再单独阻断本次 final gate，因为本节已经按 Maintainer.md 要求补做最小 Architecture Supplement：见第 7 节的 Architecture Boundary Matrix、第 5 节的 patch/entry/upgrade findings，以及第 6 节的冲突仲裁。该补审只覆盖本 PR 所需决策，不替代今后独立 Architect reviewer 的职责。
+
+## 4. Historical Human Review Closure Matrix
+
+GitHub PR #15 的 conversation comments、inline review threads、review submissions 均为空，因此没有历史人工技术意见需要标记为 RESOLVED / STILL_OPEN；Agent 生成的前述 Maintainer/Reducer/Challenger 报告不冒充 human review。
+
+| Historical review | Source | Final status | 说明 |
+| --- | --- | --- | --- |
+| HUMAN-0 | GitHub PR #15 | **NOT_APPLICABLE** | 无历史 human inline review、review submission 或 conversation technical comment；不存在 developer response/fix diff 可做人工闭环 |
+
+## 5. Final Finding Registry
+
+| ID | Priority | Root cause / 位置 | Final Maintainer 判断 | 唯一修改方向 | Re-review 证据 |
+| --- | --- | --- | --- | --- | --- |
+| **R1** | **P0** | `IndexerKLLoss -> LoggedAuxLoss`：`patches/torchtitan/models/common/aux_loss.py`、`patches/.../decoder.py`、`deepseek_v4_1/indexer.py` | **实际训练 correctness 错误。** `IndexerKLLoss._kl()` 对 token rows 求和；当前 `LoggedAuxLoss.inject()` 却按 `global_batch_size` 缩放，而 merged TorchTitan #3864 与 V4.1 source 都使用 main loss 相同的 step `global_valid_tokens`。同时 `zero_all()` 对同 `(reduce_mesh, metric_name)` 使用覆盖赋值，多个 per-layer `IndexerKLLoss` 只留下最后一层，再除实例数。`Z*Y-p` closed-form 本身是正确的，问题在 AuxLoss framework。 | 将 #3864 temporary backport 恢复为 upstream-compatible contract：step 前由 Trainer 设置 `global_valid_tokens` denominator；instance accumulator 在设备端按 metric group `+=` 汇总，日志时每 group 再 `.item()`；删除 `Decoder.Config` 注入 `global_batch_size` 的旧语义。若 pinned v0.3 仍需 FullAC replay compatibility，作为独立 Extension/compat delta 隔离并单测，不继续把 normalization/group semantics fork 在 upstream patch 内。 | CPU：token 数翻倍但 per-token 数据相同，归一化后 indexer 参数梯度不变；两个同 key loss 值 `a/b`，metric 必须等于 `(a+b)/2`；NPU ST 中 `indexer_kl_loss/mean` 必须存在且 finite。 |
+| **R2** | **P0** | `patches/torchtitan/models/common/moe.py`、`linear.py` | **硬 patch-policy 违规。** Common MoE 抽象方向可以接受，但 patch 文件自己明确承认 `vision_enabled/bias_vl/image_mask/sorted_topk` 没有 upstream counterpart；官方 TorchTitan 当前也搜不到这些字段。`BatchedLinear` 标注 #3634，但 #3634 merge commit 中根本没有该类；当前实现又与 source branch 的 `Config.n_batches + [B,O,I]` layout 不同。 | `patches/torchtitan` 只保留能与真实 upstream PR/commit 机械对照的部分。把无 upstream PR 的通用 MoE 扩展和 `BatchedLinear` 移到 `torchtitan_npu/extensions/models/common/`（若最终只服务 V4.1，则放 model scope），由 V4.1 显式 opt-in；不要复制整套 MoE。只有真实 TorchTitan PR 已提交且实现对齐后，才允许以 temporary patch 形式回迁，并写清删除条件。 | static：每个 patch 字段/类都能定位到真实 upstream PR/commit；Common extension 有 default-off + opt-in 行为 UT；`wo_a.weight` 最终 layout 纳入 state round-trip。 |
+| **R3** | **P0** | `config_registry.py` / example / `parallelize.py` / `tests/integration_tests/deepseek_v4_1.py` / runner | **默认生产分布式路径缺有效 NPU gate。** TorchTitan v0.3.0 默认 `spmd_backend="spmd_types"`，V4.1 recipe 未覆盖该默认值，example 还显式写 `spmd_types`；唯一 2P case 却强制 `partial_dtensor`。两者在 `parallelize_deepseek_v4_1()` 中进入不同实现。该 case 又 `check_loss=False` 且 `expected_steps=None`，runner 对结果直接返回，只剩 rc=0。 | 本 PR 收敛成一个明确支持面：**V4.1 当前只声明 `spmd_types` 为支持的 SPMD backend**，`partial_dtensor/full_dtensor` 先在 config/model boundary fail-fast，后续独立 PR 再扩。把现有唯一 `dsv41_debugmodel_2p_ep2_fsdp2` 改成 `spmd_types`，不新增第二组合；给同一 case 增 expected steps、`indexer_kl_loss/mean` finite 检查，并在 R1 修复后建立短 deterministic 新语义轨迹 guard。 | 同一 2P NPU case 真实完成 init/forward/backward/optimizer step；backend 与 recipe/example 完全一致；缺 step、缺 aux metric、non-finite 或 deterministic guard 偏离均自动失败。 |
+| **R4** | **P1** | `compressor.py` + `indexer.py::_selection_mask` + `model.get_attention_masks` + data contract | 当前 synthetic vision loader 每 row 单 document 且 row length 对齐，因此默认 recipe 没有直接触发；但代码/测试宣称 packed-doc isolation，模型却允许任意 `positions` reset。若 boundary 不落 compression grid，Compressor 在 mask 之前已把两个 document pooling 到同一 entry，后续 `doc_ids[:, ::ratio]` 无法修复。 | 本 PR 不扩成任意 packing 实现。把支持范围收窄为「document segment 必须按 model-derived compression alignment 对齐」；alignment 由 active ratios 单点派生，并在真实 packing/data producer boundary pad/validate，每个 segment 而不是只检查整 row。文档明确自定义 dataloader 也必须满足该 contract；不要在 Compressor/Indexer 深处堆重复 defensive checks。 | CPU 用 ratio=2 的 `3+3` document boundary 证明 producer 明确 reject/pad，再保留 aligned positive case；最终模型文档不再声称未约束的 arbitrary packing。 |
+| **R5** | **P1** | `deepseek_v4_1/__init__.py -> override.common.WorkaroundComplexRoPE` | 模型 config 已静态选择 replacement，而入口仍声明 `override.imports=...rope.workaround`；因此 override 不再是实现选择的单一入口，模型层反向依赖 override 层。 | model registry 只持有稳定 base/split-aware `ComplexRoPE.Config`（结构能力在 model/Common Extension 承载）；workaround/AscendC 只能由 `override.imports` 显式替换。禁止 model config import 具体 workaround implementation。 | UT 从真实 `Trainer.Config.override.imports` 入口构建：无 override 为 base config；启用 workaround 后才发生 replacement；其它 override 可通过同一 seam 选择。 |
+| **R6** | **P1** | `config_registry.py` + example + README | tokenizer/text/image/training values 同时来自 registry defaults、环境变量、shell 和 CLI；`DSV41_TOKENIZER_PATH`/`DSV4_TOKENIZER_PATH`/`DSV41_VISION_TEXT` 是隐藏 second source。example 名称写 `4k` 实际 `SEQ_LEN=512`，production recipe 默认 image path 又指向 `tests/assets`。 | tokenizer/text/image paths 全部进入 dataloader config/CLI；registry 只给 recipe default，不再直接读 hidden env；example 保留一个薄 shell，通过 CLI 覆盖，不新建额外 config/script；脚本直接重命名为 512 对应名称并同步 README。测试 asset 只留 debug/integration 默认。README 同时固定实际 V4.1 reference repo + commit，并列出本仓 intentional deviations。 | config parsing UT 证明 CLI 值到达真实 dataloader；静态核对 README/example/config 同一 seq_len/backend/input source；source commit 可重放。 |
+| **R7** | **P1** | `state_dict_adapter.py` / `vision_state_dict.py` / `test_state_dict_adapter.py` | 当前 adapter 已有 text/vision ownership mapping，但 UT 使用手写 HF 子集，无法证明真实 registry model 的 compressor/indexer、vision blocks、marker、MoE `bias_vl`、grouped experts、最终 `BatchedLinear` layout 全部可逆。integration 又关闭 checkpoint。 | 在 R2 最终 ownership/layout 确定后，用 tiny **真实 registered model** 的完整 `state_dict()` 做 `to_hf -> from_hf` 全量 round-trip，严格检查 key set、shape、dtype/value；删除弱 ownership helper/deterministic duplicate。若不在本 PR 验证 DCP resume，README 必须把 V4.1 checkpoint resume 标为 **UNVERIFIED**，不能写成已验证支持。 | real-model full-state round-trip；明确旧 checkpoint compatibility boundary。DCP save/resume 若仍宣称已验证，则需同一代表 NPU case 或独立已有框架给出恢复证据。 |
+| **R8** | **P2** | role/config/test scaffolding | 当前多个 bool (`owns_* / source_key / external_key / candidate roles`) 实际表达有限状态机，同时 model-level 又镜像 topology，导致 private builder validation matrix 和大量 representation tests。source branch 已有 `FULL/REINDEX/REUSE` 单一 Mode 证明可更简。 | role 收敛为单一 Mode/role；由 layer topology 一次派生；删除无 consumer 的 model-level mirror state 和 private topology defensive matrix。测试只保留真实 source→reuse、reindex、candidate 三个代表行为 + 独立数学 oracle；不要恢复 mutable state。 | 行为 UT 不再依赖 40 层 object identity/private tuple slot；公开用户边界（TP/CP/PP/compile、document alignment）仍保留 fail-fast。 |
+| **R9** | **P2** | `model.py::apply_activation_checkpointing_extensions`、依赖/文档维护 | Vision AC 直接调用 pinned TorchTitan `_wrap_block()` 私有 API，升级脆弱；`attn-gym==0.0.9` 在多个依赖/CI位置重复字面量，CI workaround 无清晰删除条件。 | 把 private AC 适配集中到 Extension/compat seam，model 只声明 extra blocks；推动/复用 upstream public hook。依赖版本以单一 source-of-truth 为主，CI `--no-deps` workaround 从该事实源派生或明确删除条件。 | pinned v0.3 compatibility UT + source upgrade smoke；静态检查版本不漂移。 |
+
+## 6. Reviewer Finding Normalization / Conflict Arbitration
+
+| 输入结论 | Final arbitration |
+| --- | --- |
+| 旧 Maintainer R1 接受 Common MoE generalization vs Reducer RED-01 要求 MOVE | **MERGED_INTO R2**：Common 抽象可以保留，但「可 Common」不等于「可放 `patches/torchtitan`」。最终接受抽象、拒绝当前 patch placement。 |
+| 旧 Maintainer R2 只要求修 provenance vs Reducer RED-02 要求移出 patch | **R2 采用更强结论**：仅改注释不够。没有真实 upstream PR 前必须移出 patch；若后续 upstream PR 存在，再按其真实 API/layout 机械回迁。 |
+| 早期对 fused KL 可能是 `Y-p` 的怀疑 | **SUPERSEDED / NOT A FINDING**：CANN reference 明确 `p_reduce = p.sum(...)`、`dI = Y * p_reduce - p`，即 `Z*Y-p`。最终 R1 只针对 AuxLoss normalization/aggregation framework。 |
+| 旧 R5/CHAL-03/CHAL-04 与 RED-08 | **MERGED_INTO R3**：不扩 ST 矩阵；只改现有唯一 2P case，使其覆盖真正默认 `spmd_types` 路径并具备 step/metric/numeric oracle。 |
+| RED-05 希望删除 defensive validation vs CHAL-02 要求 packing check | **分别处理**：固定 private topology 的 defensive matrix 按 R8 删除；document alignment 是真实输入 boundary，按 R4 保留在 producer/public boundary，而不是深层重复校验。 |
+| 旧 R7 与 RED-09 | **MERGED_INTO R7**：不叠 helper test，替换为一个 real registered model full-state round-trip。 |
+| 旧 R3/R4/R8/R10 | 分别归入 **R5/R6/R9/R8**，状态均 STILL_OPEN；当前 production head 后续只追加过 review.md，没有 production fix 可关闭这些项。 |
+
+## 7. Architecture Supplement for REVIEW-GAP
+
+由于缺少正式 Architect delivery，final Maintainer 补做以下最小 Architecture Boundary Matrix；它也是本 PR re-review 的目标形态。
+
+| 能力 | 当前 ownership | Final target ownership |
+| --- | --- | --- |
+| V4.1 topology / Compressor / Indexer / mHC / vision | `models/deepseek_v4_1` | **保留 model scope**；这是模型语义，不进入 TorchTitan patch |
+| Attention Gym selected attention | pinned external dependency | **保留复用**，固定版本并由 model wrapper 适配 |
+| AuxLoss #3864 | forked `patches/torchtitan` + decoder config hack | pinned TorchTitan 缺失期间保留**机械 upstream backport**；step denominator 的 Trainer 接线按 upstream contract；本仓兼容 delta 进入 Extension，不污染 patch 语义 |
+| multimodal route bias / sorted top-k | auto-applied Common MoE patch，无 upstream counterpart | 若语义通用，放 `extensions/models/common`；V4.1 config 显式 opt-in；有真实 upstream PR 后才临时 patch |
+| `BatchedLinear` | 标错 #3634 的 Common patch hybrid | `extensions/models/common` 或 V4.1 model scope；真实 upstream PR 前不在 patch |
+| RoPE workaround | model 静态依赖 replacement + CLI override重复 | model 用稳定 base config；具体实现仅由 `override.imports` 选择 |
+| Vision AC private hook | model 直接 `_wrap_block` | Extension/compat seam；model 只声明 extra block |
+| tokenizer/text/image/backend | env + registry + shell + CLI | 单一 `Trainer.Config` / dataloader config + CLI；example 仅薄封装 |
+| supported SPMD backend | default/example `spmd_types`，ST `partial_dtensor` | 本 PR 当前只声明 `spmd_types`；其它 backend fail-fast，后续独立扩展 |
+| state mapping | model adapter + hand-written subset UT | model adapter + real registered model full-state oracle |
+
+该目标保持 torchtitan-npu 是 TorchTitan 的 NPU 适配层，而不是形成新的 TorchTitan fork：上游已有能力复用；拟上游但 pinned 版本缺失的代码才进入 patch；本仓增强进入 Extension；实现选择走 Override；模型特有语义留在 model scope。
+
+## 8. Final Coverage Gate
+
+| Semantic unit | CPU / static evidence | NPU / distributed evidence | Final status |
+| --- | --- | --- | --- |
+| V4.1 registry 可独立于 V4 build + forward/backward | isolated subprocess real registry path | 当前 2P case 为不同 backend smoke | **PARTIAL** |
+| 显式 cross-layer state / source-reuse-reindex | threading UT 覆盖 producer/consumer | smoke only | **PASS on CPU contract** |
+| mHC contraction | float64 explicit branch-sum + permutation oracle | 无独立 NPU numeric oracle | **PASS on algorithm contract** |
+| Attention Gym + KL teacher closed-form | `Z*Y-p`、invalid slot、pooled teacher 有独立小例子 | 现 case不检查 aux metric | **PARTIAL；被 R1 阻塞** |
+| AuxLoss step normalization / metric mean | **缺失且当前生产实现已证实错误** | smoke 不会发现 | **FAIL / P0** |
+| Common MoE default-off + V4.1 opt-in | model-level CPU 行为有证据 | primary backend numeric guard缺失 | **PARTIAL；R2/R3** |
+| Vision + FullAC image routing | CPU checkpoint/non-checkpoint output/grad 对照 | 未覆盖 primary `spmd_types` NPU path | **PASS CPU / UNVERIFIED NPU** |
+| packed document isolation | aligned 4+4 selection mask；synthetic row 单 document | 无 | **PARTIAL；misaligned segment contract 未闭合** |
+| primary distributed path | static code显示 default/example=`spmd_types` | integration 强制 `partial_dtensor` | **FAIL / P0** |
+| HF/local state lifecycle | hand-written subset round-trip | checkpoint disabled | **PARTIAL / P1** |
+| compile / TP / CP / PP | config 明确 fail-fast | 不要求 ST | **N/A：当前明确不支持** |
+| 8P稳定性/性能 | example only | 无门禁证据 | **UNVERIFIED，不作为当前 merge 通过依据** |
+
+### Changed-file coverage audit
+
+当前 50 个 changed files 已全部纳入 final review，没有按 deletion/test/doc 类型跳过：
+
+| Surface | 文件数 | Final coverage |
+| --- | ---: | --- |
+| CI / dependency：`.ci/*`、`pyproject.toml`、`requirements.txt` | 4 | pinned TT/attn-gym、CI入口、重复版本事实源 |
+| examples/docs：旧 readme 删除、新 shell、新 readme | 3 | entry、backend、512/4k、source pin、checkpoint wording |
+| `review.md` | 1 | reviewer delivery / history / final gate |
+| integration + loss asset | 4 | loss anchor 删除、V4.1 case、runner、README matrix |
+| unit tests：旧目录删除 2 + 新 V4.1 UT 9 | 11 | UT正向功能、oracle、格式/表示耦合、state/packing缺口 |
+| 旧 `models/deepseek_v41` 删除 | 10 | 与新 package 替代关系、旧 golden/reference/context 删除 |
+| 新 `models/deepseek_v4_1` | 15 | registry/attention/compressor/indexer/mHC/model/data/vision/sharding/parallel/state 全链路 |
+| changed Common patches | 2 | MoE / Linear patch ownership、default-off、provenance |
+| **合计** | **50** | **覆盖完成** |
+
+## 9. Priority Summary
+
+### P0 — 合入前必须修复
+
+1. **R1 AuxLoss correctness**：global-valid-token denominator + group sum，去掉 global-batch-size fork。
+2. **R2 patch hard policy**：无 upstream counterpart 的 Common MoE extras / `BatchedLinear` 离开 `patches/torchtitan`，或先有真实 upstream PR 再机械回迁。
+3. **R3 primary NPU gate**：支持面统一为 `spmd_types`；现有唯一 2P ST 改同 backend，并增加 step / aux metric / deterministic numeric guard。
+
+### P1 — re-review 前必须闭合
+
+4. **R4** document segment alignment contract 在真实 producer/public boundary 闭合。
+5. **R5** RoPE implementation choice 回归 `override.imports` 单一入口。
+6. **R6** tokenizer/text/image/backend 等训练输入收敛到 config/CLI，修正文档/source pin/512 命名。
+7. **R7** real registered model full-state round-trip；checkpoint 未验证就明确标为 UNVERIFIED。
+
+### P2 — 同 PR 建议收敛，不能反向扩大设计
+
+8. **R8** Mode/role 单一事实源，删 derived topology/private defensive matrix 和 representation-heavy tests。
+9. **R9** private AC API 移到 compat Extension，去重依赖事实源并写删除条件。
+
+## 10. UNVERIFIED / Non-derivable Claims
+
+- 本 final reviewer **没有执行** CPU UT、NPU ST、8P example、checkpoint resume 或性能测试。
+- PR 描述中的「69 passed / 246 passed / 4 passed / 2×910C 30 steps / CI green」不是本次独立执行证据。
+- 当前 mirror head 没有 GitHub status/check run 可独立复核。
+- 8P `spmd_types` 稳定性、吞吐/内存没有自动门禁，不得由 2P partial-dtensor smoke 推导。
+- V4.1 DCP save/resume 目前没有本模型证据；HF adapter subset 也不能证明完整 state lifecycle。
+- AscendC fused sparse attention 与 fused indexer KL 当前明确未接入，本 review 不评价其本 PR 数值/性能正确性。
+- `full_dtensor` / `partial_dtensor` 若未来要成为 V4.1 支持面，需要各自独立说明不同生产路径和最小 NPU 证据；本 PR final target 不默认宣称支持。
+- moving `sdmyzlp/torchtitan:br_dpsk_v4_1` 不能作为可重放 baseline；必须固定实际 source commit 才能复核逐位 A/B 结论。
+
+## 11. Re-review Conditions
+
+下一轮 Maintainer re-review 只在以下条件满足后进行：
+
+1. R1 production fix 完成，并有 token-denominator invariance + multi-instance metric aggregation UT；不得只改文档/系数。
+2. R2 ownership 完成：当前两个 changed Common patch 中，本 PR 新增且无真实 upstream basis 的部分已经移出 patch；若选择 upstream 路线，必须给出实际 PR/commit 且实现可机械对照。
+3. R3 支持面完成：recipe/example/config/2P ST 统一为 `spmd_types`，其它 backend fail-fast；同一 ST 自动检查完整 step、`indexer_kl_loss/mean` finite 和新预期 deterministic guard。
+4. R4 packing contract 完成，并有 misaligned segment 反例；默认 synthetic single-document case 不再被当成 arbitrary packed-doc 证明。
+5. R5/R6 入口完成：model 不直接依赖 workaround replacement；数据输入不读隐藏 env；README/example/config 单一事实源且 source commit 固定。
+6. R7 state oracle 完成；如果 checkpoint resume 仍写成支持，需要给出实际恢复证据，否则文档明确 UNVERIFIED。
+7. 修复提交后重新核对所有既有 V4/V3.2 路径的 default-off compatibility；Common 能力移动/拆分后不得引入新的 package-wide副作用。
+8. 提交新的 reviewer 证据时，测试结果需注明实际 commit、命令、backend、NPU 数和结果；本文件前面的作者自验证数字不自动继承为新 head 的通过证明。
+
+**最终 merge gate：修改后重新 Review。当前 `92df773d...` final-review 输入 head 不满足合入条件。**
+
+Maintainer final self-check：
+
+- [x] 读取 Maintainer prompt、PR metadata、50 个 changed-file surface、完整 diff、`.agents/AGENTS.md`、requirements/CI、test-review UT/ST/format/report 规则、docs 规则；
+- [x] 查询全部 GitHub human review threads/submissions/comments，结果为空并显式记录；
+- [x] Challenger / Reducer delivery 已读取；Architect formal delivery 缺失已标记 REVIEW-GAP，并由 final Maintainer 做最小架构补审；
+- [x] 核对 pinned TorchTitan v0.3.0、merged #3864、merged #3634、V4.1 source branch、CANN KL reference；
+- [x] 已做 root-cause 去重和冲突仲裁，旧结论不再作为并行 merge gate；
+- [x] final section 只追加 `pr_833/review.md`，未修改 production/tests/master，未 approve/merge/close PR。
