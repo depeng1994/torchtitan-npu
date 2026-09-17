@@ -132,3 +132,11 @@
 | 结论 | 说明 |
 |---|---|
 | **暂停并澄清** | 目标“V4.1 支持 torch.compile”可以继续推进，但当前提交尚未满足本仓对**单一 CLI 入口、上游解耦、patch 边界、代码最小化、可复现验证和正式 ST**的要求。先完成 P0 项，再进入下一轮 review；不建议在现状下合入。 |
+
+## 11. 勘误（2026-09-17，二轮 review 后复核发现）
+
+Review 初版把 **当前 master** 当成了本 PR 的基线做参照，而本 PR 实际基于较早的 `8b0da62`（master 在 `4c4079d` 已把编译入口从 `COMPILE_BACKEND` env 改为纯 `--compile.*` CLI）。以 PR base 为准复核后：
+
+- **R1 部分撤回**：`COMPILE_BACKEND` 在 PR base 的 `scripts/run_train.sh` 中有消费逻辑（`if [ -n "${COMPILE_BACKEND:-}" ]` → `--compile.enable --compile.components model --compile.backend`），PR 描述中的复现命令在 PR 自身框架内可走通，"仓内无消费点"不成立。保留的建议部分：base→master 合并时该 env 入口已被 `4c4079d` 移除，届时复现命令需改用 `--compile.*` CLI；脚本内新增的 `COMPILE_ARGS=--compile.no-enable` 与 PR 描述命令并存仍易混淆，可斟酌简化。
+- **R15 撤回**：base 的 a3 脚本第 17 行确有 `export COMPILE_BACKEND=""`，PR 改名后删除了它，PR 描述"删除强制 export"与 diff 相符，原判（"该改动不存在"）错误。
+- **R16/R2/R3-R14 不受影响**：这些意见均以 PR diff 自身为准，不依赖 base 选择；GitCode 侧对应评论已在原讨论下发布更正回复（reply id 190260231）。
