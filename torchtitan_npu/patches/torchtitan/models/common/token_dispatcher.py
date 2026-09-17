@@ -43,6 +43,27 @@ from torchtitan.models.common.token_dispatcher import (
 from torchtitan.ops.scatter_add import deterministic_scatter_add
 
 
+def _stable_argsort_expert_ids(values_1d: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """Exact stable argsort for expert ids in ``[0, num_experts)``.
+
+    ``torch.argsort(..., stable=True)`` does not survive dynamo fake-eval
+    under the spmd_types patch stack (aten sort kernels fail inside
+    FakeTensor evaluation), so compute the same permutation with plain
+    traceable ops: each element's stable destination is the start position
+    of its value group plus its rank among equal values.
+    """
+    values = values_1d.to(torch.int64)
+    onehot = torch.nn.functional.one_hot(values, num_experts)
+    within = onehot.cumsum(dim=0).gather(1, values.unsqueeze(1)).squeeze(1) - 1
+    counts = onehot.sum(dim=0)
+    base = counts.cumsum(dim=0) - counts
+    pos = base[values] + within
+    # pos is a permutation of [0, N); its inverse (the stable order) is the
+    # ascending topk over distinct values -- traceable under both aot_eager
+    # and inductor (scatter-based inversion hits inductor dtype lowering).
+    return pos.topk(values.numel(), largest=False, sorted=True).indices
+
+
 @dataclass(frozen=True, kw_only=True)
 class LocalDispatchMetadata(TorchTitanLocalDispatchMetadata):
     """Local dispatch metadata with optional pre-W2 router scores."""
@@ -68,6 +89,26 @@ class LocalTokenDispatcher(TorchTitanLocalTokenDispatcher):
     def __init__(self, config: Config):
         super().__init__(config)
         self.absorb_router_scores = config.absorb_router_scores
+
+    def _local_reorder(  # pyrefly: ignore [bad-override]
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Patch override: upstream uses torch.argsort(stable=True), which
+        # does not trace under fullgraph=True with the spmd_types stack.
+        token_indices_experts_sorted_N = _stable_argsort_expert_ids(
+            topk_expert_ids_TK.view(-1).to(torch.int64), self.num_experts
+        )
+        topk_scores_experts_sorted_N = topk_scores_TK.view(-1)[token_indices_experts_sorted_N]
+        token_indices_experts_sorted_N = token_indices_experts_sorted_N // self.top_k
+        routed_input_ND = x_TD[token_indices_experts_sorted_N]
+        return (
+            routed_input_ND,
+            token_indices_experts_sorted_N,
+            topk_scores_experts_sorted_N,
+        )
 
     def dispatch(
         self,
@@ -124,6 +165,26 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
     def __init__(self, config: Config):
         super().__init__(config)
         self.absorb_router_scores = config.absorb_router_scores
+
+    def _local_reorder(  # pyrefly: ignore [bad-override]
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Patch override: upstream uses torch.argsort(stable=True), which
+        # does not trace under fullgraph=True with the spmd_types stack.
+        token_indices_experts_sorted_N = _stable_argsort_expert_ids(
+            topk_expert_ids_TK.view(-1).to(torch.int64), self.num_experts
+        )
+        topk_scores_experts_sorted_N = topk_scores_TK.view(-1)[token_indices_experts_sorted_N]
+        token_indices_experts_sorted_N = token_indices_experts_sorted_N // self.top_k
+        routed_input_ND = x_TD[token_indices_experts_sorted_N]
+        return (
+            routed_input_ND,
+            token_indices_experts_sorted_N,
+            topk_scores_experts_sorted_N,
+        )
 
     def dispatch(
         self,

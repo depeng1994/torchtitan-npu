@@ -2,13 +2,13 @@
 
 V4.1 的模型、图像路由、压缩 attention、metadata 和并行化均由 `torchtitan_npu/models/deepseek_v41` 持有，不依赖 V4 模型或其专属 override。
 
-当前只支持 **FSDP + EP、TP1 / CP1 / PP1、eager/reference**，保留 FullAC 与图文输入。不支持量化、ngram、MTP、GraphTrainer 或融合 attention；不支持的 TP、CP、PP 和 compile 配置在入口拒绝。
+当前只支持 **FSDP + EP、TP1 / CP1 / PP1、eager/reference**，保留 FullAC 与图文输入。不支持量化、ngram、MTP、GraphTrainer 或融合 attention；不支持的 TP、CP、PP 配置在入口拒绝；compile（aot_eager / inductor）已支持，默认关闭、按需通过 `--compile.*` 参数启用。
 
 单机 8 卡、40 层、16 专家的入口：
 
 ```sh
-bash examples/deepseek_v41/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh
-bash examples/deepseek_v41/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh --training.steps 5
+bash examples/deepseek_v41/debug/deepseek_v41_flash_8p_cpt_4k.sh
+bash examples/deepseek_v41/debug/deepseek_v41_flash_8p_cpt_4k.sh --training.steps 5
 ```
 
 `USE_GOLDEN=1` 是唯一支持的模式，launcher 默认启用；显式设置为 0 会报错。reference sparse attention 和专家算术已经是模型默认实现，只保留通用 RoPE workaround 与 virtual optimizer override，不再加载 V4 sparse attention 或 V4.1 Golden MoE 类替换。

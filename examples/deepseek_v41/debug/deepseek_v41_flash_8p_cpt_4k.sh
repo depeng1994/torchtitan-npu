@@ -6,7 +6,7 @@
 
 # Run this script on a single node.
 # Append CLI arguments to override the defaults below:
-#   ./examples/deepseek_v41/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh --training.steps 5
+#   ./examples/deepseek_v41/debug/deepseek_v41_flash_8p_cpt_4k.sh --training.steps 5
 # USE_GOLDEN=1 is the only currently supported operator path. USE_GOLDEN=0
 # (AscendC) is rejected until the ratio-1 shared/global-KV contract is
 # implemented by the fused sparse-attention kernels.

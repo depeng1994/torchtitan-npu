@@ -265,6 +265,10 @@ class Indexer(Module):
                     f"{tuple(candidate_mask.shape)} vs {tuple(index_score.shape)}"
                 )
             index_score = index_score.where(candidate_mask, float("-inf"))
-        indices = index_score.topk(k, dim=-1, sorted=False).indices.sort(dim=-1).values
+        selected = index_score.topk(k, dim=-1, sorted=False).indices
+        # aten sort does not survive dynamo fake-eval under the spmd patch
+        # stack; the selected slot ids are distinct, so a full-width
+        # topk(largest=False, sorted=True) is the identical ascending sort.
+        indices = selected.topk(k, dim=-1, largest=False, sorted=True).values
         valid = dense_mask.squeeze(1).gather(-1, indices)
         return indices.where(valid, -1), index_score

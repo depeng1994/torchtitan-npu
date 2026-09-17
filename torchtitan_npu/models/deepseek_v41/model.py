@@ -90,12 +90,8 @@ class V41Model(Decoder):
                 raise NotImplementedError(f"DeepSeek V4.1 currently supports CP=1 only; got CP={cp}")
             if pp != 1:
                 raise NotImplementedError(f"DeepSeek V4.1 does not support pipeline parallelism; got PP={pp}")
-            compile_config = getattr(config, "compile", None)
-            if compile_config is not None and getattr(compile_config, "enable", False):
-                raise NotImplementedError(
-                    "DeepSeek V4.1 does not support torch.compile yet; "
-                    "CSA2 cross-layer state is currently an eager-only runtime contract"
-                )
+            # compile (aot_eager / inductor) is now supported; the rejection
+            # has been removed to allow torch.compile on V4.1.
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
             if hasattr(config, "training"):
@@ -175,9 +171,38 @@ class V41Model(Decoder):
             candidate_block_size=config.candidate_block_size,
         )
         self.attention_context = V41AttentionContext.empty()
-        for layer in self.layers.values():
+        # Per-layer shared-input specs resolved once, outside any compiled
+        # region: (kv_source, index_source, index_before, after_candidate,
+        # compute_candidates, active_ratio, index_key_ratio,
+        # candidate_topk_blocks, candidate_block_size).
+        self._layer_shared_spec: dict[int, tuple] = {}
+        for layer_id in range(config.n_layers):
+            layer = self.layers[str(layer_id)]
+            kv_source = self.compression_plan.kv_source_for(layer_id)
+            index_source = self.compression_plan.index_source_for(layer_id)
+            # KV-source layers consume their own key projection (no override):
+            # mirror the reference `index_source = None if is_kv_source else before`.
+            index_before = (
+                None
+                if layer_id in self.compression_plan.kv_source_layers
+                else self.compression_plan.index_source_before(layer_id)
+            )
+            self._layer_shared_spec[layer_id] = (
+                kv_source,
+                index_source,
+                index_before,
+                layer_id > config.candidate_source_layer,
+                layer_id == config.candidate_source_layer,
+                self.compression_plan.ratios[kv_source]
+                if kv_source is not None
+                else layer.attention.compress_ratio,  # pyrefly: ignore [missing-attribute]
+                self.compression_plan.ratios[index_before] if index_before is not None else 1,
+                self.compression_plan.candidate_topk_blocks,
+                self.compression_plan.candidate_block_size,
+            )
             layer.compression_plan = self.compression_plan  # pyrefly: ignore [bad-argument-type]
             layer.attention_context = self.attention_context  # pyrefly: ignore [bad-argument-type]
+            layer.attention.publish_layer_id = layer_id  # pyrefly: ignore [missing-attribute, bad-argument-type]
 
     def apply_activation_checkpointing_extensions(self, policy) -> None:
         """Apply the shared AC policy to the V4.1 vision blocks."""
@@ -307,17 +332,37 @@ class V41Model(Decoder):
 
         pre_mix = None
         last_layer = None
-        for layer in self.layers.values():
+        for layer_key, layer in self.layers.items():
+            layer_id = int(layer_key)
             if pre_mix is None:
                 pre_mix = _make_identity_pre_mix(hidden, self.hc_mult)
-            hidden, pre_mix = layer(
-                hidden,
-                input_ids,
-                attention_masks,
-                positions,
-                pre_mix=pre_mix,
-                image_mask=image_mask,
-            )
+            from . import attention as _v41_attention
+
+            if _v41_attention._SHARED_INPUTS:
+                shared = self.attention_context.resolve_shared(self._layer_shared_spec[layer_id])
+                hidden, pre_mix, published = layer(
+                    hidden,
+                    input_ids,
+                    attention_masks,
+                    positions,
+                    pre_mix=pre_mix,
+                    image_mask=image_mask,
+                    shared=shared,
+                )
+                if published is not None:
+                    # Shared-inputs dataflow (compile path): the block returns
+                    # the published tuple; the eager path publishes via the
+                    # context side channel inside the block instead.
+                    self.attention_context.absorb(layer_id, published)
+            else:
+                hidden, pre_mix = layer(
+                    hidden,
+                    input_ids,
+                    attention_masks,
+                    positions,
+                    pre_mix=pre_mix,
+                    image_mask=image_mask,
+                )
             last_layer = layer
 
         if last_layer is None:

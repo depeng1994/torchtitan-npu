@@ -20,7 +20,7 @@ def test_v41_package_has_no_v4_references():
     paths += list((REPO / "tests/unit_tests/models/deepseek_v41").rglob("*.py"))
     paths += [
         REPO / "tests/integration_tests/deepseek_v41.py",
-        REPO / "examples/deepseek_v41/debug/deepseek_v41_flash_8p_cpt_4k_a3.sh",
+        REPO / "examples/deepseek_v41/debug/deepseek_v41_flash_8p_cpt_4k.sh",
     ]
     for path in paths:
         if path == Path(__file__):
