@@ -186,3 +186,131 @@
 - [x] tests 目录按 `.agents/skills/developer-tests-review` 的 `review测试` workflow 静态审查；
 - [x] 未把作者执行记录当作本 reviewer 的执行结果；
 - [x] 未修改生产代码、测试或 `master`；仅更新 `pr_833/review.md`。
+
+删减者review结论:
+
+> 范围：严格按 `torchtitan-npu-reviewer-skills/Reducer.md` 做静态删减审查；未执行测试。Reducer 的目标不是为每个新增对象找理由，而是先假设它不需要存在，再证明哪些语义必须留下。PR 当前基线为 `master@5ffd25ecc173eed7f92f8178f8796738bbdf8368 <- pr_833@75a4ad5102183a03f62ec91c9c9ab3f906ca5af9`。GitHub 镜像没有历史 review thread/review submission；下文“历史矩阵”针对本文件既有 maintainer review R1-R10 重新判定。
+
+## 1. Reducer Findings
+
+| ID | 优先级 | 对象 | Reducer 判定 | 为什么当前形态不应保留 | 最小化修改 | 测试动作 / 风险控制 |
+| --- | --- | --- | --- | --- | --- | --- |
+| RED-01 | **P0 / Blocker** | `torchtitan_npu/patches/torchtitan/models/common/moe.py` 中 `vision_enabled` / `bias_vl` / `image_mask` / `sorted_topk` | **MOVE** | 这里要区分“Common 抽象是否合理”和“是否允许落在 patch 目录”。前者可以合理；后者当前不成立。该文件自己的 module docstring 已明确写出这两项 V4.1 extension **“neither has an upstream counterpart”**，而仓库规则要求 `patches/torchtitan` 只临时承载已经有实际 upstream PR/commit、但 pinned TorchTitan 尚缺失的代码。#3634/#4095 不能为这两项 V4.1 能力提供 provenance。 | 保留“通用 Router 能力”这个设计方向，但先从 auto-applied TorchTitan patch 移出：优先放本仓 Common Extension/正常源码层，并让 V4.1 opt-in；若确实要进入 TorchTitan Common，则先提交一个真实包含这些字段/行为的 upstream PR，再让 patch 成为与该 PR 可机械对照的临时镜像。不要为了迁移再复制一套完整 MoE。 | 先改 ownership，再决定测试位置。现有 model-level default-off/opt-in 行为测试可保留一个；不要为了当前非法 patch 再新增一套 patch-level 测试。 |
+| RED-02 | **P0 / Blocker** | `patches/torchtitan/models/common/linear.py::BatchedLinear` 以及本 PR 新增 `self.n_batches = config.n_heads` | **MOVE + DELETE** | 既有 review 已确认 #3634 实际不包含 `BatchedLinear`，官方 TorchTitan 当前也没有该符号；本 PR 又为 V4.1 的 `Attention.forward` 读取 `wo_a.n_batches` 增加一个 alias，相当于为了一个 caller 扩大临时 patch API。更关键的是 `sdmyzlp/torchtitan:br_dpsk_v4_1` 的 `BatchedLinear` 本身使用 `Config.n_batches` 和 `[B,O,I]` weight，和本仓“`n_heads` + flattened weight + alias”的混合形态并不相同，无法声称机械跟随 source branch。 | 不再给当前 patch 叠 alias。V4.1 若只需要 group count，直接在模型模块保存/推导 group count；若需要真正 upstream `BatchedLinear` 语义，则以实际 upstream PR/commit 为唯一来源整体对齐，而不是继续维护 hybrid API。没有真实 upstream PR 前，代码应离开 `patches/torchtitan`。 | ownership 修正后只保留该层实际数学行为的一个测试；不要为 alias 单独加测试。若 weight layout 改变，state-dict round-trip 必须覆盖 `wo_a.weight`。 |
+| RED-03 | **P1** | `_make_v41_attn_config()` / `_make_indexer_config()` 的 `owns_compressor`、`owns_indexer`、`source_key`、`external_key`、`is_candidate_source`、`uses_candidates` 等布尔组合 | **SIMPLIFY + REUSE** | 多个耦合 bool 表达的是有限状态机，却暴露出大量非法组合，于是又产生 `source_key && external_key`、candidate owner 等防御校验。当前 `sdmyzlp/torchtitan:br_dpsk_v4_1` 已经有更收敛的 `HierarchicalIndexer.Mode.{FULL,REINDEX,REUSE}` 表达，可直接说明“不需要这些组合态”。 | 复用/对齐单一 role/mode；由 `layer_id + source layer sets` 一次派生 role，再构造 compressor/indexer。让结构消除非法状态，而不是继续添加校验。 | 删除针对非法 bool 组合的 UT；保留 FULL→REUSE、FULL→REINDEX 两个代表性行为检查。 |
+| RED-04 | **P1** | `V41Model.Config` 的 `n_layers`、`kv_source_layers`、`index_source_layers`、`candidate_source_layer`、`candidate_topk_blocks`、`candidate_block_size` 与每层 config 同时保存 topology | **MERGE / DELETE DERIVED STATE** | model builder 已经把 ownership、candidate role 和 block 参数写进每层 `Compressor.Config/Indexer.Config`；运行时模型并不需要再次持有整套 source lists。`n_layers` 也可由 `len(layers)` 得到。重复快照制造了 `n_layers == len(layers)` 等二次一致性校验和测试。`compress_ratios` 仍有 dataloader alignment/state adapter consumer，应保留或由 layers 单点派生。 | 让 `layers` 成为 runtime topology 的单一事实源。state adapter 改为遍历 `model_config.layers`；删除无 consumer 的 model-level source/candidate mirror fields，并删除 registry 中刚构建后再比较 `n_layers/len(layers)` 的校验。 | 删除“配置字段等于常量”的 representation tests；保留真实 registry build/forward 与 adapter 全量 round-trip。 |
+| RED-05 | **P1** | `_make_v41_config()` 中固定 topology 的大段 `ValueError` 矩阵，以及 `test_invalid_reuse_topology_is_rejected` 的 8 组 private-helper 负例 | **DELETE** | 三个公开 flavor 都把固定常量传给这个 private builder；这些非法 topology 不是 CLI/user contract。当前实现先允许私有 helper 接受任意组合，再用几十行 defensive programming 防住自己，测试又反向把这些内部错误文案固化。 | 删除 private topology validation matrix，让 builder 只构造合法固定 topology；保留真正用户可配置边界的 TP/CP/PP/compile fail-fast，以及 dataloader 的 `seq_len % alignment` 检查。若未来 topology 真成为 CLI 参数，再在用户入口恢复最小验证。 | 直接删除 8-case parametrized negative test；这部分删减不降低受支持路径覆盖。 |
+| RED-06 | **P1** | `_v41_trainer_config(...seq_len/fsdp_shard_degree/context_parallel_degree/expert_parallel_degree/local_batch_size/steps...)`、`DSV41_TOKENIZER_PATH`/`DSV4_TOKENIZER_PATH`/`DSV41_VISION_TEXT`、example shell 同时覆盖训练参数 | **SIMPLIFY / DELETE SECOND SOURCE** | public registry 函数并不使用这些 helper 参数做 flavor 选择；用户本来已有统一 CLI 覆盖层。与此同时 tokenizer/text 又绕开 config 直接读环境变量，形成 registry、env、shell、CLI 四个入口。 | private trainer helper只保留 flavor 构建所需参数；训练数值直接写 recipe defaults，由 CLI 覆盖。tokenizer/text/image path 进入 dataloader config/CLI；不再新增新的 shell/config 变体。现有 example shell 只保留薄封装。 | 增加/保留一条真实 CLI/config parsing 到 dataloader 的检查即可；删除针对内部 helper 参数的测试需求。 |
+| RED-07 | **P1** | `test_attention_threading.py`、`test_attention_policy.py`、`test_independence.py` 中大量 object identity、tuple slot、字段存在性和静态源码扫描 | **REDUCE / MERGE** | producer→consumer 连接是产品语义，但“40 层每一层返回同一个 Python object”“固定 tuple index 是 2/3/4/5/6”“某个 private module 没有某字段”并不是用户结果。这些测试会把未来把 tuple 封装、role 收敛或等价 tensor 重建都误判为回归。`test_v41_package_has_no_v4_references` 还扫描 tests/examples 源码，属于高维护的仓库结构 oracle；真实隔离 subprocess build 已经提供更强的行为证据。 | threading 只留 3 个代表节点：source→reuse、reindex、candidate pool，并在 consumer hook 检查数值/shape/最终 forward，而不是覆盖全部 40 层 identity。`test_independence` 保留隔离 subprocess 的真实 registry forward/backward；删除 AST/repo-wide grep 与 Common type identity 锁定。 | 这是主要测试删减来源；详见 Test Reduction Matrix。 |
+| RED-08 | **P1** | `tests/integration_tests/deepseek_v4_1.py` 的 `use_golden=True` + `check_loss=False`，以及已删除专用 loss anchor | **SIMPLIFY, 不扩 ST 矩阵** | runner 只有 `check_loss=True` 才读取并比较 golden，也只有 `check_loss/check_resume` 才自动加 deterministic 参数；因此当前 `use_golden=True` 不提供数值 oracle，只制造“似乎有 golden”的配置噪声。另一方面本 PR 明确改变 MoE arithmetic 并新增 KL backward，单纯 completion 又不足以证明新训练语义。 | 不新增第二个 NPU case。复用现有 2P FSDP2+EP2 case：若定位为纯 smoke，就把 `use_golden` 明确设为 false；若它承担本 PR 数值回归（更符合本次计算变更），则让同一个 case 开 deterministic 并做短轨迹/目标 metric guard。两种语义二选一，不保留当前半 golden 状态。 | ST 数量保持 1；检查 `indexer_kl_loss` 存在且 finite。若恢复 loss guard，只记录新实现的预期，不再维护 old-vs-golden 双路径。 |
+| RED-09 | **P2** | `test_state_dict_adapter.py` 的 ownership helper tests、deterministic duplicate round-trip；手写 HF 子集 | **MERGE** | `owns_*` helper 的真值表和“同一输入调用两次得到同值”都弱于真正 adapter 契约。当前更重要的风险是实际 tiny registry model 的 compressor/indexer/vision/MoE key 是否完整映射。 | 用一个真实 tiny model `state_dict -> to_hf -> from_hf` 全量 round-trip 替代 helper 真值表 + deterministic duplicate；必要时再加一个未知 key/breaking-boundary case，不做组合矩阵。 | 测试数量下降但 oracle 变强；覆盖 `wo_a`、compressor/indexer、vision markers、`bias_vl`、grouped expert weights。 |
+| RED-10 | **P2** | `attn-gym==0.0.9` 在 `requirements.txt`、`pyproject.toml`、`.ci/unit_test.sh`、`.ci/smoke_test.sh` 的版本字面量；example 名称 `...4k...sh` 实际 `SEQ_LEN=512` | **SIMPLIFY / RENAME** | 新依赖本身必要，但版本号不应在 CI workaround 再复制两份；脚本名与真实配置不一致则是已经发生的文档状态分叉。 | 保留一个依赖版本 source-of-truth，CI 的 `--no-deps` workaround 从它读取；不要为 CI 再建脚本。把现有 example 直接重命名为 512 对应名称并同步 README 引用。 | 纯维护面删减；不新增测试。 |
+
+## 2. Reduction Inventory
+
+| 新增/修改对象 | 当前职责 | 判定 | Reducer 结论 |
+| --- | --- | --- | --- |
+| `DeepSeekV41Metadata(doc_ids_BL)` | packed-document isolation | **KEEP** | 单字段、两个真实 consumer，共享语义清晰；不要重新引入 `cu_seqlens`/context state。 |
+| model/block/attention 显式 thread `cmp_k/idx_k/topk_indices/topk_scores/candidates` | 跨层共享 runtime state | **KEEP** | 这是从 mutable state 收敛到显式数据流，和 source branch 方向一致；不要为了缩短签名恢复 module state。 |
+| 每层 `Compressor` / `Indexer`，非 source 无权重 | 统一 layer shape 与 ownership | **KEEP** | 语义真实，source/reuse 生命周期清楚；应删的是 role 表达冗余，不是每层对象本身。 |
+| `IndexerKLLoss` | indexer distillation | **KEEP** | `Z*Y-p` 有独立数学 oracle，是训练语义而非 debug metadata。 |
+| `CompressedSparseInnerAttention2` + `attn-gym` | window + selected compressed KV + sink | **KEEP** | 引入第三方 operator 替代本仓重复 sparse implementation，符合复用优先。 |
+| `DeepSeekV41Metadata`/Attention Gym 的 `doc_ids` 接线 | varlen isolation | **KEEP** | 单一 metadata source。 |
+| `_make_v41_attn_config` 的多 bool role surface | 构造每层 role | **SIMPLIFY/REUSE** | 收敛到单一 Mode/role。 |
+| `V41Model.Config` source/candidate topology 镜像字段 | 重复保存 builder topology | **DELETE/MERGE** | layers 已编码；去掉 derived state。 |
+| `n_layers` + `len(layers)` 双记录 | 层数 | **SIMPLIFY** | state adapter/metrics 改为遍历 layers 后可删除 `n_layers`。 |
+| `_make_v41_config` topology validation matrix | 防御 private helper 的非法调用 | **DELETE** | 非用户入口；结构上消除非法组合。 |
+| `_document_alignment` / `document_alignment` | CLI 改 seq_len 后仍保证 pooling 边界 | **KEEP** | 这是实际运行约束，不应因 Reducer 误删；只压缩重复测试。 |
+| `_vision_encoder_anchor()` | 无 image scatter 时让 vision 参数参与 autograd | **INLINE/SIMPLIFY** | 行为要留，单调用 helper/长 docstring 可直接内联成清晰一行或短局部注释。 |
+| `DEFAULT_VISION_IMAGE_PATHS=tests/assets/...` | synthetic/debug 默认图像 | **MOVE** | 测试 fixture 不应成为正式 flash recipe 的隐式 production 默认；只留 debug/integration config。 |
+| Common MoE V4.1 fields in auto patch | multimodal/sorted routing | **MOVE** | 抽象可 Common，patch placement 当前无 upstream basis。 |
+| `BatchedLinear.n_batches` alias | 让 V4.1 forward 读取 group count | **DELETE** | caller-specific alias；group count 本地保存即可。 |
+| `attn-gym` dependency | selected attention backend | **KEEP** | 必要依赖；只去重版本声明。 |
+| example shell | 单节点参考训练入口薄封装 | **KEEP + RENAME** | 不新增脚本；修正 4k/512 漂移。 |
+| 2P FSDP2+EP2 integration case | NPU 完成性/数值代表场景 | **KEEP** | 只保留这一组，不扩组合；让语义明确。 |
+
+## 3. Historical Review Fix Reduction Matrix
+
+| 既有 finding | Reducer 复核 | 当前状态 | Reducer 动作 |
+| --- | --- | --- | --- |
+| R1 Common MoE generalization **Accepted** | “Common 抽象可复用”成立，但不能推出“允许放在 `patches/torchtitan`”。patch 本文明确承认两项能力无 upstream counterpart。 | **重新打开** | 对抽象 **KEEP**，对 patch placement **MOVE (P0)**；不要继续为非法 placement 增测试。 |
+| R2 `BatchedLinear` provenance | 仍成立，而且本 PR 的 `n_batches` alias 又扩大了无 provenance API。 | **未修** | **MOVE + DELETE alias (P0)**。 |
+| R3 model 静态依赖 `WorkaroundComplexRoPE` | Reducer 同意：这是实现选择重复，override 不再是单一入口。 | **未修** | **REUSE/MOVE** 到稳定 config + override seam。 |
+| R4 hidden env + `4k`/512 | 仍成立；`_v41_trainer_config` 还额外复制一组本可 CLI 覆盖的参数。 | **未修** | **DELETE second source + RENAME**。 |
+| R5 ST 无 numeric guard | 仍成立，但不应通过增加新 NPU case 修。 | **未修** | **MERGE** 到现有 2P case，保持 ST=1。 |
+| R6 identity oracle | Reducer 更进一步：repo-wide AST scan、40-layer object identity、private tuple slot 都属于实现表示锁定。 | **未修** | **DELETE/REDUCE**，保留真实隔离 build + 代表 producer/consumer。 |
+| R7 state adapter 子集 round-trip | 仍成立；解决方式不应是再叠 helper test。 | **未修** | **MERGE** 现有测试为一个 real-model full round-trip。 |
+| R8 private `_wrap_block` | 仍是升级耦合。 | **未修** | **MOVE** private compatibility 到 Extension/compat seam；模型只声明 extra blocks。 |
+| R9 patch-level tests | 前提需要修改：RED-01/02 ownership 未合法化前，不应先为非法 patch 扩测试。 | **需改方案** | 先 MOVE/明确 upstream basis；最终位置只留最小行为 UT。 |
+| R10 defensive topology validation | 完全符合 Reducer 删除目标。 | **未修** | **DELETE** private validation matrix + 对应 negative tests。 |
+
+GitHub 镜像当前没有 review thread/review submission，因此没有额外“历史 inline comment 已修复但残留代码”可做二次删减；本矩阵已覆盖 `review.md` 中可见的 R1-R10 历史决策。
+
+## 4. Top Reduction Plan
+
+| 优先级 | 改动 | 预期净效果 |
+| --- | --- | --- |
+| **P0** | 把无 upstream counterpart 的 V4.1 Router/MoE 扩展移出 `patches/torchtitan`，或先建立真实 upstream PR 后再以 patch 镜像；不复制完整 MoE。 | 恢复 patch 目录可删除、可机械对照的生命周期；去掉 package-wide model leakage。 |
+| **P0** | 停止继续扩 `BatchedLinear` hybrid patch；删除 `n_batches` alias，V4.1 本地持有 group count；若要 upstream Common，则整体对齐真实 PR。 | 去掉无 provenance API 和一个跨层 patch 依赖。 |
+| **P1** | role bool 收敛为一个 Mode；删除 model-level topology mirror fields、`n_layers/len(layers)` 二次状态、private topology validation matrix。 | 同时减少 config surface、运行时校验和大量 negative/representation tests。 |
+| **P1** | Trainer recipe 只保留 flavor defaults + CLI；tokenizer/text/image 不再读 hidden env；现有 shell 保持单一薄入口。 | 训练入口重新单一可追溯，不新增 config/shell 变体。 |
+| **P1** | 测试以行为为中心压缩：一个真实隔离 forward/backward、几个代表 state transitions、独立 KL/mHC 数学 oracle、一个 real state round-trip、一个 2P ST。 | 降低维护成本，同时提升 oracle 强度。 |
+| **P2** | CI 从单一依赖版本源读取 `attn-gym`，重命名 `4k`→512 example，移动 tests asset 默认值到 debug/integration。 | 去掉文档/依赖重复状态。 |
+
+### KEEP 清单（不要为了“删代码”误删）
+
+- 显式跨层 tuple state，而不是恢复 mutable attention context；
+- `DeepSeekV41Metadata.doc_ids_BL` 单字段 metadata；
+- 每层 Compressor/Indexer 的 source/reuse 结构；
+- Attention Gym `selected_attention` 复用；
+- `IndexerKLLoss` 的 marginal-weighted KL 和独立 closed-form gradient oracle；
+- mHC 的显式 branch-sum oracle；
+- dataloader alignment **约束本身**；
+- 现有唯一 2P FSDP2+EP2 代表 ST。
+
+## 5. Test Reduction Matrix
+
+| 测试文件 / case | 当前价值 | Reducer 动作 | 保留的最小 oracle |
+| --- | --- | --- | --- |
+| `test_attention_policy.py` | selection mask 手算是高价值；大量 config ownership/非法 topology 是 representation/defensive | **保留 1，删除/合并其余** | 保留 document-isolated causal selection 的精确 expected；删除 8-case private builder rejection，role 配置检查缩成一个真实 source→reuse/reindex 行为。 |
+| `test_attention_threading.py` | producer/consumer 语义重要，但全 40 层 identity 与 tuple slot 强耦合 | **大幅缩减** | 仅 source→reuse、reindex、candidate pool 三个代表 transition + 最终 forward；删除重复 pass-through identity、private missing-state assertion matrix。 |
+| `test_baseline_contract.py` | TP user boundary、实际 routing 行为有价值；内部 factory/type/default field 次要 | **MERGE** | 保留 TP rejection；Common/V4.1 routing 只保留一个最终行为 case。删除 `compress_ratios` private consistency 负例。 |
+| `test_independence.py` | 隔离 subprocess real registry build/backward 很强；AST scan/type identity 较弱 | **保留 1~2，移动 1** | 保留 `test_v41_builds_and_runs_without_v4`；删除 repo-wide AST grep 和 Common type identity；`test_common_rope_imports_without_cann` 移到 common rope/override 对应测试目录。 |
+| `test_indexer_distill_loss.py` | closed-form gradient 与 pooled-teacher 等价是核心算法 oracle | **KEEP + 小合并** | 保留 `Z*Y-p` + pooled sum；invalid-slot 可并入主 case；删除“每层 config 是否挂 loss”的 representation test。 |
+| `test_mhc_v4_1.py` | explicit branch oracle 高价值；多个性质测试存在重叠 | **KEEP 2，合并/删重复性质** | `matches_the_explicit_branch_sum` + permutation case 足够区分错误 contraction axis；shape/Sinkhorn 可并入一个 smoke。 |
+| `test_state_dict_adapter.py` | 当前 helper ownership + 手写子集过弱 | **替换而非增加** | 一个 tiny real registry model 全量 round-trip；删除 `owns_*` 真值表和 deterministic duplicate。 |
+| `test_training_contract.py` | synthetic producer 与 FullAC gradient/routing 都是用户可观察行为 | **KEEP** | FullAC 前后 output/grad + image mask；synthetic loader 基础字段可留一个。 |
+| `test_vision_loader_alignment.py` | alignment 约束真实，但 6 个 case 重复验证字段/透传/不改变数据 | **缩成 2** | 一个 registry-derived alignment 到 loader 的正向 case + 一个 CLI `seq_len=511` rejection。删除 `dataset.document_alignment` 字段存在、loader pass-through、unchanged-row 等重复检查。 |
+| `dsv41_debugmodel_2p_ep2_fsdp2` | 唯一代表 NPU ST | **KEEP 1，不新增组合** | 明确 smoke 或 deterministic guard 二选一；本 PR 更适合在同一 case 增 KL metric + 短数值 guard。 |
+
+### 测试 review 子结论
+
+当前测试的主要问题不是“数量少”，而是**实现表示测试过多、真正 end-to-end oracle 反而需要更强**。建议用替换而不是叠加：删除 private validation/identity/helper 测试后，把预算集中到真实 registry forward/backward、real state round-trip 与现有 2P ST。按仓内 UT/ST review skill，CPU UT 不能替代真实 NPU 通信，但也不需要为每个 bool/field 再造 case。
+
+## 6. “还能否删掉约 30%？”
+
+**可以，但目标应是本 PR 新增的 validation/config/test scaffolding，而不是核心 V4.1 算法。** 不建议为了数字删除显式 state、metadata、KL、Attention Gym 或 mHC 语义。可直接形成约 30% 量级维护面下降的组合是：
+
+1. 删除 `_make_v41_config` 的 private defensive validation matrix + 8 个 negative topology cases；
+2. role bool 收敛为单一 Mode，并删除 model-level topology mirror fields/对应字段断言；
+3. `test_attention_threading` 从“40 层 object identity 全展开”收敛到 3 个代表 transition；
+4. 删除 `test_independence` 的 repo-wide AST scan/type identity oracle，保留真实隔离 subprocess；
+5. state adapter 4~5 个 helper/subset checks 合并成 1 个 real-model full round-trip；
+6. vision alignment 6 个 checks 收敛为正向 + 一个真实错误入口；
+7. 删除 `BatchedLinear.n_batches` caller-specific alias、trainer helper 的重复可调参数和 CI 里的重复版本字面量。
+
+这组删减预计可以明显超过“只做格式清理”的量级，并接近/达到 **新增 UT + defensive/config surface 的 30%~40%**；核心生产算法不需要同步缩掉 30%。真正的衡量标准是减少事实源、非法状态和表示耦合，而不是追求总代码行数百分比。
+
+## 7. Reducer 最终结论
+
+**当前结论：需要修改后再合入。** 最高优先级不是继续补测试，而是先把 RED-01/RED-02 的 patch ownership 修正；随后用 RED-03~RED-07 把角色/配置/入口/测试维护面收敛。已有 review 对 Common MoE “抽象方向可接受”的判断可以保留，但严格按仓库 patch 生命周期，当前无 upstream counterpart 的 V4.1 字段不能因此继续留在 `patches/torchtitan`。
+
+Reducer 自检：
+
+- [x] 已先读 PR metadata、完整 diff、固定 TorchTitan 版本与 source branch；
+- [x] 已读取 `.agents/AGENTS.md` 与 UT/ST review skill/原则文档；
+- [x] 已逐类盘点新增 class/config/field/helper/state/test/dependency/entry；
+- [x] 已显式标出 KEEP，避免把核心语义误删；
+- [x] 已复核既有 R1-R10，未把旧 review 结论机械继承；
+- [x] 已给出 P0/P1/P2、Test Reduction Matrix 与约 30% 删减方案；
+- [x] 本次只允许修改 `pr_833/review.md`；不修改生产代码、测试、`master`，不 approve/merge/close PR。
