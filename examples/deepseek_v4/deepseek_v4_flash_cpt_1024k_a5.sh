@@ -20,4 +20,7 @@ exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
     --parallelism.data-parallel-replicate-degree 1 \
     --training.seq-len 1048576 \
     --training.global-batch-size 8 \
+    --dataloader.num-workers 1 \
+    --dataloader.persistent-workers \
+    --dataloader.prefetch-factor 8 \
     "$@"
