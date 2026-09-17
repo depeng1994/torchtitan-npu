@@ -14,6 +14,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
+# One worker overlaps the current online tokenize/pack path with NPU compute.
+# prefetch_factor=8 matches this recipe's current GA8 burst-fetch order. It is a
+# tuning default rather than a topology invariant; adjust it from steady-state
+# DataLoader wait time and host/shared-memory pressure when batch topology changes.
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
     --parallelism.context-parallel-degree 128 \
     --parallelism.data-parallel-shard-degree 1 \
@@ -21,6 +25,5 @@ exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
     --training.seq-len 1048576 \
     --training.global-batch-size 8 \
     --dataloader.num-workers 1 \
-    --dataloader.persistent-workers \
     --dataloader.prefetch-factor 8 \
     "$@"
