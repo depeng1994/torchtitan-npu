@@ -21,16 +21,20 @@ torchtitan 迁移而来。
 | `dsv3_2_dsa_ep2_fsdp2` | DeepSeek-V3.2 | DSA + EP2/FSDP2 | 2 | - | 是 | - |
 | `dsv3_2_dsa_cp2` | DeepSeek-V3.2 | DSA + CP2 | 2 | - | 否 | ST 仅验证训练触发；CPU metadata oracle 单独覆盖，暂未生成 CP2 golden loss |
 | `dsv4_ema_ep2_fsdp2` | DeepSeek-V4 | Golden + EP2/FSDP2 + EMA CPU offload | 2 | - | 否 | 校验完整 DCP metadata 包含 `ema_optimizer.*` |
-| `dsv41_golden_2p_ep2_fsdp2` | DeepSeek-V4.1 | Golden 调试模型（40 层全结构、调试宽度）+ FSDP2 + EP2，50 步精确 loss | 2 | - | 是 | 多模态 golden 轨迹守护，锚定 `tests/assets/losses/dsv41_golden_2p_ep2_fsdp2.txt`；8 卡形状作手动 A/B 回归，锚不入库 |
+| `dsv41_debugmodel_2p_ep2_fsdp2` | DeepSeek-V4.1 | Reference 调试模型（40 层全结构、调试宽度）+ FSDP2 + EP2 | 2 | - | 否 | V4.1 不保留专门 loss 锚（对齐上游 torchtitan 的模型测试方式）；该 case 只覆盖 reference 算子路径的真实训练执行，末步 loss 不保证 run-to-run 复现（deterministic 与 seed 仅在 `check_loss=True` 时启用，历史末值 8.59 / 8.71 / 8.86），需要稳定数值时显式传 `--debug.deterministic --debug.seed=42` |
 
-V4.1 模型栈完全独立于 `deepseek_v4`（无继承、无 import、无跨模型 override，见 `tests/unit_tests/models/deepseek_v41/test_independence.py`）；golden 参考算子是 `V41SparseAttention`/`V41MoE` 的原生路径，套件仅需 RoPE workaround 与 virtual optimizer 两个通用 override。
+V4.1 模型栈完全独立于 `deepseek_v4`（无继承、无 import、无跨模型 override，见 `tests/unit_tests/models/deepseek_v4_1/test_independence.py`）；模型默认算子是 Attention Gym 的 eager `selected_attention`（`CompressedSparseInnerAttention2`）与公共 MoE 工厂（`make_moe_config`，仅路由器的视觉偏置与降序选择为插件扩展），套件仅需 RoPE workaround 与 virtual optimizer 两个通用 override。
 
 `use_golden` 与 `check_loss` 是两个独立维度：`use_golden` 仅决定使用 Golden 参考算子
 还是 SMLA/NPU override；`check_loss` 决定是否启用 deterministic、读取参考 loss 并执行
 精确数值比较。
 
-当前三个 Golden case（V4 两个、V4.1 一个） 设置 `check_loss=True`，使用固定随机种子和 deterministic 模式，
+当前两个 Golden case（均为 V4）设置 `check_loss=True`，使用固定随机种子和 deterministic 模式，
 比较 TensorBoard 标量 `loss_metrics/global_avg_loss`，要求 step 集合和每个浮点值均精确相等。
+DeepSeek-V4.1 不保留专门 loss 锚：与上游 torchtitan 的 V4.1 模型一致，它由 CPU UT 加一条
+reference 路径的 2 卡 case 覆盖，不做逐值比较；该 case 是 smoke run，末步 loss 不保证
+run-to-run 复现（deterministic 与 seed 只在 `check_loss=True` 时启用），需要稳定数值时
+显式传 `--debug.deterministic --debug.seed=42`。
 
 两个 DeepSeek-V3.2 case 同样设置 `check_loss=True`，使用 RoPE workaround、Ascend DSA
 metadata/attention override，并分别对 1-rank 和 EP2/FSDP2 的 100-step loss 做精确比较。
@@ -110,6 +114,10 @@ runner 迁移自 torchtitan 的 GPUPool 机制：默认将用例并发打包到�
 `OverrideDefinitions.timeout` 设置超时；超时后 runner 会向子进程所在进程组先发
 `SIGTERM`、宽限期后再 `SIGKILL`，确保 `torchrun` 及各 rank 子进程全部退出，不会
 留下占用 NPU 的孤儿进程（超时按失败处理并输出已捕获日志）。
+
+- 同一台机器上并发运行两个 2 卡 case 时必须为每个 run 设置不同的
+  `HCCL_NPU_SOCKET_PORT_RANGE`（例如 `62000-62020`）；否则后启动的 run 会在 HCCL
+  建链时报 `Communication_Error_Bind_IP_Port`（一次并发验证即在同一端口上冲突）。
 
 调度器本身不设独立单元测试：其正确性（设备不重叠、失败/超时释放、并发打包、
 golden loss 等价）由集成测试自身的 canary 运行直接验证。

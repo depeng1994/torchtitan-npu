@@ -17,6 +17,14 @@ clamp as transformers / the inference repo; 0 disables).  The config
 factories gain a ``swiglu_limit`` passthrough.  Swaps the originals at
 import time so downstream code keeps using the upstream names; non-hash
 configs and the default 0.0 clamp take the byte-identical upstream path.
+The multimodal V4.1 router keeps two extensions of its own (upstream V4.1 is
+text-only, so neither has an upstream counterpart): ``vision_enabled`` adds the
+``bias_vl`` choice bias, which replaces the load-balancing bias on image-masked
+tokens and is a plain parameter the MoE balancing hook never updates, and
+``MoE.forward`` threads the ``image_mask`` down to it.  ``sorted_topk`` restores
+the reference's descending selection order, since the pinned router selects
+unsorted.
+
 ``config_utils`` is deliberately imported inside ``apply()``, after the
 class swaps, so its module-level imports bind the patched classes — keep
 the swap-then-import order.
@@ -66,6 +74,11 @@ class HashRouter(TokenChoiceTopKRouter):
     class Config(TokenChoiceTopKRouter.Config):
         hash: bool = False
         vocab_size: int | None = None
+        # Multimodal extension: add the ``bias_vl`` image-masked choice bias.
+        vision_enabled: bool = False
+        # Select the top-k in descending score order (the reference's order, which the
+        # routed-index digests depend on) instead of the pinned unsorted selection.
+        sorted_topk: bool = False
         score_func: Literal[  # pyrefly: ignore [bad-override]
             "softmax", "sigmoid", "sqrtsoftplus"
         ] = "sigmoid"
@@ -74,6 +87,10 @@ class HashRouter(TokenChoiceTopKRouter):
         super().__init__(config)
         self.hash = config.hash
         self.vocab_size = config.vocab_size
+        self.sorted_topk = config.sorted_topk
+        self.bias_vl = (
+            torch.nn.Parameter(torch.zeros(self.num_experts, dtype=torch.float32)) if config.vision_enabled else None
+        )
         if self.hash:
             if config.vocab_size is None:
                 raise ValueError("hash routing requires vocab_size.")
@@ -95,10 +112,17 @@ class HashRouter(TokenChoiceTopKRouter):
                     device=buffer_device,
                 )
 
-    def _select_experts(self, scores_for_choice: torch.Tensor) -> torch.Tensor:
-        return scores_for_choice.topk(self.top_k, dim=-1, sorted=False)[1]
+    def reset_parameters(self) -> None:
+        # ``bias_vl`` starts at zero; it is not part of the score gate, so no gate
+        # initialization applies to it.
+        bias_vl = getattr(self, "bias_vl", None)
+        if bias_vl is not None:
+            torch.nn.init.zeros_(bias_vl)
 
-    def forward(self, x_BLD, expert_bias_E=None, *, input_ids=None):
+    def _select_experts(self, scores_for_choice: torch.Tensor) -> torch.Tensor:
+        return scores_for_choice.topk(self.top_k, dim=-1, sorted=self.sorted_topk)[1]
+
+    def forward(self, x_BLD, expert_bias_E=None, *, input_ids=None, image_mask=None):
         # Compute gate in float32 to help stability of expert load balancing
         # (torchtitan TokenChoiceTopKRouter pattern).
         with torch.autocast(device_type=x_BLD.device.type, dtype=torch.float32):
@@ -120,7 +144,13 @@ class HashRouter(TokenChoiceTopKRouter):
                 raise ValueError("input_ids is required for DSV4 hash routing.")
             selected_experts_indices = self.tid2eid[input_ids]
         else:
-            scores_for_choice = scores if expert_bias_E is None else scores + expert_bias_E
+            choice_bias = scores.new_zeros(self.num_experts) if expert_bias_E is None else expert_bias_E
+            # Multimodal extension: on image-masked tokens the vision bias replaces the
+            # load-balancing bias in the choice.  ``bias_vl`` is a plain parameter, so
+            # the balancing hook (which updates ``expert_bias_E``) never touches it.
+            if image_mask is not None and self.bias_vl is not None:
+                choice_bias = torch.where(image_mask.unsqueeze(-1), self.bias_vl, choice_bias)
+            scores_for_choice = scores + choice_bias
             # Apply node-limited routing if configured (upstream behavior).
             if self.num_expert_groups is not None:
                 scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
@@ -156,11 +186,18 @@ class HashMoE(MoE):
         if getattr(self.router, "hash", False):
             self.expert_bias_E = None
 
-    def forward(self, x_BLD: torch.Tensor, *, input_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x_BLD: torch.Tensor,
+        *,
+        input_ids: torch.Tensor | None = None,
+        image_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Forward through the router (with optional ``input_ids``) and experts.
 
         The body mirrors upstream ``MoE.forward``; ``input_ids`` is only
-        consumed by the router's hash path.
+        consumed by the router's hash path and ``image_mask`` only by its
+        multimodal vision bias.
         """
         _B, L, _D = x_BLD.shape
         sp_size = getattr(self.routed_experts.token_dispatcher, "sp_size", 1)
@@ -182,6 +219,7 @@ class HashMoE(MoE):
             x_BLD,
             getattr(self, "expert_bias_E", None),
             input_ids=input_ids,
+            image_mask=image_mask,
         )
 
         routing_map_BLE = torch.zeros_like(scores_BLE, dtype=torch.bool).scatter_(

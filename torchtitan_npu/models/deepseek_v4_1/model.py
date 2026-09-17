@@ -3,34 +3,156 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""V4.1 model layer: the standalone decoder with multimodal input handling.
+"""DeepSeek V4.1 text backbone.
 
-A plain :class:`torchtitan.models.common.decoder.Decoder` 鈥?no MTP depths,
-no context-parallel sharding (both rejected in ``update_from_config``).
-The golden reference arithmetic is the only path; ``USE_GOLDEN=0`` is
-rejected by the config registry entry, and the model output follows the
-golden FP32 contract.
+Shape legend for this file:
+    B = batch, L = sequence length, D = model dimension, hc = ``hc_mult`` residual
+    branches.
+
+A plain :class:`torchtitan.models.common.decoder.Decoder` — no MTP depths, no
+context-parallel sharding (both rejected in ``update_from_config``).
+
+The block carries the residual stream as ``hc`` parallel branches and threads the
+cross-layer attention state (compressed KV, index keys, selected entries, student
+logits, candidate pool) explicitly: an attention source layer returns the tensors it
+produced, every other layer returns what it was handed.  That keeps the reuse structure
+visible in the forward signature instead of in mutable module state, at the cost of a
+longer tuple.
+
+Single-Pass mHC means each sublayer collapses its input with the mixing coefficients
+predicted by the *previous* sublayer, so the block returns the coefficients its
+successor needs.  The stack has no learned output head: the model collapses the
+branches with the last block's coefficients and feeds the result straight to the output
+norm.
+
+Packed documents are described by :class:`DeepSeekV41Metadata`: the only varlen
+metadata is a document id per token, which both Attention Gym's operator (window
+branch) and the indexer (entry-axis isolation) derive their masks from.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
-from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
-from torchtitan.models.common.decoder import Decoder
+from torchtitan.models.common.decoder import Decoder, TransformerBlock
 
-from .attention import V41AttentionContext, build_v41_compression_spec
-from .metadata import build_compressed_varlen_metadata
-from .mhc import _make_identity_pre_mix
-from .reference import ReferenceMetadataExtension
+from .mhc import HcPost, HcPre
 from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings  # noqa: TC001
 from .vision_data import scatter_image_features
 
 if TYPE_CHECKING:
-    from torchtitan_npu.models.common.metadata_extension import MetadataExtension
+    from torchtitan.models.common.moe import MoE
+
+    from .attention import Attention
+
+
+@dataclass(frozen=True, kw_only=True, slots=True)
+class DeepSeekV41Metadata:
+    """Per-forward varlen metadata, built by :meth:`V41Model.get_attention_masks`.
+
+    ``doc_ids_BL`` is the only field: a non-decreasing document index per token, built
+    from the positions resetting to 0 at every packed segment start.  The same tensor
+    serves both consumers, which is why they agree by construction:
+    ``selected_attention`` applies ``doc_ids[q] == doc_ids[k]`` to its sliding-window
+    branch, and the indexer applies the same equality one axis over, entry ``j``
+    covering tokens ``[j * compress_ratio, (j + 1) * compress_ratio)``.  No
+    ``cu_seqlens``-style ragged form is carried because the operators consume the
+    per-token view directly.
+    """
+
+    doc_ids_BL: torch.Tensor  # noqa: N815
+
+
+class DeepSeekV41TransformerBlock(TransformerBlock):
+    """Transformer block with HC mixing around attention and the MoE feed-forward."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TransformerBlock.Config):
+        # Redeclared with the V4.1 types so config builders can reach the fields the
+        # sharding and MTP helpers need.
+        attention: Attention.Config  # pyrefly: ignore [bad-override]
+        moe: MoE.Config  # pyrefly: ignore [bad-override]
+        hc_attn_pre: HcPre.Config
+        hc_ffn_pre: HcPre.Config
+        hc_post: HcPost.Config
+
+    def __init__(self, config: Config):
+        super().__init__()
+        cfg = config
+        self.moe_enabled = True
+        self.attention = cfg.attention.build()
+        self.attention_norm = cfg.attention_norm.build()
+        self.ffn_norm = cfg.ffn_norm.build()
+        self.moe = cfg.moe.build()
+        self.hc_attn_pre = cfg.hc_attn_pre.build()
+        self.hc_ffn_pre = cfg.hc_ffn_pre.build()
+        self.hc_post = cfg.hc_post.build()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_masks: DeepSeekV41Metadata | None,
+        positions: torch.Tensor | None = None,
+        *,
+        pre_mix: torch.Tensor,
+        image_mask: torch.Tensor | None = None,
+        cmp_k: torch.Tensor | None = None,
+        idx_k: torch.Tensor | None = None,
+        topk_indices: torch.Tensor | None = None,
+        topk_scores: torch.Tensor | None = None,
+        candidates: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Returns ``(x, pre_mix, cmp_k, idx_k, topk_indices, topk_scores, candidates)``.
+
+        ``pre_mix`` is the attention-input coefficient the next block must consume, and
+        the shared attention tensors are this block's contribution to the chain.
+        """
+        residual = x
+        x, attn_pre, post, comb = self.hc_attn_pre(x, pre_mix)
+        x, cmp_k, idx_k, topk_indices, topk_scores, candidates = self.attention(
+            self.attention_norm(x),
+            positions,
+            attention_masks,
+            cmp_k=cmp_k,
+            idx_k=idx_k,
+            topk_indices=topk_indices,
+            topk_scores=topk_scores,
+            candidates=candidates,
+        )
+        x = self.hc_post(x, residual, post, comb)
+
+        residual = x
+        x, ffn_pre, post, comb = self.hc_ffn_pre(x, attn_pre)
+        x = self.moe(self.ffn_norm(x), input_ids=input_ids, image_mask=image_mask)
+        x = self.hc_post(x, residual, post, comb)
+        return x, ffn_pre, cmp_k, idx_k, topk_indices, topk_scores, candidates
+
+    def collapse_pre_mix(self, x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
+        return self.hc_attn_pre.collapse(x, pre_mix)
+
+
+def _vision_encoder_anchor(hidden: torch.Tensor, visual: torch.Tensor) -> torch.Tensor:
+    """Keep the vision tower in the autograd graph when nothing is scattered.
+
+    A batch can carry a tower whose features have no slot to go to (no spans and no
+    feature indices, or empty spans).  DDP/FSDP require every parameter to take part in
+    the backward pass, so the hidden states keep a zero-valued contribution from the
+    tower instead of dropping it -- and this makes that intent explicit rather than a
+    bare multiply-by-zero.
+    """
+    return hidden + visual.sum() * 0
 
 
 def scatter_image_embeddings(
@@ -70,7 +192,6 @@ class V41Model(Decoder):
         n_layers: int
         hc_mult: int = 4
         compress_ratios: tuple[int, ...]
-        window_size: int
         kv_source_layers: tuple[int, ...] = ()
         index_source_layers: tuple[int, ...] = ()
         candidate_source_layer: int = 20
@@ -78,7 +199,6 @@ class V41Model(Decoder):
         candidate_block_size: int = 8
         vision_encoder: DeepSeekV41VisionEncoder.Config | None = None
         image_marker_embeddings: ImageMarkerEmbeddings.Config | None = None
-        metadata_extension: MetadataExtension.Config = field(default_factory=ReferenceMetadataExtension.Config)
 
         def update_from_config(self, *, config, **kwargs):
             parallelism = config.parallelism
@@ -98,6 +218,11 @@ class V41Model(Decoder):
                 )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
+            if len(self.compress_ratios) != self.n_layers:
+                raise ValueError(
+                    f"compress_ratios must match n_layers ({self.n_layers}), got {len(self.compress_ratios)}"
+                )
+
             if hasattr(config, "training"):
                 from torchtitan.models.common.rope import RoPE
 
@@ -105,9 +230,9 @@ class V41Model(Decoder):
                 for _, rope_cfg, _, _ in self.traverse(RoPE.Config):
                     setattr(rope_cfg, "max_seq_len", seq_len)  # noqa: B010
 
-            from .sharding import set_deepseek_v41_sharding_config
+            from .sharding import set_deepseek_v4_1_sharding_config
 
-            set_deepseek_v41_sharding_config(
+            set_deepseek_v4_1_sharding_config(
                 self,
                 enable_sp=parallelism.enable_sequence_parallel,
                 enable_ep=parallelism.expert_parallel_degree > 1,
@@ -118,12 +243,12 @@ class V41Model(Decoder):
 
             from torchtitan.models.utils import get_moe_model_nparams_and_flops
 
-            deepseek_v41_model = cast("V41Model", model)
+            deepseek_v4_1_model = cast("V41Model", model)
             first_attention = self.layers[0].attention
             head_dims = 2 * first_attention.head_dim
             nparams, num_flops_per_token = get_moe_model_nparams_and_flops(
                 self,
-                deepseek_v41_model,
+                deepseek_v4_1_model,
                 first_attention.n_heads,
                 head_dims,
                 seq_len,
@@ -147,7 +272,7 @@ class V41Model(Decoder):
                             * attention.indexer.index_head_dim
                             * compressed_seq_len
                         )
-                        compressed_seq_len = min(compressed_seq_len, inner_attention.index_topk)
+                        compressed_seq_len = min(compressed_seq_len, attention.indexer.index_topk)
                     num_flops_per_token += 6 * attention.n_heads * (2 * attention.head_dim) * compressed_seq_len
             return nparams, num_flops_per_token
 
@@ -156,31 +281,18 @@ class V41Model(Decoder):
         cfg = config
         self.hc_mult = cfg.hc_mult
         self.compress_ratios = tuple(cfg.compress_ratios)
-        self.window_size = cfg.window_size
-        self.vocab_size = cfg.vocab_size
-        self._metadata_extension = cfg.metadata_extension.build()
 
         self.vision_encoder = config.vision_encoder.build() if config.vision_encoder is not None else None
         self.image_marker_embeddings = (
             config.image_marker_embeddings.build() if config.image_marker_embeddings is not None else None
         )
 
-        self.compression_plan = build_v41_compression_spec(
-            layer_ids=tuple(range(config.n_layers)),
-            ratios=self.compress_ratios[: config.n_layers],
-            kv_source_layers=config.kv_source_layers,
-            index_source_layers=config.index_source_layers,
-            candidate_source_layer=config.candidate_source_layer,
-            candidate_topk_blocks=config.candidate_topk_blocks,
-            candidate_block_size=config.candidate_block_size,
-        )
-        self.attention_context = V41AttentionContext.empty()
-        for layer in self.layers.values():
-            layer.compression_plan = self.compression_plan  # pyrefly: ignore [bad-argument-type]
-            layer.attention_context = self.attention_context  # pyrefly: ignore [bad-argument-type]
-
     def apply_activation_checkpointing_extensions(self, policy) -> None:
-        """Apply the shared AC policy to the V4.1 vision blocks."""
+        """Apply the shared AC policy to the V4.1 vision blocks.
+
+        ``_wrap_block`` is private because the pinned torchtitan exposes no public hook
+        for wrapping a block that is not part of a ``Decoder`` layer list.
+        """
         if self.vision_encoder is None:
             return
         for name, block in self.vision_encoder.blocks.named_children():
@@ -205,22 +317,30 @@ class V41Model(Decoder):
             pp_enabled=parallel_dims.pp_enabled,
         )
 
+    def get_attention_masks(  # pyrefly: ignore [bad-override]
+        self, positions: torch.Tensor
+    ) -> DeepSeekV41Metadata:
+        """Build the only varlen metadata: a document id per token.
+
+        ``selected_attention`` consumes it for the window branch, and the indexer derives
+        its entry-axis ``doc_ids[:, ::compress_ratio]`` rule from it, so no ragged
+        ``cu_seqlens`` form is needed.
+        """
+        if positions is None:
+            raise ValueError("DeepSeek V4.1 requires positions to build its attention metadata")
+        return DeepSeekV41Metadata(doc_ids_BL=torch.cumsum((positions == 0).to(torch.int32), dim=-1) - 1)
+
     def build_attention_masks(self, inputs, labels, extra_kwargs, *, cp_mesh=None, load_balancer_type=None):
-        """Build the model-owned per-batch compressed-attention metadata."""
+        """Build the model-owned per-batch varlen metadata.
+
+        The pinned trainer calls this hook for models that own their metadata instead of
+        the Flex/Varlen ``get_attention_masks`` dispatch, so the model attaches its
+        metadata here.
+        """
+        del load_balancer_type
         if cp_mesh is not None:
             raise NotImplementedError("DeepSeek V4.1 currently supports CP=1 only")
-        positions = extra_kwargs.get("positions")
-        masks = self.get_attention_masks(positions=positions)
-        if not isinstance(masks, VarlenMetadata):
-            raise TypeError(
-                "DeepSeek-V4.1 compression requires a varlen stream (the "
-                "inner attention is varlen-typed), got "
-                f"{type(masks)}."
-            )
-        common = build_compressed_varlen_metadata(masks, self.compress_ratios)
-        if self._metadata_extension is not None:
-            common = self._metadata_extension(common)
-        extra_kwargs["attention_masks"] = common
+        extra_kwargs["attention_masks"] = self.get_attention_masks(extra_kwargs.get("positions"))
         return inputs, labels, extra_kwargs
 
     def _prepare_multimodal_embeddings(
@@ -265,14 +385,14 @@ class V41Model(Decoder):
             )
             return scatter_image_features(hidden, flat_visual, image_feature_indices)
         if image_spans is None:
-            return hidden + visual.sum() * 0
+            return _vision_encoder_anchor(hidden, visual)
         return scatter_image_embeddings(hidden, visual, image_spans)
 
     def forward(  # pyrefly: ignore [bad-override]
         self,
         tokens: torch.Tensor,
         positions: torch.Tensor | None = None,
-        attention_masks: AttentionMasksType | None = None,
+        attention_masks: DeepSeekV41Metadata | None = None,
         *,
         pixel_values: torch.Tensor | None = None,
         image_grid: torch.Tensor | None = None,
@@ -281,9 +401,12 @@ class V41Model(Decoder):
         token_types: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
     ):
-        """V4.1 forward with Single-Pass mHC for vision and text-only batches."""
-        self.attention_context.reset()
+        """V4.1 forward with Single-Pass mHC for vision and text-only batches.
 
+        The cross-layer attention state is threaded through the stack as ordinary local
+        variables: an attention source layer returns the tensors it produced, and every
+        other layer returns what it was handed.
+        """
         if pixel_values is None:
             image_mask = None
             embeds = input_embeds
@@ -305,18 +428,34 @@ class V41Model(Decoder):
         hidden = embeds if embeds is not None else (tok_embeddings(tokens) if tok_embeddings is not None else tokens)
         hidden = hidden.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
 
-        pre_mix = None
+        pre_mix = HcPre.identity_pre_mix(hidden, self.hc_mult)
+        cmp_k: torch.Tensor | None = None
+        idx_k: torch.Tensor | None = None
+        topk_indices: torch.Tensor | None = None
+        topk_scores: torch.Tensor | None = None
+        candidates: torch.Tensor | None = None
         last_layer = None
         for layer in self.layers.values():
-            if pre_mix is None:
-                pre_mix = _make_identity_pre_mix(hidden, self.hc_mult)
-            hidden, pre_mix = layer(
+            (
+                hidden,
+                pre_mix,
+                cmp_k,
+                idx_k,
+                topk_indices,
+                topk_scores,
+                candidates,
+            ) = layer(
                 hidden,
                 input_ids,
                 attention_masks,
                 positions,
                 pre_mix=pre_mix,
                 image_mask=image_mask,
+                cmp_k=cmp_k,
+                idx_k=idx_k,
+                topk_indices=topk_indices,
+                topk_scores=topk_scores,
+                candidates=candidates,
             )
             last_layer = layer
 

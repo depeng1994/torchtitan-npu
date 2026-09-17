@@ -11,8 +11,8 @@ import torch
 from torch.utils.checkpoint import DefaultDeviceType
 from torchtitan.distributed.activation_checkpoint import FullAC
 
-from torchtitan_npu.models.deepseek_v41.vision_data import build_image_token_layout
-from torchtitan_npu.models.deepseek_v41.vision_loader import _SyntheticVisionDataset
+from torchtitan_npu.models.deepseek_v4_1.vision_data import build_image_token_layout
+from torchtitan_npu.models.deepseek_v4_1.vision_loader import _SyntheticVisionDataset
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 
@@ -35,8 +35,7 @@ def test_synthetic_vision_without_image_files():
 def test_full_ac_preserves_image_routing(monkeypatch):
     # CPU-only checkpoint inputs otherwise inherit the registered NPU backend.
     monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
-    registry = importlib.import_module("torchtitan_npu.models.deepseek_v41.model_registry")
-    monkeypatch.setenv("USE_GOLDEN", "1")
+    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
     monkeypatch.setattr(
         registry,
         "_DEBUG_WIDTHS",
@@ -57,8 +56,13 @@ def test_full_ac_preserves_image_routing(monkeypatch):
             vision_inter_dim=16,
         ),
     )
-    config = registry.model_registry("deepseek_v41_debugmodel").model
+    config = registry.model_registry("deepseek_v4_1_debugmodel").model
     config.vocab_size = 64
+    # The trainer's update_from_config fills the aux-loss denominators before the run.
+    from torchtitan_npu.models.deepseek_v4_1.indexer import IndexerKLLoss
+
+    for _, loss_cfg, _, _ in config.traverse(IndexerKLLoss.Config):
+        loss_cfg.global_batch_size = 1
     config.tok_embeddings.num_embeddings = 64
     config.lm_head.out_features = 64
     # The golden reference arithmetic is the native attention path; no

@@ -66,7 +66,7 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
         for layer_id in range(model_config.n_layers):
             layer_cfg = model_config.layers[layer_id]
             compressor_cfg = layer_cfg.attention.compressor
-            if compressor_cfg is not None:
+            if compressor_cfg.is_source:
                 compressor_map = {
                     f"layers.{layer_id}.attn.compressor.norm.weight": (
                         f"layers.{layer_id}.attention.compressor.norm.weight"
@@ -81,7 +81,7 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
                     )
                 self.from_hf_map.update(compressor_map)
             indexer_cfg = layer_cfg.attention.indexer
-            if indexer_cfg is not None:
+            if indexer_cfg.is_source:
                 indexer_map = {
                     f"layers.{layer_id}.attn.indexer.wq_b.weight": (f"layers.{layer_id}.attention.indexer.wq_b.weight"),
                     f"layers.{layer_id}.attn.indexer.weights_proj.weight": (

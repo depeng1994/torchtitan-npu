@@ -53,5 +53,11 @@ git -C "${TORCHTITAN_DIR}" fetch --depth 1 origin "${TORCHTITAN_COMMIT}"
 git -C "${TORCHTITAN_DIR}" checkout --detach --quiet "${TORCHTITAN_COMMIT}"
 pip install --no-deps -e "${TORCHTITAN_DIR}"
 
+# The image predates wheels added to requirements.txt.  Install only those wheels:
+# the image pins a *different* torch/torch_npu build than requirements.txt does, so
+# re-running the whole file would upgrade the CANN stack mid-job (it broke the
+# fused-op smoke tests once).  New pure-Python runtime wheels go here by name.
+pip install --no-deps attn-gym==0.0.9
+
 python -c 'from torchtitan.distributed.context_parallel.api import cp_shard; print(cp_shard.__module__)'
 python -m pytest -v --tb=short tests/unit_tests

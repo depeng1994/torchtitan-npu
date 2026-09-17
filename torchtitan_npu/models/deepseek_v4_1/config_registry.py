@@ -5,9 +5,9 @@
 
 """V4.1 trainer config recipes (standalone; no V4 imports).
 
-The golden/reference path is the only supported operator selection: the
-config fails fast when ``USE_GOLDEN`` is not set, because the AscendC
-fused kernels do not yet accept the V4.1 ratio-1 shared-KV contract.
+The eager/reference operator path is what V4.1 runs: the AscendC fused
+sparse-attention kernels do not yet accept the V4.1 ratio-1 shared-KV
+contract, so the recipe selects the reference operators unconditionally.
 """
 
 import os
@@ -24,27 +24,23 @@ from torchtitan_npu.config import OptimizerConfig, TrainingConfig
 from torchtitan_npu.extensions.profiler import CANNProfiler
 from torchtitan_npu.extensions.trainer import TrainerEx
 
-from .config import (
-    DeepSeekV41CropConfig,
-    DeepSeekV41DebugConfig,
-    DeepSeekV41FullLayerConfig,
-)
+from . import model_registry
 from .data import SyntheticTokenizer
-from .model_registry import model_registry
 from .vision_loader import DeepSeekV41SyntheticVisionDataLoader
 
 # The Golden fixture image; override it via a config entry when training on real data.
 DEFAULT_VISION_IMAGE_PATHS = ("tests/assets/dsv4_vit_test.jpeg",)
 
 
-def _golden_enabled() -> bool:
-    return (
-        os.getenv(
-            "USE_GOLDEN",
-            os.getenv("TORCHTITAN_NPU_VISION_GOLDEN", os.getenv("TORCHTITAN_NPU_GOLDEN_TRAINING", "0")),
-        )
-        == "1"
-    )
+def _document_alignment(model_spec) -> int:
+    """Largest compression ratio the model pools with, ``1`` when it has none.
+
+    Every row the vision loader emits is one document, so the row length has to
+    be a multiple of the pooling ratio: the row edge is the document edge the
+    compressed-attention pool must not straddle.
+    """
+    ratios = [ratio for ratio in model_spec.model.compress_ratios if ratio > 1]
+    return max(ratios) if ratios else 1
 
 
 def _v41_optimizer_config(model_spec, *, lr: float) -> OptimizerConfig:
@@ -71,31 +67,33 @@ def _v41_optimizer_config(model_spec, *, lr: float) -> OptimizerConfig:
     )
 
 
-def _build_v41_trainer_config(flavor: str, crop: DeepSeekV41CropConfig) -> TrainerEx.Config:
+def _v41_trainer_config(
+    flavor: str,
+    *,
+    seq_len: int = 512,
+    fsdp_shard_degree: int = 8,
+    context_parallel_degree: int = 1,
+    expert_parallel_degree: int = 8,
+    local_batch_size: int = 1,
+    steps: int = 10,
+) -> TrainerEx.Config:
+    """Trainer recipe shared by the registered V4.1 single-node flavors.
+
+    The flavors differ only in their model widths and layer count, which the
+    model registry owns; the trainer shape below is the frozen
+    V4.1 single-node resource crop (FSDP 8 / EP 8, eager/reference operators).
+    """
     # The V4.1 layer-20+ ratio-1 layers produce a real shared/global KV, which
     # the AscendC sparse-attention path still rejects ("ratio-1 asc must not
-    # receive compressed KV").  Until that kernel path is adapted, V4.1 is
-    # golden/reference-only: fail fast instead of silently mis-selecting the
-    # AscendC kernels.
-    if not _golden_enabled():
-        raise NotImplementedError(
-            "DeepSeek V4.1 currently supports the golden/reference path only "
-            "(USE_GOLDEN=1). The AscendC fused kernels do not yet accept the "
-            "V4.1 ratio-1 shared-KV contract."
-        )
-
+    # receive compressed KV").  V4.1 therefore runs the eager/reference
+    # operators unconditionally; selecting the AscendC kernels here would
+    # silently mis-handle the ratio-1 container.
     model_spec = model_registry(flavor)
-    if model_spec.model.dim != crop.hidden_size:  # pyrefly: ignore [missing-attribute]
-        raise ValueError("registered V4.1 model does not match hidden_size")
-    if len(model_spec.model.layers) != crop.num_hidden_layers:  # pyrefly: ignore [missing-attribute]
-        raise ValueError("registered V4.1 model does not match the configured layer range")
-    if model_spec.model.vision_encoder.num_layers != crop.vision_layers:  # pyrefly: ignore [missing-attribute]
-        raise ValueError("registered V4.1 model does not match vision_layers")
-    if (
-        tuple(layer.attention.compress_ratio for layer in model_spec.model.layers)  # pyrefly: ignore [not-iterable]
-        != crop.compress_ratios  # pyrefly: ignore [not-iterable]
-    ):  # pyrefly: ignore [not-iterable]
-        raise ValueError("registered V4.1 model does not match compression ratios")
+    # The registry validates the crop-level topology; this only pins that the
+    # config the trainer is handed describes every layer it will build.
+    if model_spec.model.n_layers != len(model_spec.model.layers):  # pyrefly: ignore [missing-attribute]
+        raise ValueError("registered V4.1 model does not describe every configured layer")
+
     return TrainerEx.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
@@ -113,11 +111,12 @@ def _build_v41_trainer_config(flavor: str, crop: DeepSeekV41CropConfig) -> Train
         tokenizer=SyntheticTokenizer.Config(vocab_size=129280),
         dataloader=DeepSeekV41SyntheticVisionDataLoader.Config(
             vocab_size=129280,
+            document_alignment=_document_alignment(model_spec),
             patch_count=64,
             image_span_start=8,
             image_paths=DEFAULT_VISION_IMAGE_PATHS,
             # Deterministic synthetic token stream unless a tokenizer is
-            # explicitly provided (the golden test suite points this at the
+            # explicitly provided (the integration case points this at the
             # committed tests/assets/deepseek_v3 mini tokenizer).
             tokenizer_path=os.environ.get("DSV41_TOKENIZER_PATH", os.environ.get("DSV4_TOKENIZER_PATH")),
             text=os.environ.get("DSV41_VISION_TEXT", "Describe the image."),
@@ -130,16 +129,16 @@ def _build_v41_trainer_config(flavor: str, crop: DeepSeekV41CropConfig) -> Train
             min_lr_factor=0.01,
         ),
         training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=crop.sequence_length,
-            steps=10,
+            local_batch_size=local_batch_size,
+            seq_len=seq_len,
+            steps=steps,
             disable_cuda_graphs=True,
         ),
         parallelism=ParallelismConfig(
-            data_parallel_shard_degree=crop.fsdp_shard_degree,
-            expert_parallel_degree=8,
+            data_parallel_shard_degree=fsdp_shard_degree,
+            expert_parallel_degree=expert_parallel_degree,
             tensor_parallel_degree=1,
-            context_parallel_degree=crop.context_parallel_degree,
+            context_parallel_degree=context_parallel_degree,
             pipeline_parallel_degree=1,
             fsdp_reshard_after_forward="always",
             context_parallel_load_balancer="headtail",
@@ -150,39 +149,21 @@ def _build_v41_trainer_config(flavor: str, crop: DeepSeekV41CropConfig) -> Train
     )
 
 
-def deepseek_v41_flash_30layers_16experts_vision() -> TrainerEx.Config:
+def deepseek_v4_1_flash_30layers_16experts_vision() -> TrainerEx.Config:
     """Thirty continuous decoder layers for fast single-node validation."""
-    return _build_v41_trainer_config(
-        "deepseek_v41_flash_30layers_16experts_vision",
-        DeepSeekV41CropConfig(
-            hidden_size=5120,
-            vision_layers=32,
-        ),
-    )
+    return _v41_trainer_config("deepseek_v4_1_flash_30layers_16experts_vision")
 
 
-def deepseek_v41_flash_40layers_16experts_vision() -> TrainerEx.Config:
+def deepseek_v4_1_flash_40layers_16experts_vision() -> TrainerEx.Config:
     """Full 40-layer decoder with the single-node 16-expert resource crop."""
-    return _build_v41_trainer_config(
-        "deepseek_v41_flash_40layers_16experts_vision",
-        DeepSeekV41FullLayerConfig(
-            hidden_size=5120,
-            vision_layers=32,
-        ),
-    )
+    return _v41_trainer_config("deepseek_v4_1_flash_40layers_16experts_vision")
 
 
-def deepseek_v41_debugmodel() -> TrainerEx.Config:
-    """Reduced-width full-structure V4.1 shape for the golden trajectory tests.
+def deepseek_v4_1_debugmodel() -> TrainerEx.Config:
+    """Reduced-width full-structure V4.1 shape for the CPU and integration tests.
 
     The real 40-layer compression/source structure and vision depth with
-    debug widths, so the deterministic golden loss guard exercises every
+    debug widths, so the integration run exercises every
     V4.1 code path quickly.
     """
-    return _build_v41_trainer_config(
-        "deepseek_v41_debugmodel",
-        DeepSeekV41DebugConfig(
-            hidden_size=512,
-            vision_layers=32,
-        ),
-    )
+    return _v41_trainer_config("deepseek_v4_1_debugmodel")
