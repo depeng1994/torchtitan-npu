@@ -62,7 +62,9 @@ MTP forward、chunked loss 和 backward。
 `dsv4_mtp_smla_cp2_headtail` 额外配置 `num_workers=1`、`prefetch_factor=8`，只承担
 StatefulDataLoader multiprocessing 与 CP/HeadTail/MTP 训练路径的兼容性 smoke。该用例仍为
 1 step，因此不声称覆盖 steady-state prefetch overlap；1M 场景下 step1+ 的等待时间与
-host/shared-memory 压力应由专门的长序列性能复现实验验证。
+host/shared-memory 压力由专门的长序列性能复现实验验证。对于修改 DataLoader/CP metadata
+性能路径的 PR，这个 1-step smoke 不能替代合入前的最终-head on-device A/B、loss/grad_norm
+一致性、host RSS/\`/dev/shm\` high-water mark 与 CI/UT 执行证据。
 
 `dsv4_muon_swap_ep2_fsdp2` 使用 NPU 融合算子：Ascend RMSNorm、complex RoPE、sparse
 attention、MHC 和 MoE token dispatcher；两卡 EP2/FSDP2，并追加 `--optimizer.name=Muon`
