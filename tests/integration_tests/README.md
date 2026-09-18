@@ -15,7 +15,7 @@ torchtitan 迁移而来。
 | `dsv4_checkpoint_resume_ep2_fsdp2` | DeepSeek-V4 | EP2 + FSDP2，step 2 恢复到 step 4 | 2 | - | 是，含 grad_norm | 与本次连续训练的 step 3、4 精确比较 |
 | `dsv4_smla_1rank_aot_eager` | DeepSeek-V4 | 1 Rank | 1 | `aot_eager` | 否 | SMLA 暂不支持 `--debug.deterministic` |
 | `dsv4_smla_ep2_fsdp2` | DeepSeek-V4 | EP2 + FSDP2 | 2 | `aot_eager` | 否 | SMLA 暂不支持 `--debug.deterministic` |
-| `dsv4_smla_cp2_ep2_fsdp2` | DeepSeek-V4 | CP2 + EP2 + FSDP2 | 4 | `aot_eager` | 否 | SMLA 暂不支持 `--debug.deterministic` |
+| `dsv4_smla_cp2_ep2_fsdp2` | DeepSeek-V4 | CP2 + EP2 + FSDP2（复用同一对 rank） | 2 | `aot_eager` | 否 | SMLA 暂不支持 `--debug.deterministic` |
 | `dsv4_mtp_smla_cp2_headtail` | DeepSeek-V4 MTP | CP2 + headtail | 2 | - | 否 | SMLA 暂不支持 `--debug.deterministic` |
 | `dsv3_2_dsa_1rank` | DeepSeek-V3.2 | 1 Rank，DSA | 1 | - | 是 | - |
 | `dsv3_2_dsa_ep2_fsdp2` | DeepSeek-V3.2 | DSA + EP2/FSDP2 | 2 | - | 是 | - |
@@ -59,11 +59,12 @@ MTP+CP 场景下的实际构图、编译和训练执行路径；单卡、EP2 和
 `deepseek_v4_debugmodel`、CP2 和 headtail，在 C4 packed sequence 上执行完整的
 MTP forward、chunked loss 和 backward。
 
-`dsv4_mtp_smla_cp2_headtail` 额外配置 `num_workers=1`、`prefetch_factor=8`，只承担
-StatefulDataLoader multiprocessing 与 CP/HeadTail/MTP 训练路径的兼容性 smoke。该用例仍为
-1 step，因此不声称覆盖 steady-state prefetch overlap；1M 场景下 step1+ 的等待时间与
+`dsv4_smla_cp2_ep2_fsdp2` 与 `dsv4_mtp_smla_cp2_headtail` 都配置
+`num_workers=1`、`prefetch_factor=8`：前者覆盖 2-rank CP2+EP2/FSDP2+aot_eager，后者覆盖
+CP2+HeadTail+MTP，分别验证 StatefulDataLoader multiprocessing 与两条 CP 训练路径的兼容性。
+两者仍均为 1 step，因此不声称覆盖 steady-state prefetch overlap；1M 场景下 step1+ 的等待时间与
 host/shared-memory 压力由专门的长序列性能复现实验验证。对于修改 DataLoader/CP metadata
-性能路径的 PR，这个 1-step smoke 不能替代合入前的最终-head on-device A/B、loss/grad_norm
+性能路径的 PR，这些 smoke 不能替代合入前的最终-head on-device A/B、loss/grad_norm
 一致性、host RSS / `/dev/shm` high-water mark 与 CI/UT 执行证据。
 
 `dsv4_muon_swap_ep2_fsdp2` 使用 NPU 融合算子：Ascend RMSNorm、complex RoPE、sparse
