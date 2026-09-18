@@ -14,10 +14,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
+# Prefetch 8 batches to overlap 1M long-sequence GA8 data loading with compute.
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
     --parallelism.context-parallel-degree 128 \
     --parallelism.data-parallel-shard-degree 1 \
     --parallelism.data-parallel-replicate-degree 1 \
     --training.seq-len 1048576 \
     --training.global-batch-size 8 \
+    --dataloader.num-workers 1 \
+    --dataloader.prefetch-factor 8 \
     "$@"

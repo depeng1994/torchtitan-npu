@@ -9,9 +9,9 @@ Two halves live here (the single home of all DSV4 CP logic):
 
 1. **The plan builder** — a pure derivation from the global context: the
    pre-shard document structure (the model's ``get_attention_masks``
-   result) plus the load-balancer permutation.  Every rank derives every
-   rank's rank-local shard metadata in-frame via
-   ``CPVarlenMetadata.from_global`` (the shard path's own builder), so
+   result) plus the load-balancer permutation.  The planner derives all-rank
+   segment geometry directly from that global context and materializes only the
+   current rank's ``CPVarlenMetadata`` through the shard path's own builder, so
    there is **no plan-time communication** at all.  The whole derivation
    is expressed in the documents' **permuted slices** (``docs``, keyed by
    the segment's doc identity): every row a plan consumes — window
@@ -59,15 +59,23 @@ segment with each ratio plan's ``cmp_k_global_gather_indices``.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
+from typing import cast
 
 import spmd_types as spmd
 import torch
 from torch.distributed._functional_collectives import all_to_all_single
+from torch.distributed.tensor.experimental._context_parallel._load_balancer import (
+    _LoadBalancer,
+)
 from torchtitan.config import Configurable
 from torchtitan.distributed.utils import get_spmd_backend
 
-from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
+from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
+    CPVarlenMetadata,
+    _argsort_indices,
+)
 
 from .metadata import CompressedBlockLayout
 
@@ -81,8 +89,7 @@ __all__ = [
 
 
 class _RankMesh:
-    """``CPVarlenMetadata.from_global``'s ``DeviceMesh`` contract for a fixed
-    rank (the pure plan derives every rank's shard metadata in-frame)."""
+    """``CPVarlenMetadata.from_global``'s ``DeviceMesh`` contract for one rank."""
 
     ndim = 1
 
@@ -95,6 +102,18 @@ class _RankMesh:
 
     def get_local_rank(self) -> int:
         return self._rank
+
+
+class _CachedLoadBalancer:
+    """DSV4-local view that reuses one already-built load-balancer layout."""
+
+    def __init__(self, rearrange_indices: torch.Tensor):
+        self._rearrange_indices = rearrange_indices
+
+    def _generate_indices(self, restore: bool = False) -> torch.Tensor:
+        if restore:
+            return _argsort_indices(self._rearrange_indices)
+        return self._rearrange_indices
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +140,60 @@ def segment_structure(cp_meta) -> list[tuple[int, int, int, int]]:
         seqlen_k = cu_k[s + 1] - cu_k[s]
         segs.append((kg[cu_k[s]], seg_len, seqlen_k, seqlen_k - seg_len))
     return segs
+
+
+def _derive_all_rank_segments(
+    global_cu: list[int],
+    rearrange: list[int],
+    restore: list[int],
+    *,
+    cp_size: int,
+    shard_len: int,
+) -> list[list[tuple[int, int, int, int]]]:
+    """Derive planner-only all-rank segments from global packed boundaries.
+
+    This reproduces ``segment_structure`` without constructing CP-1 temporary
+    ``CPVarlenMetadata`` objects and copying their rank-local tensors to host.
+    """
+    doc_starts = set(global_cu[1:-1])
+    segs_all: list[list[tuple[int, int, int, int]]] = []
+
+    for rank in range(cp_size):
+        q = rearrange[rank * shard_len : (rank + 1) * shard_len]
+        if not q:
+            segs_all.append([])
+            continue
+
+        segs: list[tuple[int, int, int, int]] = []
+        first = prev = q[0]
+        seg_len = 1
+
+        def append_segment(seg_first: int, seg_last: int, length: int) -> None:
+            doc_idx = bisect_right(global_cu, seg_first) - 1
+            doc_start = global_cu[doc_idx]
+            seqlen_k = seg_last - doc_start + 1
+            segs.append(
+                (
+                    restore[doc_start],
+                    length,
+                    seqlen_k,
+                    seg_first - doc_start,
+                )
+            )
+
+        for pos in q[1:]:
+            if pos != prev + 1 or pos in doc_starts:
+                append_segment(first, prev, seg_len)
+                first = pos
+                seg_len = 1
+            else:
+                seg_len += 1
+            prev = pos
+
+        append_segment(first, prev, seg_len)
+        segs_all.append(segs)
+
+    return segs_all
 
 
 def _window_range(seg: tuple[int, int, int, int], window_size: int) -> tuple[int, int]:
@@ -183,36 +256,43 @@ def _routing_geometry(
     """The alltoallv routing of one exchange.
 
     ``foreign_all[r]`` = rank r's foreign positions (permuted-stream
-    coordinates, in its per-segment receive order).  Returns per rank
-    ``(send_indices, send_splits, recv_splits, recv_offsets)``: the send
-    payload rows grouped by receiver (receiver order), the per-receiver /
-    per-sender split sizes, and each receive position's flat offset in
-    the all_to_all output layout (cat over senders of [my rows from that
-    sender]).
+    coordinates, in its per-segment receive order).  Build the same routing
+    in two linear passes over each receiver instead of rescanning every
+    receiver once per source rank.
     """
-    routing: list[tuple[list[int], list[int], list[int], list[int]]] = []
-    for r in range(cp_size):
-        send_indices: list[int] = []
-        send_splits = [0] * cp_size
-        for j in range(cp_size):
-            for p in foreign_all[j]:
-                if p // shard_len == r:
-                    send_indices.append(p % shard_len)
-                    send_splits[j] += 1
-        recv_splits = [0] * cp_size
-        for p in foreign_all[r]:
-            recv_splits[p // shard_len] += 1
-        starts = [0]
-        for n in recv_splits:
-            starts.append(starts[-1] + n)
+    send_indices: list[list[int]] = [[] for _ in range(cp_size)]
+    send_splits: list[list[int]] = [[0] * cp_size for _ in range(cp_size)]
+    recv_splits_all: list[list[int]] = []
+    recv_offsets_all: list[list[int]] = []
+
+    for dst, positions in enumerate(foreign_all):
+        counts = [0] * cp_size
+        for p in positions:
+            src = p // shard_len
+            send_indices[src].append(p % shard_len)
+            send_splits[src][dst] += 1
+            counts[src] += 1
+
+        starts = [0] * cp_size
+        total = 0
+        for src, n in enumerate(counts):
+            starts[src] = total
+            total += n
+
         seen = [0] * cp_size
         recv_offsets: list[int] = []
-        for p in foreign_all[r]:
-            o = p // shard_len
-            recv_offsets.append(starts[o] + seen[o])
-            seen[o] += 1
-        routing.append((send_indices, send_splits, recv_splits, recv_offsets))
-    return routing
+        for p in positions:
+            src = p // shard_len
+            recv_offsets.append(starts[src] + seen[src])
+            seen[src] += 1
+
+        recv_splits_all.append(counts)
+        recv_offsets_all.append(recv_offsets)
+
+    return [
+        (send_indices[r], send_splits[r], recv_splits_all[r], recv_offsets_all[r])
+        for r in range(cp_size)
+    ]
 
 
 def _row_order(rows: list[int], *, rank: int, shard_len: int) -> tuple[list[int], int]:
@@ -251,28 +331,49 @@ def _build_exchange_plan(row, device) -> ExchangePlan:
 
 
 def _container_slots(segs_all, seg_blocks_all, *, ratio: int):
-    """The ``(doc_start, block) -> container slot`` map and the uniform
-    container width ``max_kept``.
+    """Build dense first-owner slots and the uniform container width.
 
-    A rank's kept blocks fill the leading slots of its padded container
-    (per segment the plan blocks after the strip — the borrow-source
-    blocks are dropped); ownership follows the start-owner rule (the
-    first rank claiming a block).  The container width is uniform
-    (``max_kept``) so every rank's container is a valid ``S(1)`` shard of
-    the all-gathered ``[cp * max_kept, D]``, and a block's slot is
-    ``owner * max_kept + local_offset``.
+    Avoid a tuple-key Python dict lookup for every compressed block.  Document
+    identities stay as dict keys only once per document; block ownership and
+    local offsets use flat lists.
     """
-    local: dict[tuple[int, int], tuple[int, int]] = {}
+    doc_nblocks: dict[int, int] = {}
+    for segs, blocks in zip(segs_all, seg_blocks_all, strict=True):
+        for seg, (_A, block_end, _strip) in zip(segs, blocks, strict=True):
+            nblocks = max(block_end // ratio, seg[2] // ratio)
+            if nblocks > doc_nblocks.get(seg[0], 0):
+                doc_nblocks[seg[0]] = nblocks
+
+    doc_base: dict[int, int] = {}
+    total_blocks = 0
+    for doc, nblocks in doc_nblocks.items():
+        doc_base[doc] = total_blocks
+        total_blocks += nblocks
+
+    owner = [-1] * total_blocks
+    local_offset = [0] * total_blocks
     max_kept = 0
     for rr, (segs, blocks) in enumerate(zip(segs_all, seg_blocks_all, strict=True)):
         off = 0
         for seg, (A, block_end, strip) in zip(segs, blocks, strict=True):
-            for b in range(A // ratio + strip, block_end // ratio):
-                local.setdefault((seg[0], b), (rr, off))
+            b0 = A // ratio + strip
+            b1 = block_end // ratio
+            if b1 <= b0:
+                continue
+            base = doc_base[seg[0]]
+            for b in range(b0, b1):
+                idx = base + b
+                if owner[idx] < 0:
+                    owner[idx] = rr
+                    local_offset[idx] = off
                 off += 1
         max_kept = max(max_kept, off)
-    slots = {(doc, b): owner * max_kept + off for (doc, b), (owner, off) in local.items()}
-    return slots, max_kept
+
+    slots = [-1] * total_blocks
+    for i, block_owner in enumerate(owner):
+        if block_owner >= 0:
+            slots[i] = block_owner * max_kept + local_offset[i]
+    return slots, doc_base, max_kept
 
 
 def _assemble_window_plan(
@@ -327,7 +428,6 @@ def _assemble_block_plan(
     rows: list[int] = []
     for seg, (A, block_end, _strip) in zip(segs, my_blocks, strict=True):
         rows += docs[seg[0]][A:block_end]
-    block_total = len(rows)
     order, n_foreign = _row_order(rows, rank=rank, shard_len=shard_len)
     # The plan blocks of one rank never overlap, so every foreign row is
     # received exactly once (the recv_offsets length is the receive count).
@@ -354,8 +454,12 @@ def _assemble_block_plan(
     rem = [seg[2] % ratio for seg in segs]
     cu_cmp_t = torch.tensor([0, *cu_cmp], dtype=torch.int32, device=device).cumsum(0, dtype=torch.int32)
     # ---- compressed-level gather: ownership + assembly ----
-    slots, max_kept = _container_slots(segs_all, seg_blocks_all, ratio=ratio)
-    cmp_k_global_gather_indices = [slots[(seg[0], b)] for seg in segs for b in range(seg[2] // ratio)]
+    slots, doc_base, max_kept = _container_slots(segs_all, seg_blocks_all, ratio=ratio)
+    cmp_k_global_gather_indices = [
+        slots[doc_base[seg[0]] + b]
+        for seg in segs
+        for b in range(seg[2] // ratio)
+    ]
     return CompressedBlockLayout(
         cu_seqlens_cmp_k=cu_cmp_t,
         block_remainder=torch.tensor(rem, dtype=torch.int32, device=device),
@@ -379,45 +483,67 @@ def build_cp_plan(
     window_size: int,
     ratios: list[int],
 ) -> tuple[CPVarlenMetadata, dict[int, CompressedBlockLayout], WindowPlan]:
-    """The pure per-rank plan derivation from the global context (no
-    communication): every rank's rank-local varlen is derived in-frame via
-    ``CPVarlenMetadata.from_global`` (the shard path's own builder), so the
-    rank-local varlen, the per-ratio block plans, and the window plan all
-    fall out of the pre-shard document structure + the load-balancer
-    permutation.  The model's ``build_attention_masks`` calls this; the
-    dispatchers are wired by their owners' ``parallelize``.
+    """Derive one rank's DSV4 plan from global packed boundaries.
+
+    The common ``CPVarlenMetadata`` is built only for the current rank.  DSV4's
+    planner-only all-rank segment geometry comes directly from global document
+    boundaries plus one load-balancer layout, so no CP-sized set of temporary
+    common metadata is materialized.
     """
     global_cu = global_varlen.cu_seq_q
     device = global_cu.device
-    seq_len = int(global_cu[-1].item())
-    rearrange = (
-        load_balancer._generate_indices(restore=False).reshape(-1)
-        if load_balancer is not None
-        else torch.arange(seq_len, device=device)
+    seq_len = shard_len * cp_size
+
+    if load_balancer is not None:
+        rearrange_indices = load_balancer._generate_indices(restore=False)
+        if rearrange_indices is None:
+            raise ValueError("load_balancer._generate_indices() returned None")
+        rearrange_indices = rearrange_indices.to(global_cu.dtype)
+        if rearrange_indices.numel() != seq_len:
+            raise ValueError(
+                "DeepSeek-V4 CP planning currently requires local_batch_size=1; "
+                f"got {rearrange_indices.numel()} load-balance indices for "
+                f"seq_len={seq_len}."
+            )
+        rearrange = rearrange_indices.reshape(-1)
+        # DSV4 needs the inverse once for planner host geometry.  The common
+        # upstream-like builder keeps its own inverse contract for current-rank
+        # metadata; do not extend that public API with a DSV4-only fast path.
+        restore = torch.empty_like(rearrange)
+        restore[rearrange] = torch.arange(seq_len, dtype=rearrange.dtype, device=device)
+        cp_load_balancer = cast(_LoadBalancer, _CachedLoadBalancer(rearrange_indices))
+    else:
+        rearrange = torch.arange(seq_len, dtype=global_cu.dtype, device=device)
+        restore = rearrange
+        cp_load_balancer = None
+
+    cp_metadata = CPVarlenMetadata.from_global(
+        global_varlen,
+        _RankMesh(cp_size, rank),  # pyrefly: ignore [bad-argument-type]
+        1,
+        seq_len,
+        cp_load_balancer,
     )
-    restore = torch.argsort(rearrange)
-    varlens = [
-        CPVarlenMetadata.from_global(
-            # The ``_RankMesh`` shim implements the ``DeviceMesh`` contract
-            # (``size`` / ``get_local_rank``) the pure derivation needs.
-            global_varlen,
-            _RankMesh(cp_size, r),  # pyrefly: ignore [bad-argument-type]
-            1,
-            seq_len,
-            load_balancer,
-        )
-        for r in range(cp_size)
-    ]
-    segs_all = [segment_structure(v) for v in varlens]
+
+    # One host materialization of global planner inputs replaces CP copies of
+    # CPVarlenMetadata plus per-rank ``segment_structure().cpu().tolist()``.
+    rearrange_host = rearrange.tolist()
+    restore_host = restore.tolist()
+    global_cu_host = global_cu.tolist()
+    segs_all = _derive_all_rank_segments(
+        global_cu_host,
+        rearrange_host,
+        restore_host,
+        cp_size=cp_size,
+        shard_len=shard_len,
+    )
     my_segs = segs_all[rank]
-    # The full permuted document slices, keyed by the segment's doc
-    # identity (the permuted doc start): every row a plan consumes — the
-    # window range or the plan blocks — is a slice of one document's slice.
+
+    # The full permuted document slices, keyed by the segment's doc identity.
     docs: dict[int, list[int]] = {}
-    for d in range(len(global_cu) - 1):
-        d0, d1 = int(global_cu[d].item()), int(global_cu[d + 1].item())
+    for d0, d1 in zip(global_cu_host[:-1], global_cu_host[1:], strict=True):
         if d1 > d0:
-            docs[int(restore[d0].item())] = restore[d0:d1].tolist()
+            docs[restore_host[d0]] = restore_host[d0:d1]
 
     # ---- the window plan (ratio-independent) ----
     win_foreign: list[list[int]] = [[] for _ in range(cp_size)]
@@ -467,7 +593,7 @@ def build_cp_plan(
             shard_len=shard_len,
             device=device,
         )
-    return varlens[rank], plans, window
+    return cp_metadata, plans, window
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +659,7 @@ class WindowPlan:
     Describes the Attention's ``swa_k`` gather: the exchange routing of
     the per-segment window rows ``[win_start, q0)``, the packed ori
     stream's ``gather_indices`` (indices into
-    ``cat([x_local, exchange_recv_rows])``), and the packed-ori cumsum
+    ``cat([x_local, recv])``), and the packed-ori cumsum
     (``cu_seqlens_ori_kv``) the kernels consume.  Both the window rows and
     this plan are ratio-independent — one object per rank.
     """

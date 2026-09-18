@@ -202,12 +202,10 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         """The model-owned per-batch metadata construction (the single
         overridable mask-handling seam).
 
-        One entry for both modes: the common contract
-        (``build_compressed_varlen_metadata``) is always built; under CP
-        ``_build_cp_metadata`` shards the inputs and derives the rank-local
-        plan from the global context in-frame (no plan-time communication);
-        the ``metadata_extension`` (e.g. the reference tier or the AscendC
-        kernel metadata) runs last.
+        Under CP the global varlen boundaries feed ``_build_cp_metadata``
+        directly; building the plain compressed plans first would be dead work
+        because the CP builder immediately replaces them with rank-local plans.
+        Without CP the existing plain compressed metadata path is unchanged.
         """
         positions = extra_kwargs.get("positions")
         mtp_batch = None
@@ -225,18 +223,19 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                 "inner attention is varlen-typed), got "
                 f"{type(masks)}."
             )
-        common = build_compressed_varlen_metadata(masks, self.compress_ratios)
         if cp_mesh is not None:
             inputs, labels, positions, common, mtp_batch = self._build_cp_metadata(
                 inputs,
                 labels,
                 positions,
-                common,
+                masks,
                 cp_mesh,
                 load_balancer_type,
                 mtp_batch,
             )
             extra_kwargs["positions"] = positions
+        else:
+            common = build_compressed_varlen_metadata(masks, self.compress_ratios)
         if mtp_batch is not None:
             extra_kwargs["mtp_batch"] = mtp_batch
         if self._lightning_indexer_metadata is not None:
@@ -251,17 +250,17 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         inputs,
         labels,
         positions,
-        common,
+        global_varlen,
         cp_mesh,
         load_balancer_type,
         mtp_batch,
     ):
         """The context-parallel metadata: shard the tensors via the generic
-        path and derive the rank-local plan from the global context (the
-        common metadata's varlen + the load-balancer permutation).
+        path and derive the rank-local plan directly from the global varlen
+        context plus the load-balancer permutation.
 
         Returns ``(inputs, labels, positions, metadata, mtp_batch)``."""
-        seq_len = common.seq_len
+        seq_len = int(global_varlen.cu_seq_q[-1].item())
         cp_size = cp_mesh.size(0)
         if seq_len % cp_size != 0:
             raise ValueError(f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size}).")
@@ -282,7 +281,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
             mtp_batch = MTPBatch(*tensors[3:])
         rank = cp_mesh.get_local_rank()
         cp_meta, plans, window = build_cp_plan(
-            common.varlen,
+            global_varlen,
             lb,
             rank=rank,
             cp_size=cp_size,
