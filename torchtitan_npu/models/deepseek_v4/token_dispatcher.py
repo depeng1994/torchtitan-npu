@@ -72,7 +72,10 @@ from torch.distributed.tensor.experimental._context_parallel._load_balancer impo
 from torchtitan.config import Configurable
 from torchtitan.distributed.utils import get_spmd_backend
 
-from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
+from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
+    CPVarlenMetadata,
+    _argsort_indices,
+)
 
 from .metadata import CompressedBlockLayout
 
@@ -109,7 +112,7 @@ class _CachedLoadBalancer:
 
     def _generate_indices(self, restore: bool = False) -> torch.Tensor:
         if restore:
-            return torch.argsort(self._rearrange_indices, dim=-1)
+            return _argsort_indices(self._rearrange_indices)
         return self._rearrange_indices
 
 

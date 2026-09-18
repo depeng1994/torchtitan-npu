@@ -20,6 +20,29 @@ from torch.distributed.tensor.experimental._context_parallel._load_balancer impo
 )
 from torchtitan.models.common.attention import VarlenMetadata
 
+# Positions up to this bound are represented exactly in float32, so sorting the
+# float32 view yields the identical order as sorting the integer view.  The
+# NPU ArgSort kernel only supports float dtypes on AiCore; the integer dtypes
+# fall back to AiCpu (~175 ms vs ~2 ms at 1M tokens), which dominates
+# ``from_global`` when a load balancer is present.
+_FLOAT32_EXACT_INT_MAX = 2**24
+
+
+def _argsort_indices(indices: torch.Tensor) -> torch.Tensor:
+    """``torch.argsort`` over a position-index tensor, AiCore-fast on NPU.
+
+    The input holds load-balancer positions (< ``seq_length``).  Cast to
+    float32 for the sort whenever every value is exactly representable, which
+    keeps the order bit-identical to the integer sort; the result is cast back
+    to the input dtype.  Values beyond the float32 exact range fall back to the
+    plain integer sort (correct, merely slower).
+    """
+    if indices.numel() == 0:
+        return torch.argsort(indices, dim=-1)
+    if int(indices.max()) < _FLOAT32_EXACT_INT_MAX:
+        return torch.argsort(indices.to(torch.float32), dim=-1).to(indices.dtype)
+    return torch.argsort(indices, dim=-1)
+
 
 @dataclass(frozen=True, eq=False)
 class CPVarlenMetadata:
@@ -105,10 +128,10 @@ class CPVarlenMetadata:
             rearrange_indices = rearrange_indices.to(dtype)
             if rearrange_indices.shape[0] == 1:
                 tok_indices_per_batch = rearrange_indices.expand(batch_size, -1)
-                restore_per_batch = torch.argsort(rearrange_indices, dim=-1).expand(batch_size, -1)
+                restore_per_batch = _argsort_indices(rearrange_indices).expand(batch_size, -1)
             else:
                 tok_indices_per_batch = rearrange_indices
-                restore_per_batch = torch.argsort(rearrange_indices, dim=-1)
+                restore_per_batch = _argsort_indices(rearrange_indices)
 
         # Map rank-local Q slots to sequence positions.
         rank_q_indices = tok_indices_per_batch[:, cp_rank * shard_len : (cp_rank + 1) * shard_len]
