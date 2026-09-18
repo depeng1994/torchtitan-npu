@@ -19,7 +19,7 @@ from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
 )
 
 
-_MAX_SECONDS = 5.0
+_MAX_SECONDS = 2.5
 
 
 class _FakeCPMesh:
@@ -41,6 +41,7 @@ class _FakeCPMesh:
 @pytest.mark.cpu
 def test_varlen_cp_1m_headtail_metadata_complexity():
     """Guard one common current-rank metadata build at 1M / CP128."""
+    # Prevent the common varlen primitive from regressing to multi-second full-sequence work.
 
     def _build_current_rank_metadata(global_metadata, load_balancer):
         return CPVarlenMetadata.from_global(
