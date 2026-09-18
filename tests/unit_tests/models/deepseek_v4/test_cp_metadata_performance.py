@@ -15,12 +15,13 @@ from tests.unit_tests.distributed.cp_metadata_perf_utils import (
 from torchtitan_npu.models.deepseek_v4.token_dispatcher import build_cp_plan
 
 
-_MAX_SECONDS = 8.0
+_MAX_SECONDS = 4.0
 
 
 @pytest.mark.cpu
 def test_dsv4_cp_plan_1m_headtail_metadata_complexity():
     """Guard the full DSV4 planner against 1M / CP128 complexity regressions."""
+    # Prevent the full DSV4 planner from regressing back to CP-sized full-sequence work.
 
     def _build_dsv4_plan(global_metadata, load_balancer):
         return build_cp_plan(
