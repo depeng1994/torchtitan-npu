@@ -489,7 +489,7 @@ def build_cp_plan(
     """
     global_cu = global_varlen.cu_seq_q
     device = global_cu.device
-    seq_len = int(global_cu[-1].item())
+    seq_len = shard_len * cp_size
 
     if load_balancer is not None:
         rearrange_indices = load_balancer._generate_indices(restore=False)
