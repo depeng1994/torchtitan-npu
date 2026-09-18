@@ -68,43 +68,57 @@ def test_cp_plan_builds_only_current_rank_common_metadata(monkeypatch):
     assert window is not None
 
 
-def test_build_attention_masks_cp_skips_plain_global_compressed_builder(monkeypatch):
-    """CP wiring consumes global varlen directly and must skip plain plans."""
+def test_build_attention_masks_cp_runs_real_metadata_wiring(monkeypatch):
+    """CP producer/consumer wiring reaches the real planner and skips plain plans."""
     cu = torch.tensor([0, 8, 16], dtype=torch.int32)
     varlen = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu, max_q=8, max_k=8)
-    sentinel = object()
     seen = {}
+
+    class _FakeCPMesh:
+        device_type = "cpu"
+
+        def size(self, dim=None):
+            assert dim in (None, 0)
+            return 2
+
+        def get_local_rank(self):
+            return 0
 
     class _Stub:
         mtp_layers = None
         compress_ratios = (1, 4, 128)
+        window_size = 4
         _lightning_indexer_metadata = None
         _metadata_extension = None
+        _build_cp_metadata = model_mod.DeepSeekV4Model._build_cp_metadata
 
         def get_attention_masks(self, *, positions):
-            seen["positions"] = positions
+            seen["positions_before_shard"] = positions
             return varlen
 
-        def _build_cp_metadata(
-            self,
-            inputs,
-            labels,
-            positions,
-            global_varlen,
-            cp_mesh,
-            load_balancer_type,
-            mtp_batch,
-        ):
-            seen["global_varlen"] = global_varlen
-            seen["cp_mesh"] = cp_mesh
-            seen["load_balancer_type"] = load_balancer_type
-            return inputs, labels, positions, sentinel, mtp_batch
+    def fake_cp_shard(
+        cp_mesh,
+        tensors,
+        seq_dims,
+        load_balancer_type,
+        seq_dim,
+    ):
+        seen["cp_shard_mesh"] = cp_mesh
+        seen["cp_shard_load_balancer_type"] = load_balancer_type
+        seen["cp_shard_seq_dims"] = seq_dims
+        seen["cp_shard_seq_dim"] = seq_dim
+        # CPU wiring test boundary only: production cp_shard owns the actual
+        # HeadTail tensor placement.  Return rank-0-shaped tensors so the real
+        # _build_cp_metadata -> build_cp_plan path remains under test.
+        local = tuple(t[:, : t.shape[1] // 2].clone() for t in tensors)
+        return local, None
 
     def fail_plain_builder(*args, **kwargs):
         raise AssertionError(
             "CP path must not build plain global compressed metadata"
         )
 
+    monkeypatch.setattr(model_mod, "cp_shard", fake_cp_shard)
     monkeypatch.setattr(
         model_mod,
         "build_compressed_varlen_metadata",
@@ -115,7 +129,7 @@ def test_build_attention_masks_cp_skips_plain_global_compressed_builder(monkeypa
     inputs = torch.zeros((1, 16), dtype=torch.long)
     labels = torch.zeros((1, 16), dtype=torch.long)
     extra_kwargs = {"positions": positions}
-    cp_mesh = object()
+    cp_mesh = _FakeCPMesh()
 
     out_inputs, out_labels, out_kwargs = (
         model_mod.DeepSeekV4Model.build_attention_masks(
@@ -128,9 +142,17 @@ def test_build_attention_masks_cp_skips_plain_global_compressed_builder(monkeypa
         )
     )
 
-    assert out_inputs is inputs
-    assert out_labels is labels
-    assert out_kwargs["attention_masks"] is sentinel
-    assert seen["global_varlen"] is varlen
-    assert seen["cp_mesh"] is cp_mesh
-    assert seen["load_balancer_type"] == "headtail"
+    metadata = out_kwargs["attention_masks"]
+    assert isinstance(metadata, model_mod.CompressedVarlenMetadata)
+    assert int(metadata.varlen.cu_seq_q[-1]) == 8
+    assert set(metadata.plans) == {1, 4, 128}
+    assert metadata.window is not None
+
+    assert out_inputs.shape == (1, 8)
+    assert out_labels.shape == (1, 8)
+    assert out_kwargs["positions"].shape == (1, 8)
+    assert seen["positions_before_shard"] is positions
+    assert seen["cp_shard_mesh"] is cp_mesh
+    assert seen["cp_shard_load_balancer_type"] == "headtail"
+    assert seen["cp_shard_seq_dims"] is None
+    assert seen["cp_shard_seq_dim"] == 1
