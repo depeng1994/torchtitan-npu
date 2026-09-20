@@ -68,6 +68,76 @@ def test_cp_plan_builds_only_current_rank_common_metadata(monkeypatch):
     assert window is not None
 
 
+def test_tensorized_cp_routing_matches_reference_and_fullgraph():
+    """Protect routing equality and Dynamo fullgraph capture."""
+    rows = torch.tensor([0, 1, 35, 66, 99, 34, 67, 100, 100, 7, 70, 103])
+    dest = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2])
+    cp_size, shard_len, rank = 4, 32, 1
+
+    # Python oracle for the old routing semantics.
+    foreign = [[] for _ in range(cp_size)]
+    for pos, dst in zip(rows.tolist(), dest.tolist(), strict=True):
+        if pos // shard_len != dst:
+            foreign[dst].append(pos)
+    send = [[] for _ in range(cp_size)]
+    send_splits = [[0] * cp_size for _ in range(cp_size)]
+    recv_splits, recv_offsets = [], []
+    for dst, positions in enumerate(foreign):
+        counts = [0] * cp_size
+        for pos in positions:
+            src = pos // shard_len
+            send[src].append(pos % shard_len)
+            send_splits[src][dst] += 1
+            counts[src] += 1
+        starts, total = [0] * cp_size, 0
+        for src, count in enumerate(counts):
+            starts[src], total = total, total + count
+        seen, offsets = [0] * cp_size, []
+        for pos in positions:
+            src = pos // shard_len
+            offsets.append(starts[src] + seen[src])
+            seen[src] += 1
+        recv_splits.append(counts)
+        recv_offsets.append(offsets)
+    expected = (send[rank], send_splits[rank], recv_splits[rank], recv_offsets[rank])
+
+    route = cp_mod._routing_tensors(
+        rows, dest, rank=rank, shard_len=shard_len, cp_size=cp_size
+    )
+    assert [x.tolist() for x in route] == list(expected)
+
+    rank_rows = rows[dest == rank]
+    expected_order, recv_of = [], {}
+    for pos in rank_rows.tolist():
+        if pos // shard_len == rank:
+            expected_order.append(pos - rank * shard_len)
+        else:
+            if pos not in recv_of:
+                recv_of[pos] = len(recv_of)
+            expected_order.append(shard_len + recv_of[pos])
+    order, unique = cp_mod._row_order_tensor(
+        rank_rows, rank=rank, shard_len=shard_len, cp_size=cp_size
+    )
+    assert order.tolist() == expected_order
+    assert int(unique) == len(recv_of)
+
+    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
+        compiled_route = torch.compile(
+            lambda r, d: cp_mod._routing_tensors(
+                r, d, rank=rank, shard_len=shard_len, cp_size=cp_size
+            ), backend="eager", fullgraph=True, dynamic=True,
+        )
+        compiled_order = torch.compile(
+            lambda r: cp_mod._row_order_tensor(
+                r, rank=rank, shard_len=shard_len, cp_size=cp_size
+            ), backend="eager", fullgraph=True, dynamic=True,
+        )
+        assert [x.tolist() for x in compiled_route(rows, dest)] == list(expected)
+        got_order, got_unique = compiled_order(rank_rows)
+        assert got_order.tolist() == expected_order
+        assert int(got_unique) == len(recv_of)
+
+
 def test_build_attention_masks_cp_runs_real_metadata_wiring(monkeypatch):
     """CP producer/consumer wiring reaches the real planner and skips plain plans."""
     cu = torch.tensor([0, 8, 16], dtype=torch.int32)

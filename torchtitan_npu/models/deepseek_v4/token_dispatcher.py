@@ -245,20 +245,6 @@ def _segment_host_lists(
     return out
 
 
-def _rows_by_rank_host(
-    rows: torch.Tensor,
-    dest_ranks: torch.Tensor,
-    *,
-    cp_size: int,
-) -> list[list[int]]:
-    """Temporary host view for the Python routing removed in the next commit."""
-    packed = torch.stack([dest_ranks.to(rows.dtype), rows], dim=1).cpu().tolist()
-    out: list[list[int]] = [[] for _ in range(cp_size)]
-    for dst, pos in packed:
-        out[dst].append(pos)
-    return out
-
-
 def _window_rows_tensor(
     geometry: _SegmentGeometry,
     restore: torch.Tensor,
@@ -396,72 +382,79 @@ def _tensor(vals: list[int], device) -> torch.Tensor:
     return torch.tensor(vals, dtype=torch.int64, device=device)
 
 
-def _routing_geometry(
-    foreign_all: list[list[int]], *, shard_len: int, cp_size: int
-) -> list[tuple[list[int], list[int], list[int], list[int]]]:
-    """The alltoallv routing of one exchange.
-
-    ``foreign_all[r]`` = rank r's foreign positions (permuted-stream
-    coordinates, in its per-segment receive order).  Build the same routing
-    in two linear passes over each receiver instead of rescanning every
-    receiver once per source rank.
-    """
-    send_indices: list[list[int]] = [[] for _ in range(cp_size)]
-    send_splits: list[list[int]] = [[0] * cp_size for _ in range(cp_size)]
-    recv_splits_all: list[list[int]] = []
-    recv_offsets_all: list[list[int]] = []
-
-    for dst, positions in enumerate(foreign_all):
-        counts = [0] * cp_size
-        for p in positions:
-            src = p // shard_len
-            send_indices[src].append(p % shard_len)
-            send_splits[src][dst] += 1
-            counts[src] += 1
-
-        starts = [0] * cp_size
-        total = 0
-        for src, n in enumerate(counts):
-            starts[src] = total
-            total += n
-
-        seen = [0] * cp_size
-        recv_offsets: list[int] = []
-        for p in positions:
-            src = p // shard_len
-            recv_offsets.append(starts[src] + seen[src])
-            seen[src] += 1
-
-        recv_splits_all.append(counts)
-        recv_offsets_all.append(recv_offsets)
-
-    return [
-        (send_indices[r], send_splits[r], recv_splits_all[r], recv_offsets_all[r])
-        for r in range(cp_size)
-    ]
+def _routing_tensors(
+    rows: torch.Tensor,
+    dest_ranks: torch.Tensor,
+    *,
+    rank: int,
+    shard_len: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Current-rank all-to-all routing, entirely on the planner device."""
+    src_ranks = torch.div(rows, shard_len, rounding_mode="floor")
+    foreign = src_ranks != dest_ranks
+    send_mask = foreign & (src_ranks == rank)
+    send_indices = (rows[send_mask] % shard_len).to(torch.long)
+    send_splits = torch.bincount(
+        dest_ranks[send_mask].to(torch.long), minlength=cp_size
+    )
+    recv_mask = foreign & (dest_ranks == rank)
+    recv_src = src_ranks[recv_mask].to(torch.long)
+    recv_splits = torch.bincount(recv_src, minlength=cp_size)
+    recv_starts = recv_splits.cumsum(0) - recv_splits
+    src_ids = torch.arange(cp_size, device=rows.device)
+    seen = (recv_src[:, None] == src_ids[None, :]).to(torch.long).cumsum(0)
+    seen_for_row = seen.gather(1, recv_src[:, None]).squeeze(1) - 1
+    recv_offsets = (recv_starts[recv_src] + seen_for_row).to(torch.long)
+    return send_indices, send_splits, recv_splits, recv_offsets
 
 
-def _row_order(rows: list[int], *, rank: int, shard_len: int) -> tuple[list[int], int]:
-    """The row order of one packed stream and its unique-receive count.
+def _row_order_tensor(
+    rows: torch.Tensor,
+    *,
+    rank: int,
+    shard_len: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map packed rows into the local-plus-received stream without Python."""
+    seq_len = cp_size * shard_len
+    src = torch.div(rows, shard_len, rounding_mode="floor")
+    local = src == rank
+    nrows = rows.numel()
+    row_ids = torch.arange(nrows, device=rows.device, dtype=torch.long)
+    sentinel = torch.full((), nrows, device=rows.device, dtype=torch.long)
+    first = torch.full((seq_len,), nrows, device=rows.device, dtype=torch.long)
+    first.scatter_reduce_(
+        0, rows.to(torch.long), torch.where(local, sentinel, row_ids),
+        reduce="amin", include_self=True,
+    )
+    is_first = (~local) & (first[rows.to(torch.long)] == row_ids)
+    slots = is_first.to(torch.long).cumsum(0) - 1
+    slot_map = torch.full((seq_len,), nrows, device=rows.device, dtype=torch.long)
+    slot_map.scatter_reduce_(
+        0, rows.to(torch.long), torch.where(is_first, slots, sentinel),
+        reduce="amin", include_self=True,
+    )
+    foreign_slot = slot_map[rows.to(torch.long)]
+    order = torch.where(
+        local, rows.to(torch.long) - rank * shard_len, shard_len + foreign_slot
+    )
+    return order, is_first.to(torch.long).sum()
 
-    ``rows`` are the stream's rows in packed order (permuted
-    coordinates); local rows map to their local offset, foreign rows to
-    ``shard_len + receive slot`` — the first-appearance order matching the
-    routing's ``recv_offsets``.
-    """
-    order: list[int] = []
-    recv_of: dict[int, int] = {}
-    cursor = 0
-    for pos in rows:
-        if pos // shard_len == rank:
-            order.append(pos - rank * shard_len)
-        else:
-            if pos not in recv_of:
-                recv_of[pos] = cursor
-                cursor += 1
-            order.append(shard_len + recv_of[pos])
-    return order, cursor
 
+def _routing_row(
+    rows: torch.Tensor,
+    dest_ranks: torch.Tensor,
+    *,
+    rank: int,
+    shard_len: int,
+    cp_size: int,
+):
+    """Tensor routing plus O(CP) host split lists required by collectives."""
+    send, send_splits, recv_splits, recv_offsets = _routing_tensors(
+        rows, dest_ranks, rank=rank, shard_len=shard_len, cp_size=cp_size
+    )
+    return (send, send_splits.cpu().tolist(), recv_splits.cpu().tolist(), recv_offsets)
 
 def _build_exchange_plan(row, device) -> ExchangePlan:
     """One rank's routing row as the tensor/list mix the collective APIs
@@ -469,10 +462,10 @@ def _build_exchange_plan(row, device) -> ExchangePlan:
     exchange never syncs."""
     send, splits, recv, off = row
     return ExchangePlan(
-        send_indices=_tensor(send, device),
+        send_indices=send.to(device=device, dtype=torch.long),
         send_splits=splits,
         recv_splits=recv,
-        recv_offsets=_tensor(off, device),
+        recv_offsets=off.to(device=device, dtype=torch.long),
     )
 
 
@@ -523,8 +516,8 @@ def _container_slots(segs_all, seg_blocks_all, *, ratio: int):
 
 
 def _assemble_window_plan(
-    win_rows: list[int],
-    ori_lens: list[int],
+    win_rows: torch.Tensor,
+    ori_lens: torch.Tensor,
     routing_row,
     *,
     rank: int,
@@ -532,9 +525,12 @@ def _assemble_window_plan(
     device,
 ) -> WindowPlan:
     """Assemble the current rank window plan from pre-derived row geometry."""
-    win_order, _ = _row_order(win_rows, rank=rank, shard_len=shard_len)
-    cu_ori = torch.tensor(
-        [0, *ori_lens], dtype=torch.int32, device=device
+    cp_size = len(routing_row[1])
+    win_order, _ = _row_order_tensor(
+        win_rows, rank=rank, shard_len=shard_len, cp_size=cp_size
+    )
+    cu_ori = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), ori_lens.to(torch.int32)]
     ).cumsum(0, dtype=torch.int32)
     return WindowPlan(
         exchange=_build_exchange_plan(routing_row, device),
@@ -546,7 +542,7 @@ def _assemble_window_plan(
 def _assemble_block_plan(
     segs: list[tuple[int, int, int, int]],
     segs_all: list[list[tuple[int, int, int, int]]],
-    rows: list[int],
+    rows: torch.Tensor,
     seg_blocks_all: list[list[tuple[int, int, int]]],
     routing_row,
     *,
@@ -562,10 +558,10 @@ def _assemble_block_plan(
     derived directly over the plan blocks; the ``gather_indices`` order
     the pooled stream the exchange produces (``cat([x_local, recv])``)."""
     my_blocks = seg_blocks_all[rank]
-    order, n_foreign = _row_order(rows, rank=rank, shard_len=shard_len)
-    # The plan blocks of one rank never overlap, so every foreign row is
-    # received exactly once (the recv_offsets length is the receive count).
-    assert n_foreign == len(routing_row[3]), (n_foreign, len(routing_row[3]))
+    cp_size = len(routing_row[1])
+    order, _ = _row_order_tensor(
+        rows, rank=rank, shard_len=shard_len, cp_size=cp_size
+    )
 
     # The compressor contract, derived directly over the plan blocks.
     pos_parts: list[torch.Tensor] = []
@@ -676,22 +672,15 @@ def build_cp_plan(
     win_rows_t, win_dest_t, win_lens_t = _window_rows_tensor(
         geometry, restore, window_size=window_size
     )
-    win_rows_all = _rows_by_rank_host(
-        win_rows_t, win_dest_t, cp_size=cp_size
-    )
-    win_foreign = [
-        [p for p in rows if p // shard_len != r]
-        for r, rows in enumerate(win_rows_all)
-    ]
-    routing = _routing_geometry(
-        win_foreign, shard_len=shard_len, cp_size=cp_size
+    routing = _routing_row(
+        win_rows_t, win_dest_t, rank=rank, shard_len=shard_len, cp_size=cp_size
     )
     my_seg_mask = geometry.ranks == rank
-    ori_lens = win_lens_t[my_seg_mask].cpu().tolist()
+    my_row_mask = win_dest_t == rank
     window = _assemble_window_plan(
-        win_rows_all[rank],
-        ori_lens,
-        routing[rank],
+        win_rows_t[my_row_mask],
+        win_lens_t[my_seg_mask],
+        routing,
         rank=rank,
         shard_len=shard_len,
         device=device,
@@ -710,25 +699,22 @@ def build_cp_plan(
         block_rows_t, block_dest_t, A_t, block_end_t, strip_t = (
             _block_rows_tensor(geometry, restore, ratio=ratio)
         )
-        block_rows_all = _rows_by_rank_host(
-            block_rows_t, block_dest_t, cp_size=cp_size
-        )
-        block_foreign = [
-            [p for p in rows if p // shard_len != r]
-            for r, rows in enumerate(block_rows_all)
-        ]
         seg_blocks_all = _block_host_lists(
             A_t, block_end_t, strip_t, geometry.counts
         )
-        routing = _routing_geometry(
-            block_foreign, shard_len=shard_len, cp_size=cp_size
+        routing = _routing_row(
+            block_rows_t,
+            block_dest_t,
+            rank=rank,
+            shard_len=shard_len,
+            cp_size=cp_size,
         )
         plans[ratio] = _assemble_block_plan(
             my_segs,
             segs_all,
-            block_rows_all[rank],
+            block_rows_t[block_dest_t == rank],
             seg_blocks_all,
-            routing[rank],
+            routing,
             ratio=ratio,
             rank=rank,
             shard_len=shard_len,
