@@ -142,59 +142,205 @@ def segment_structure(cp_meta) -> list[tuple[int, int, int, int]]:
     return segs
 
 
-def _derive_all_rank_segments(
-    global_cu: list[int],
-    rearrange: list[int],
-    restore: list[int],
+@dataclass(frozen=True)
+class _SegmentGeometry:
+    """Compact all-rank segment geometry kept on the planner device."""
+
+    ranks: torch.Tensor
+    doc_ids: torch.Tensor
+    doc_starts: torch.Tensor
+    doc_lens: torch.Tensor
+    seg_lens: torch.Tensor
+    seqlens_k: torch.Tensor
+    p0: torch.Tensor
+    counts: torch.Tensor
+
+
+def _derive_all_rank_segments_tensor(
+    global_cu: torch.Tensor,
+    rearrange: torch.Tensor,
+    restore: torch.Tensor,
     *,
     cp_size: int,
     shard_len: int,
-) -> list[list[tuple[int, int, int, int]]]:
-    """Derive planner-only all-rank segments from global packed boundaries.
+) -> _SegmentGeometry:
+    """Derive all-rank segment geometry without materializing O(S) host lists.
 
-    This reproduces ``segment_structure`` without constructing CP-1 temporary
-    ``CPVarlenMetadata`` objects and copying their rank-local tensors to host.
+    Segments are compacted rank-major.  The helper is tensor-only so it can be
+    captured by Dynamo and executed on the planner device.
     """
-    doc_starts = set(global_cu[1:-1])
-    segs_all: list[list[tuple[int, int, int, int]]] = []
+    q = rearrange.reshape(cp_size, shard_len)
+    doc_idx = torch.searchsorted(global_cu[1:], q, right=True)
+    breaks = torch.ones_like(q, dtype=torch.bool)
+    breaks[:, 1:] = (q[:, 1:] != q[:, :-1] + 1) | (
+        doc_idx[:, 1:] != doc_idx[:, :-1]
+    )
 
-    for rank in range(cp_size):
-        q = rearrange[rank * shard_len : (rank + 1) * shard_len]
-        if not q:
-            segs_all.append([])
-            continue
+    seg_local = breaks.cumsum(dim=1) - 1
+    counts = breaks.sum(dim=1)
+    seg_base = counts.cumsum(dim=0) - counts
+    seg_global = seg_local + seg_base[:, None]
 
-        segs: list[tuple[int, int, int, int]] = []
-        first = prev = q[0]
-        seg_len = 1
+    seg_lens = torch.bincount(seg_global.reshape(-1)).to(global_cu.dtype)
+    seg_first = q[breaks]
+    seg_doc_idx = doc_idx[breaks]
+    doc_starts = global_cu[seg_doc_idx]
+    p0 = seg_first - doc_starts
+    seqlens_k = p0 + seg_lens
+    doc_ids = restore[doc_starts.to(torch.long)]
+    doc_lens = global_cu[seg_doc_idx + 1] - doc_starts
+    ranks = torch.repeat_interleave(
+        torch.arange(cp_size, device=q.device), counts.to(torch.long)
+    )
+    return _SegmentGeometry(
+        ranks=ranks,
+        doc_ids=doc_ids,
+        doc_starts=doc_starts,
+        doc_lens=doc_lens,
+        seg_lens=seg_lens,
+        seqlens_k=seqlens_k,
+        p0=p0,
+        counts=counts,
+    )
 
-        def append_segment(seg_first: int, seg_last: int, length: int) -> None:
-            doc_idx = bisect_right(global_cu, seg_first) - 1
-            doc_start = global_cu[doc_idx]
-            seqlen_k = seg_last - doc_start + 1
-            segs.append(
-                (
-                    restore[doc_start],
-                    length,
-                    seqlen_k,
-                    seg_first - doc_start,
-                )
-            )
 
-        for pos in q[1:]:
-            if pos != prev + 1 or pos in doc_starts:
-                append_segment(first, prev, seg_len)
-                first = pos
-                seg_len = 1
-            else:
-                seg_len += 1
-            prev = pos
+def _expand_segment_ranges(
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    restore: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand original-position ranges and map them to permuted coordinates."""
+    repeats = lengths.to(torch.long)
+    seg_ids = torch.repeat_interleave(
+        torch.arange(lengths.numel(), device=starts.device), repeats
+    )
+    ends = repeats.cumsum(0)
+    offsets = torch.arange(ends[-1], device=starts.device, dtype=starts.dtype)
+    offsets = offsets - torch.repeat_interleave(ends - repeats, repeats).to(
+        starts.dtype
+    )
+    original = starts[seg_ids] + offsets
+    return restore[original.to(torch.long)], seg_ids
 
-        append_segment(first, prev, seg_len)
-        segs_all.append(segs)
 
-    return segs_all
+def _segment_host_lists(
+    geometry: _SegmentGeometry,
+) -> list[list[tuple[int, int, int, int]]]:
+    """Temporary compact host view for routing/container code removed later."""
+    packed = torch.stack(
+        [
+            geometry.doc_ids,
+            geometry.seg_lens,
+            geometry.seqlens_k,
+            geometry.p0,
+        ],
+        dim=1,
+    ).cpu().tolist()
+    counts = geometry.counts.cpu().tolist()
+    out: list[list[tuple[int, int, int, int]]] = []
+    cursor = 0
+    for count in counts:
+        out.append([tuple(row) for row in packed[cursor : cursor + count]])
+        cursor += count
+    return out
 
+
+def _rows_by_rank_host(
+    rows: torch.Tensor,
+    dest_ranks: torch.Tensor,
+    *,
+    cp_size: int,
+) -> list[list[int]]:
+    """Temporary host view for the Python routing removed in the next commit."""
+    packed = torch.stack([dest_ranks.to(rows.dtype), rows], dim=1).cpu().tolist()
+    out: list[list[int]] = [[] for _ in range(cp_size)]
+    for dst, pos in packed:
+        out[dst].append(pos)
+    return out
+
+
+def _window_rows_tensor(
+    geometry: _SegmentGeometry,
+    restore: torch.Tensor,
+    *,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    win_start = torch.clamp(geometry.p0 - (window_size - 1), min=0)
+    win_lens = geometry.seg_lens + geometry.p0 - win_start
+    rows, row_seg = _expand_segment_ranges(
+        geometry.doc_starts + win_start, win_lens, restore
+    )
+    return rows, geometry.ranks[row_seg], win_lens
+
+
+def _block_ranges_tensor(
+    geometry: _SegmentGeometry,
+    *,
+    ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    p0 = geometry.p0
+    q0 = p0 + geometry.seg_lens
+    straddle_idx = q0 // ratio
+    straddle = (
+        (q0 % ratio != 0)
+        & (straddle_idx * ratio >= p0)
+        & ((straddle_idx + 1) * ratio <= geometry.doc_lens)
+    )
+    b_first = (p0 + ratio - 1) // ratio
+    b_last = q0 // ratio - 1
+    has_complete = b_first <= b_last
+    case2 = (~has_complete) & straddle & (straddle_idx > 0)
+    case3 = (~has_complete) & straddle & (straddle_idx == 0)
+
+    A = torch.where(
+        has_complete,
+        torch.where(b_first > 0, (b_first - 1) * ratio, torch.zeros_like(q0)),
+        torch.where(
+            case2,
+            (straddle_idx - 1) * ratio,
+            torch.where(case3, torch.zeros_like(q0), q0),
+        ),
+    )
+    B = torch.where(
+        has_complete,
+        torch.where(straddle, (straddle_idx + 1) * ratio, q0),
+        torch.where(case2 | case3, (straddle_idx + 1) * ratio, q0),
+    )
+    strip = torch.where(
+        has_complete,
+        (b_first > 0).to(q0.dtype),
+        case2.to(q0.dtype),
+    )
+    return A, (B // ratio) * ratio, strip
+
+
+def _block_rows_tensor(
+    geometry: _SegmentGeometry,
+    restore: torch.Tensor,
+    *,
+    ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    A, block_end, strip = _block_ranges_tensor(geometry, ratio=ratio)
+    rows, row_seg = _expand_segment_ranges(
+        geometry.doc_starts + A, block_end - A, restore
+    )
+    return rows, geometry.ranks[row_seg], A, block_end, strip
+
+
+def _block_host_lists(
+    A: torch.Tensor,
+    block_end: torch.Tensor,
+    strip: torch.Tensor,
+    counts: torch.Tensor,
+) -> list[list[tuple[int, int, int]]]:
+    packed = torch.stack([A, block_end, strip], dim=1).cpu().tolist()
+    count_list = counts.cpu().tolist()
+    out: list[list[tuple[int, int, int]]] = []
+    cursor = 0
+    for count in count_list:
+        out.append([tuple(row) for row in packed[cursor : cursor + count]])
+        cursor += count
+    return out
 
 def _window_range(seg: tuple[int, int, int, int], window_size: int) -> tuple[int, int]:
     """``(win_start, win_len)`` of the segment's window rows — ratio-
@@ -377,28 +523,19 @@ def _container_slots(segs_all, seg_blocks_all, *, ratio: int):
 
 
 def _assemble_window_plan(
-    segs: list[tuple[int, int, int, int]],
-    docs: dict[int, list[int]],
+    win_rows: list[int],
+    ori_lens: list[int],
     routing_row,
     *,
     rank: int,
     shard_len: int,
-    window_size: int,
     device,
 ) -> WindowPlan:
-    """The ratio-independent window plan: the exchange + the packed ori
-    stream's ``gather_indices`` (``cu_seqlens_ori_kv`` bounds the
-    per-segment window rows)."""
-    win_rows: list[int] = []
-    ori_lens: list[int] = []
-    for seg in segs:
-        win_start, win_len = _window_range(seg, window_size)
-        ori_lens.append(win_len)
-        win_rows += docs[seg[0]][win_start : win_start + win_len]
-    # The receive slots number the stream-wide foreign order (matching the
-    # routing's recv_offsets), so the gather indices run once over all rows.
+    """Assemble the current rank window plan from pre-derived row geometry."""
     win_order, _ = _row_order(win_rows, rank=rank, shard_len=shard_len)
-    cu_ori = torch.tensor([0, *ori_lens], dtype=torch.int32, device=device).cumsum(0, dtype=torch.int32)
+    cu_ori = torch.tensor(
+        [0, *ori_lens], dtype=torch.int32, device=device
+    ).cumsum(0, dtype=torch.int32)
     return WindowPlan(
         exchange=_build_exchange_plan(routing_row, device),
         gather_indices=_tensor(win_order, device),
@@ -409,7 +546,7 @@ def _assemble_window_plan(
 def _assemble_block_plan(
     segs: list[tuple[int, int, int, int]],
     segs_all: list[list[tuple[int, int, int, int]]],
-    docs: dict[int, list[int]],
+    rows: list[int],
     seg_blocks_all: list[list[tuple[int, int, int]]],
     routing_row,
     *,
@@ -425,9 +562,6 @@ def _assemble_block_plan(
     derived directly over the plan blocks; the ``gather_indices`` order
     the pooled stream the exchange produces (``cat([x_local, recv])``)."""
     my_blocks = seg_blocks_all[rank]
-    rows: list[int] = []
-    for seg, (A, block_end, _strip) in zip(segs, my_blocks, strict=True):
-        rows += docs[seg[0]][A:block_end]
     order, n_foreign = _row_order(rows, rank=rank, shard_len=shard_len)
     # The plan blocks of one rank never overlap, so every foreign row is
     # received exactly once (the recv_offsets length is the receive count).
@@ -525,41 +659,41 @@ def build_cp_plan(
         cp_load_balancer,
     )
 
-    # One host materialization of global planner inputs replaces CP copies of
-    # CPVarlenMetadata plus per-rank ``segment_structure().cpu().tolist()``.
-    rearrange_host = rearrange.tolist()
-    restore_host = restore.tolist()
-    global_cu_host = global_cu.tolist()
-    segs_all = _derive_all_rank_segments(
-        global_cu_host,
-        rearrange_host,
-        restore_host,
+    geometry = _derive_all_rank_segments_tensor(
+        global_cu,
+        rearrange,
+        restore,
         cp_size=cp_size,
         shard_len=shard_len,
     )
+
+    # Compact segment rows are still materialized for the remaining Python
+    # routing/container stages.  The O(S) planner inputs stay on device.
+    segs_all = _segment_host_lists(geometry)
     my_segs = segs_all[rank]
 
-    # The full permuted document slices, keyed by the segment's doc identity.
-    docs: dict[int, list[int]] = {}
-    for d0, d1 in zip(global_cu_host[:-1], global_cu_host[1:], strict=True):
-        if d1 > d0:
-            docs[restore_host[d0]] = restore_host[d0:d1]
-
     # ---- the window plan (ratio-independent) ----
-    win_foreign: list[list[int]] = [[] for _ in range(cp_size)]
-    for r in range(cp_size):
-        for seg in segs_all[r]:
-            win_start, win_len = _window_range(seg, window_size)
-            doc = docs[seg[0]]
-            win_foreign[r] += [p for p in doc[win_start : win_start + win_len] if p // shard_len != r]
-    routing = _routing_geometry(win_foreign, shard_len=shard_len, cp_size=cp_size)
+    win_rows_t, win_dest_t, win_lens_t = _window_rows_tensor(
+        geometry, restore, window_size=window_size
+    )
+    win_rows_all = _rows_by_rank_host(
+        win_rows_t, win_dest_t, cp_size=cp_size
+    )
+    win_foreign = [
+        [p for p in rows if p // shard_len != r]
+        for r, rows in enumerate(win_rows_all)
+    ]
+    routing = _routing_geometry(
+        win_foreign, shard_len=shard_len, cp_size=cp_size
+    )
+    my_seg_mask = geometry.ranks == rank
+    ori_lens = win_lens_t[my_seg_mask].cpu().tolist()
     window = _assemble_window_plan(
-        my_segs,
-        docs,
+        win_rows_all[rank],
+        ori_lens,
         routing[rank],
         rank=rank,
         shard_len=shard_len,
-        window_size=window_size,
         device=device,
     )
 
@@ -573,19 +707,26 @@ def build_cp_plan(
                 gather_indices=None,
             )
             continue
-        block_foreign: list[list[int]] = [[] for _ in range(cp_size)]
-        seg_blocks_all: list[list[tuple[int, int, int]]] = [[] for _ in range(cp_size)]
-        for r in range(cp_size):
-            for seg in segs_all[r]:
-                A, B, strip = _block_range(seg, len(docs[seg[0]]), ratio=ratio)
-                block_end = (B // ratio) * ratio
-                seg_blocks_all[r].append((A, block_end, strip))
-                block_foreign[r] += [p for p in docs[seg[0]][A:block_end] if p // shard_len != r]
-        routing = _routing_geometry(block_foreign, shard_len=shard_len, cp_size=cp_size)
+        block_rows_t, block_dest_t, A_t, block_end_t, strip_t = (
+            _block_rows_tensor(geometry, restore, ratio=ratio)
+        )
+        block_rows_all = _rows_by_rank_host(
+            block_rows_t, block_dest_t, cp_size=cp_size
+        )
+        block_foreign = [
+            [p for p in rows if p // shard_len != r]
+            for r, rows in enumerate(block_rows_all)
+        ]
+        seg_blocks_all = _block_host_lists(
+            A_t, block_end_t, strip_t, geometry.counts
+        )
+        routing = _routing_geometry(
+            block_foreign, shard_len=shard_len, cp_size=cp_size
+        )
         plans[ratio] = _assemble_block_plan(
             my_segs,
             segs_all,
-            docs,
+            block_rows_all[rank],
             seg_blocks_all,
             routing[rank],
             ratio=ratio,

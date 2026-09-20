@@ -260,7 +260,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         context plus the load-balancer permutation.
 
         Returns ``(inputs, labels, positions, metadata, mtp_batch)``."""
-        seq_len = int(global_varlen.cu_seq_q[-1].item())
+        seq_len = positions.shape[1]
         cp_size = cp_mesh.size(0)
         if seq_len % cp_size != 0:
             raise ValueError(f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size}).")
@@ -293,7 +293,12 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
             inputs,
             labels,
             positions,
-            CompressedVarlenMetadata(varlen=cp_meta, plans=plans, window=window),
+            CompressedVarlenMetadata(
+                varlen=cp_meta,
+                plans=plans,
+                window=window,
+                seq_len_host=seq_len,
+            ),
             mtp_batch,
         )
 

@@ -71,15 +71,38 @@ def patched_post_dataloading_process(self, input_dict, labels):
     return original_post_dataloading_process(self, input_dict, labels)
 
 
-# Backport TorchTitan #4421 by rewriting only the two v0.3.0 H2D copies.
-def patch_async_h2d() -> None:
-    src = textwrap.dedent(inspect.getsource(Trainer.train_step))
-    assert src.count("value.to(self.device)") == src.count("labels.to(self.device)") == 1
-    src = src.replace("value.to(self.device)", "value.to(self.device, non_blocking=True)")
-    src = src.replace("labels.to(self.device)", "labels.to(self.device, non_blocking=True)")
-    scope = dict(Trainer.train_step.__globals__)
+def _rewrite_method_h2d(method, replacements: dict[str, str]):
+    """Keep the v0.3.0 backport narrow and fail loudly if upstream drifts."""
+    src = textwrap.dedent(inspect.getsource(method))
+    for old, new in replacements.items():
+        assert old in src, f"missing expected TorchTitan v0.3.0 H2D site: {old}"
+        src = src.replace(old, new)
+    scope = dict(method.__globals__)
     exec(src, scope)
-    Trainer.train_step = scope["train_step"]
+    return scope[method.__name__]
+
+
+# Backport TorchTitan #4421 semantics to every explicit v0.3.0 CPU->device copy.
+def patch_async_h2d() -> None:
+    Trainer.train_step = _rewrite_method_h2d(
+        Trainer.train_step,
+        {
+            "local_valid_tokens.to(self.device)": (
+                "local_valid_tokens.to(self.device, non_blocking=True)"
+            ),
+            "value.to(self.device)": "value.to(self.device, non_blocking=True)",
+            "labels.to(self.device)": "labels.to(self.device, non_blocking=True)",
+        },
+    )
+    Trainer.forward_backward_step = _rewrite_method_h2d(
+        Trainer.forward_backward_step,
+        {
+            "torch.sum(torch.stack(losses)).to(self.device)": (
+                "torch.sum(torch.stack(losses)).to("
+                "self.device, non_blocking=True)"
+            ),
+        },
+    )
 
 
 class EMATrainer(Trainer):
