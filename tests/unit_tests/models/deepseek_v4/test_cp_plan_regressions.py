@@ -138,6 +138,50 @@ def test_tensorized_cp_routing_matches_reference_and_fullgraph():
         assert int(got_unique) == len(recv_of)
 
 
+def test_tensorized_cp_container_layout_fullgraph():
+    """Keep block ownership on tensors and Dynamo-capturable."""
+    docs = (37, 41, 63, 115)
+    cp_size = 4
+    seq_len = sum(docs)
+    shard_len = seq_len // cp_size
+    cu = torch.tensor([0, *torch.tensor(docs).cumsum(0).tolist()], dtype=torch.int32)
+    lb = _CountingHeadTail(seq_len, cp_size)
+    rearrange = lb._generate_indices(False).reshape(-1).to(torch.int32)
+    restore = torch.empty_like(rearrange)
+    restore[rearrange] = torch.arange(seq_len, dtype=torch.int32)
+    geometry = cp_mod._derive_all_rank_segments_tensor(
+        cu, rearrange, restore, cp_size=cp_size, shard_len=shard_len
+    )
+    A, block_end, strip = cp_mod._block_ranges_tensor(geometry, ratio=4)
+
+    eager = cp_mod._container_layout_tensor(
+        geometry, A, block_end, strip,
+        ratio=4, rank=0, cp_size=cp_size, seq_len=seq_len,
+    )
+    with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
+        compiled = torch.compile(
+            lambda ranks, doc_starts, seqlens_k, a, end, st: cp_mod._container_layout_tensor(
+                cp_mod._SegmentGeometry(
+                    ranks=ranks,
+                    doc_ids=geometry.doc_ids,
+                    doc_starts=doc_starts,
+                    doc_lens=geometry.doc_lens,
+                    seg_lens=geometry.seg_lens,
+                    seqlens_k=seqlens_k,
+                    p0=geometry.p0,
+                    counts=geometry.counts,
+                ),
+                a, end, st, ratio=4, rank=0, cp_size=cp_size, seq_len=seq_len,
+            ),
+            backend="eager", fullgraph=True, dynamic=True,
+        )
+        got = compiled(
+            geometry.ranks, geometry.doc_starts, geometry.seqlens_k, A, block_end, strip
+        )
+    assert got[0].tolist() == eager[0].tolist()
+    assert int(got[1]) == int(eager[1])
+
+
 def test_build_attention_masks_cp_runs_real_metadata_wiring(monkeypatch):
     """CP producer/consumer wiring reaches the real planner and skips plain plans."""
     cu = torch.tensor([0, 8, 16], dtype=torch.int32)
