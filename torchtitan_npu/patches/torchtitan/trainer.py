@@ -6,9 +6,12 @@
 
 # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3634
 # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3985
+# Backport upstream PR: https://github.com/pytorch/torchtitan/pull/4421
 
 import functools
+import inspect
 import logging
+import textwrap
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -68,6 +71,17 @@ def patched_post_dataloading_process(self, input_dict, labels):
     return original_post_dataloading_process(self, input_dict, labels)
 
 
+# Backport TorchTitan #4421 by rewriting only the two v0.3.0 H2D copies.
+def patch_async_h2d() -> None:
+    src = textwrap.dedent(inspect.getsource(Trainer.train_step))
+    assert src.count("value.to(self.device)") == src.count("labels.to(self.device)") == 1
+    src = src.replace("value.to(self.device)", "value.to(self.device, non_blocking=True)")
+    src = src.replace("labels.to(self.device)", "labels.to(self.device, non_blocking=True)")
+    scope = dict(Trainer.train_step.__globals__)
+    exec(src, scope)
+    Trainer.train_step = scope["train_step"]
+
+
 class EMATrainer(Trainer):
     """Trainer with upstream EMA configuration and optimizer wiring."""
 
@@ -89,7 +103,9 @@ class EMATrainer(Trainer):
 
 def apply() -> None:
     logger.info("[PATCH] Trainer.post_dataloading_process -> patched_post_dataloading_process")
+    logger.info("[PATCH] Trainer.train_step -> async H2D source rewrite (upstream #4421)")
     Trainer.post_dataloading_process = patched_post_dataloading_process
+    patch_async_h2d()
     torchtitan.trainer.Trainer = EMATrainer
 
 

@@ -14,7 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# Prefetch 8 batches to overlap 1M long-sequence GA8 data loading with compute.
+# Prefetch/pin 1M GA8 batches so queue drain and async H2D can overlap compute.
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
     --parallelism.context-parallel-degree 128 \
     --parallelism.data-parallel-shard-degree 1 \
@@ -23,4 +23,5 @@ exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
     --training.global-batch-size 8 \
     --dataloader.num-workers 1 \
     --dataloader.prefetch-factor 8 \
+    --dataloader.pin-memory \
     "$@"
