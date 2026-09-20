@@ -91,11 +91,15 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_graph_trainer_recompute/">DeepSeek-V4 GraphTrainer 激活重计算</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_lora/">DeepSeek-V4 LoRA 微调</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_tnd/">DeepSeek-V4 TND 适配</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../ep_process_group/">EP 通信域分离</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../fused_ops/">融合算子接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../graph_trainer_ep_overlap/">GraphTrainer EP overlap 适配</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
                   </li>
@@ -246,13 +250,14 @@
 </tr>
 <tr>
 <td>EP overlap（上游实验性 pass）</td>
-<td>未验证</td>
+<td>已通过patch适配；见 <a href="../graph_trainer_ep_overlap/"><code>graph_trainer_ep_overlap.md</code></a></td>
 </tr>
 </tbody>
 </table>
 <h2 id="_7">相关文档</h2>
 <ul>
 <li>上游 GraphTrainer 说明与 EP overlap 用法：<a href="https://github.com/pytorch/torchtitan/blob/main/torchtitan/experiments/graph_trainer/README.md"><code>torchtitan/experiments/graph_trainer/README.md</code></a></li>
+<li>EP overlap 适配：<a href="../graph_trainer_ep_overlap/"><code>graph_trainer_ep_overlap.md</code></a></li>
 <li>DSV4 稀疏注意力与 TND 融合路径：<a href="../deepseek_v4_tnd/"><code>deepseek_v4_tnd.md</code></a></li>
 </ul>
               
