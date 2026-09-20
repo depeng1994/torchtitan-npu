@@ -163,7 +163,7 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
         _build_case(
             test_name="dsv4_smla_cp2_ep2_fsdp2",
             test_descr="DeepSeek-V4 SMLA Muon cp2 ep2 fsdp2",
-            ngpu=4,
+            ngpu=2,
             extra_args=(
                 "--training.steps=1",
                 "--parallelism.expert-parallel-degree=2",
@@ -173,6 +173,8 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "--compile.backend=aot_eager",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",
+                "--dataloader.num-workers=1",
+                "--dataloader.prefetch-factor=8",
                 "--optimizer.name=Muon",
             ),
             use_golden=False,
@@ -189,6 +191,8 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "--parallelism.spmd-backend=spmd_types",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",
+                "--dataloader.num-workers=1",
+                "--dataloader.prefetch-factor=8",
                 "--optimizer.name=Muon",
             ),
             use_golden=False,

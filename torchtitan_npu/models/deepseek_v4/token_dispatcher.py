@@ -9,9 +9,9 @@ Two halves live here (the single home of all DSV4 CP logic):
 
 1. **The plan builder** — a pure derivation from the global context: the
    pre-shard document structure (the model's ``get_attention_masks``
-   result) plus the load-balancer permutation.  Every rank derives every
-   rank's rank-local shard metadata in-frame via
-   ``CPVarlenMetadata.from_global`` (the shard path's own builder), so
+   result) plus the load-balancer permutation.  The planner derives all-rank
+   segment geometry directly from that global context and materializes only the
+   current rank's ``CPVarlenMetadata`` through the shard path's own builder, so
    there is **no plan-time communication** at all.  The whole derivation
    is expressed in the documents' **permuted slices** (``docs``, keyed by
    the segment's doc identity): every row a plan consumes — window
@@ -59,15 +59,23 @@ segment with each ratio plan's ``cmp_k_global_gather_indices``.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
+from typing import cast
 
 import spmd_types as spmd
 import torch
 from torch.distributed._functional_collectives import all_to_all_single
+from torch.distributed.tensor.experimental._context_parallel._load_balancer import (
+    _LoadBalancer,
+)
 from torchtitan.config import Configurable
 from torchtitan.distributed.utils import get_spmd_backend
 
-from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
+from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
+    CPVarlenMetadata,
+    _argsort_indices,
+)
 
 from .metadata import CompressedBlockLayout
 
@@ -81,8 +89,7 @@ __all__ = [
 
 
 class _RankMesh:
-    """``CPVarlenMetadata.from_global``'s ``DeviceMesh`` contract for a fixed
-    rank (the pure plan derives every rank's shard metadata in-frame)."""
+    """``CPVarlenMetadata.from_global``'s ``DeviceMesh`` contract for one rank."""
 
     ndim = 1
 
@@ -95,6 +102,18 @@ class _RankMesh:
 
     def get_local_rank(self) -> int:
         return self._rank
+
+
+class _CachedLoadBalancer:
+    """DSV4-local view that reuses one already-built load-balancer layout."""
+
+    def __init__(self, rearrange_indices: torch.Tensor):
+        self._rearrange_indices = rearrange_indices
+
+    def _generate_indices(self, restore: bool = False) -> torch.Tensor:
+        if restore:
+            return _argsort_indices(self._rearrange_indices)
+        return self._rearrange_indices
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +141,189 @@ def segment_structure(cp_meta) -> list[tuple[int, int, int, int]]:
         segs.append((kg[cu_k[s]], seg_len, seqlen_k, seqlen_k - seg_len))
     return segs
 
+
+@dataclass(frozen=True)
+class _SegmentGeometry:
+    """Compact all-rank segment geometry kept on the planner device."""
+
+    ranks: torch.Tensor
+    doc_ids: torch.Tensor
+    doc_starts: torch.Tensor
+    doc_lens: torch.Tensor
+    seg_lens: torch.Tensor
+    seqlens_k: torch.Tensor
+    p0: torch.Tensor
+    counts: torch.Tensor
+
+
+def _derive_all_rank_segments_tensor(
+    global_cu: torch.Tensor,
+    rearrange: torch.Tensor,
+    restore: torch.Tensor,
+    *,
+    cp_size: int,
+    shard_len: int,
+) -> _SegmentGeometry:
+    """Derive all-rank segment geometry without materializing O(S) host lists.
+
+    Segments are compacted rank-major.  The helper is tensor-only so it can be
+    captured by Dynamo and executed on the planner device.
+    """
+    q = rearrange.reshape(cp_size, shard_len)
+    doc_idx = torch.searchsorted(global_cu[1:], q, right=True)
+    breaks = torch.ones_like(q, dtype=torch.bool)
+    breaks[:, 1:] = (q[:, 1:] != q[:, :-1] + 1) | (
+        doc_idx[:, 1:] != doc_idx[:, :-1]
+    )
+
+    seg_local = breaks.cumsum(dim=1) - 1
+    counts = breaks.sum(dim=1)
+    seg_base = counts.cumsum(dim=0) - counts
+    seg_global = seg_local + seg_base[:, None]
+
+    seg_lens = torch.bincount(seg_global.reshape(-1)).to(global_cu.dtype)
+    seg_first = q[breaks]
+    seg_doc_idx = doc_idx[breaks]
+    doc_starts = global_cu[seg_doc_idx]
+    p0 = seg_first - doc_starts
+    seqlens_k = p0 + seg_lens
+    doc_ids = restore[doc_starts.to(torch.long)]
+    doc_lens = global_cu[seg_doc_idx + 1] - doc_starts
+    ranks = torch.repeat_interleave(
+        torch.arange(cp_size, device=q.device), counts.to(torch.long)
+    )
+    return _SegmentGeometry(
+        ranks=ranks,
+        doc_ids=doc_ids,
+        doc_starts=doc_starts,
+        doc_lens=doc_lens,
+        seg_lens=seg_lens,
+        seqlens_k=seqlens_k,
+        p0=p0,
+        counts=counts,
+    )
+
+
+def _expand_segment_ranges(
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    restore: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand original-position ranges and map them to permuted coordinates."""
+    repeats = lengths.to(torch.long)
+    seg_ids = torch.repeat_interleave(
+        torch.arange(lengths.numel(), device=starts.device), repeats
+    )
+    ends = repeats.cumsum(0)
+    offsets = torch.arange(ends[-1], device=starts.device, dtype=starts.dtype)
+    offsets = offsets - torch.repeat_interleave(ends - repeats, repeats).to(
+        starts.dtype
+    )
+    original = starts[seg_ids] + offsets
+    return restore[original.to(torch.long)], seg_ids
+
+
+def _segment_host_rows(
+    geometry: _SegmentGeometry, rank: int
+) -> list[tuple[int, int, int, int]]:
+    """Compact host view only for the current-rank compressor contract."""
+    mask = geometry.ranks == rank
+    return [
+        tuple(row)
+        for row in torch.stack(
+            [
+                geometry.doc_ids[mask],
+                geometry.seg_lens[mask],
+                geometry.seqlens_k[mask],
+                geometry.p0[mask],
+            ],
+            dim=1,
+        ).cpu().tolist()
+    ]
+
+def _window_rows_tensor(
+    geometry: _SegmentGeometry,
+    restore: torch.Tensor,
+    *,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    win_start = torch.clamp(geometry.p0 - (window_size - 1), min=0)
+    win_lens = geometry.seg_lens + geometry.p0 - win_start
+    rows, row_seg = _expand_segment_ranges(
+        geometry.doc_starts + win_start, win_lens, restore
+    )
+    return rows, geometry.ranks[row_seg], win_lens
+
+
+def _block_ranges_tensor(
+    geometry: _SegmentGeometry,
+    *,
+    ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    p0 = geometry.p0
+    q0 = p0 + geometry.seg_lens
+    straddle_idx = q0 // ratio
+    straddle = (
+        (q0 % ratio != 0)
+        & (straddle_idx * ratio >= p0)
+        & ((straddle_idx + 1) * ratio <= geometry.doc_lens)
+    )
+    b_first = (p0 + ratio - 1) // ratio
+    b_last = q0 // ratio - 1
+    has_complete = b_first <= b_last
+    case2 = (~has_complete) & straddle & (straddle_idx > 0)
+    case3 = (~has_complete) & straddle & (straddle_idx == 0)
+
+    A = torch.where(
+        has_complete,
+        torch.where(b_first > 0, (b_first - 1) * ratio, torch.zeros_like(q0)),
+        torch.where(
+            case2,
+            (straddle_idx - 1) * ratio,
+            torch.where(case3, torch.zeros_like(q0), q0),
+        ),
+    )
+    B = torch.where(
+        has_complete,
+        torch.where(straddle, (straddle_idx + 1) * ratio, q0),
+        torch.where(case2 | case3, (straddle_idx + 1) * ratio, q0),
+    )
+    strip = torch.where(
+        has_complete,
+        (b_first > 0).to(q0.dtype),
+        case2.to(q0.dtype),
+    )
+    return A, (B // ratio) * ratio, strip
+
+
+def _block_rows_tensor(
+    geometry: _SegmentGeometry,
+    restore: torch.Tensor,
+    *,
+    ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    A, block_end, strip = _block_ranges_tensor(geometry, ratio=ratio)
+    rows, row_seg = _expand_segment_ranges(
+        geometry.doc_starts + A, block_end - A, restore
+    )
+    return rows, geometry.ranks[row_seg], A, block_end, strip
+
+
+def _block_host_rows(
+    A: torch.Tensor,
+    block_end: torch.Tensor,
+    strip: torch.Tensor,
+    geometry: _SegmentGeometry,
+    rank: int,
+) -> list[tuple[int, int, int]]:
+    """Compact host view only for current-rank compressor fields."""
+    mask = geometry.ranks == rank
+    return [
+        tuple(row)
+        for row in torch.stack([A[mask], block_end[mask], strip[mask]], dim=1)
+        .cpu()
+        .tolist()
+    ]
 
 def _window_range(seg: tuple[int, int, int, int], window_size: int) -> tuple[int, int]:
     """``(win_start, win_len)`` of the segment's window rows — ratio-
@@ -173,69 +375,85 @@ def _block_range(seg: tuple[int, int, int, int], doc_len: int, *, ratio: int) ->
     return A, B, strip
 
 
-def _tensor(vals: list[int], device) -> torch.Tensor:
+def _tensor(vals: list[int] | torch.Tensor, device) -> torch.Tensor:
+    if isinstance(vals, torch.Tensor):
+        return vals.to(device=device, dtype=torch.int64)
     return torch.tensor(vals, dtype=torch.int64, device=device)
 
 
-def _routing_geometry(
-    foreign_all: list[list[int]], *, shard_len: int, cp_size: int
-) -> list[tuple[list[int], list[int], list[int], list[int]]]:
-    """The alltoallv routing of one exchange.
-
-    ``foreign_all[r]`` = rank r's foreign positions (permuted-stream
-    coordinates, in its per-segment receive order).  Returns per rank
-    ``(send_indices, send_splits, recv_splits, recv_offsets)``: the send
-    payload rows grouped by receiver (receiver order), the per-receiver /
-    per-sender split sizes, and each receive position's flat offset in
-    the all_to_all output layout (cat over senders of [my rows from that
-    sender]).
-    """
-    routing: list[tuple[list[int], list[int], list[int], list[int]]] = []
-    for r in range(cp_size):
-        send_indices: list[int] = []
-        send_splits = [0] * cp_size
-        for j in range(cp_size):
-            for p in foreign_all[j]:
-                if p // shard_len == r:
-                    send_indices.append(p % shard_len)
-                    send_splits[j] += 1
-        recv_splits = [0] * cp_size
-        for p in foreign_all[r]:
-            recv_splits[p // shard_len] += 1
-        starts = [0]
-        for n in recv_splits:
-            starts.append(starts[-1] + n)
-        seen = [0] * cp_size
-        recv_offsets: list[int] = []
-        for p in foreign_all[r]:
-            o = p // shard_len
-            recv_offsets.append(starts[o] + seen[o])
-            seen[o] += 1
-        routing.append((send_indices, send_splits, recv_splits, recv_offsets))
-    return routing
+def _routing_tensors(
+    rows: torch.Tensor,
+    dest_ranks: torch.Tensor,
+    *,
+    rank: int,
+    shard_len: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Current-rank all-to-all routing, entirely on the planner device."""
+    src_ranks = torch.div(rows, shard_len, rounding_mode="floor")
+    foreign = src_ranks != dest_ranks
+    send_mask = foreign & (src_ranks == rank)
+    send_indices = (rows[send_mask] % shard_len).to(torch.long)
+    send_splits = torch.bincount(
+        dest_ranks[send_mask].to(torch.long), minlength=cp_size
+    )
+    recv_mask = foreign & (dest_ranks == rank)
+    recv_src = src_ranks[recv_mask].to(torch.long)
+    recv_splits = torch.bincount(recv_src, minlength=cp_size)
+    recv_starts = recv_splits.cumsum(0) - recv_splits
+    src_ids = torch.arange(cp_size, device=rows.device)
+    seen = (recv_src[:, None] == src_ids[None, :]).to(torch.long).cumsum(0)
+    seen_for_row = seen.gather(1, recv_src[:, None]).squeeze(1) - 1
+    recv_offsets = (recv_starts[recv_src] + seen_for_row).to(torch.long)
+    return send_indices, send_splits, recv_splits, recv_offsets
 
 
-def _row_order(rows: list[int], *, rank: int, shard_len: int) -> tuple[list[int], int]:
-    """The row order of one packed stream and its unique-receive count.
+def _row_order_tensor(
+    rows: torch.Tensor,
+    *,
+    rank: int,
+    shard_len: int,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map packed rows into the local-plus-received stream without Python."""
+    seq_len = cp_size * shard_len
+    src = torch.div(rows, shard_len, rounding_mode="floor")
+    local = src == rank
+    nrows = rows.numel()
+    row_ids = torch.arange(nrows, device=rows.device, dtype=torch.long)
+    sentinel = torch.full((), nrows, device=rows.device, dtype=torch.long)
+    first = torch.full((seq_len,), nrows, device=rows.device, dtype=torch.long)
+    first.scatter_reduce_(
+        0, rows.to(torch.long), torch.where(local, sentinel, row_ids),
+        reduce="amin", include_self=True,
+    )
+    is_first = (~local) & (first[rows.to(torch.long)] == row_ids)
+    slots = is_first.to(torch.long).cumsum(0) - 1
+    slot_map = torch.full((seq_len,), nrows, device=rows.device, dtype=torch.long)
+    slot_map.scatter_reduce_(
+        0, rows.to(torch.long), torch.where(is_first, slots, sentinel),
+        reduce="amin", include_self=True,
+    )
+    foreign_slot = slot_map[rows.to(torch.long)]
+    order = torch.where(
+        local, rows.to(torch.long) - rank * shard_len, shard_len + foreign_slot
+    )
+    return order, is_first.to(torch.long).sum()
 
-    ``rows`` are the stream's rows in packed order (permuted
-    coordinates); local rows map to their local offset, foreign rows to
-    ``shard_len + receive slot`` — the first-appearance order matching the
-    routing's ``recv_offsets``.
-    """
-    order: list[int] = []
-    recv_of: dict[int, int] = {}
-    cursor = 0
-    for pos in rows:
-        if pos // shard_len == rank:
-            order.append(pos - rank * shard_len)
-        else:
-            if pos not in recv_of:
-                recv_of[pos] = cursor
-                cursor += 1
-            order.append(shard_len + recv_of[pos])
-    return order, cursor
 
+def _routing_row(
+    rows: torch.Tensor,
+    dest_ranks: torch.Tensor,
+    *,
+    rank: int,
+    shard_len: int,
+    cp_size: int,
+):
+    """Tensor routing plus O(CP) host split lists required by collectives."""
+    send, send_splits, recv_splits, recv_offsets = _routing_tensors(
+        rows, dest_ranks, rank=rank, shard_len=shard_len, cp_size=cp_size
+    )
+    return (send, send_splits.cpu().tolist(), recv_splits.cpu().tolist(), recv_offsets)
 
 def _build_exchange_plan(row, device) -> ExchangePlan:
     """One rank's routing row as the tensor/list mix the collective APIs
@@ -243,61 +461,89 @@ def _build_exchange_plan(row, device) -> ExchangePlan:
     exchange never syncs."""
     send, splits, recv, off = row
     return ExchangePlan(
-        send_indices=_tensor(send, device),
+        send_indices=send.to(device=device, dtype=torch.long),
         send_splits=splits,
         recv_splits=recv,
-        recv_offsets=_tensor(off, device),
+        recv_offsets=off.to(device=device, dtype=torch.long),
     )
 
 
-def _container_slots(segs_all, seg_blocks_all, *, ratio: int):
-    """The ``(doc_start, block) -> container slot`` map and the uniform
-    container width ``max_kept``.
+def _container_layout_tensor(
+    geometry: _SegmentGeometry,
+    A: torch.Tensor,
+    block_end: torch.Tensor,
+    strip: torch.Tensor,
+    *,
+    ratio: int,
+    rank: int,
+    cp_size: int,
+    seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build compressed gather ownership on device; only width is scalar-hosted."""
+    b0 = torch.div(A, ratio, rounding_mode="floor") + strip
+    b1 = torch.div(block_end, ratio, rounding_mode="floor")
+    kept_counts = torch.clamp(b1 - b0, min=0).to(torch.long)
 
-    A rank's kept blocks fill the leading slots of its padded container
-    (per segment the plan blocks after the strip — the borrow-source
-    blocks are dropped); ownership follows the start-owner rule (the
-    first rank claiming a block).  The container width is uniform
-    (``max_kept``) so every rank's container is a valid ``S(1)`` shard of
-    the all-gathered ``[cp * max_kept, D]``, and a block's slot is
-    ``owner * max_kept + local_offset``.
-    """
-    local: dict[tuple[int, int], tuple[int, int]] = {}
-    max_kept = 0
-    for rr, (segs, blocks) in enumerate(zip(segs_all, seg_blocks_all, strict=True)):
-        off = 0
-        for seg, (A, block_end, strip) in zip(segs, blocks, strict=True):
-            for b in range(A // ratio + strip, block_end // ratio):
-                local.setdefault((seg[0], b), (rr, off))
-                off += 1
-        max_kept = max(max_kept, off)
-    slots = {(doc, b): owner * max_kept + off for (doc, b), (owner, off) in local.items()}
-    return slots, max_kept
+    seg_ids = torch.repeat_interleave(
+        torch.arange(kept_counts.numel(), device=A.device), kept_counts
+    )
+    seg_prefix = kept_counts.cumsum(0) - kept_counts
+    rel = torch.arange(kept_counts.sum(), device=A.device) - torch.repeat_interleave(
+        seg_prefix, kept_counts
+    )
+    block_ids = b0[seg_ids].to(torch.long) + rel
+    block_keys = geometry.doc_starts[seg_ids].to(torch.long) + block_ids * ratio
+    kept_ranks = geometry.ranks[seg_ids].to(torch.long)
 
+    kept_per_rank = torch.bincount(kept_ranks, minlength=cp_size)
+    rank_starts = kept_per_rank.cumsum(0) - kept_per_rank
+    local_offsets = torch.arange(block_keys.numel(), device=A.device) - rank_starts[
+        kept_ranks
+    ]
+    max_kept = kept_per_rank.max()
+
+    # Original block starts are unique document/block keys in [0, seq_len).
+    # The minimum container slot is exactly the old first-owner rule because
+    # rank-major slots are ordered by (rank, local_offset).
+    sentinel = cp_size * max_kept + seq_len
+    slot_by_key = torch.zeros(seq_len, dtype=torch.long, device=A.device) + sentinel
+    candidate = kept_ranks * max_kept + local_offsets
+    slot_by_key.scatter_reduce_(
+        0, block_keys, candidate, reduce="amin", include_self=True
+    )
+
+    my_mask = geometry.ranks == rank
+    my_doc_starts = geometry.doc_starts[my_mask].to(torch.long)
+    prefix_counts = torch.div(
+        geometry.seqlens_k[my_mask], ratio, rounding_mode="floor"
+    ).to(torch.long)
+    my_seg_ids = torch.repeat_interleave(
+        torch.arange(my_doc_starts.numel(), device=A.device), prefix_counts
+    )
+    prefix_base = prefix_counts.cumsum(0) - prefix_counts
+    prefix_rel = torch.arange(prefix_counts.sum(), device=A.device) - torch.repeat_interleave(
+        prefix_base, prefix_counts
+    )
+    target_keys = my_doc_starts[my_seg_ids] + prefix_rel * ratio
+    return slot_by_key[target_keys], max_kept
 
 def _assemble_window_plan(
-    segs: list[tuple[int, int, int, int]],
-    docs: dict[int, list[int]],
+    win_rows: torch.Tensor,
+    ori_lens: torch.Tensor,
     routing_row,
     *,
     rank: int,
     shard_len: int,
-    window_size: int,
     device,
 ) -> WindowPlan:
-    """The ratio-independent window plan: the exchange + the packed ori
-    stream's ``gather_indices`` (``cu_seqlens_ori_kv`` bounds the
-    per-segment window rows)."""
-    win_rows: list[int] = []
-    ori_lens: list[int] = []
-    for seg in segs:
-        win_start, win_len = _window_range(seg, window_size)
-        ori_lens.append(win_len)
-        win_rows += docs[seg[0]][win_start : win_start + win_len]
-    # The receive slots number the stream-wide foreign order (matching the
-    # routing's recv_offsets), so the gather indices run once over all rows.
-    win_order, _ = _row_order(win_rows, rank=rank, shard_len=shard_len)
-    cu_ori = torch.tensor([0, *ori_lens], dtype=torch.int32, device=device).cumsum(0, dtype=torch.int32)
+    """Assemble the current rank window plan from pre-derived row geometry."""
+    cp_size = len(routing_row[1])
+    win_order, _ = _row_order_tensor(
+        win_rows, rank=rank, shard_len=shard_len, cp_size=cp_size
+    )
+    cu_ori = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), ori_lens.to(torch.int32)]
+    ).cumsum(0, dtype=torch.int32)
     return WindowPlan(
         exchange=_build_exchange_plan(routing_row, device),
         gather_indices=_tensor(win_order, device),
@@ -307,31 +553,22 @@ def _assemble_window_plan(
 
 def _assemble_block_plan(
     segs: list[tuple[int, int, int, int]],
-    segs_all: list[list[tuple[int, int, int, int]]],
-    docs: dict[int, list[int]],
-    seg_blocks_all: list[list[tuple[int, int, int]]],
+    rows: torch.Tensor,
+    my_blocks: list[tuple[int, int, int]],
     routing_row,
+    cmp_k_global_gather_indices: torch.Tensor,
+    out_width: int,
     *,
     ratio: int,
     rank: int,
     shard_len: int,
     device,
 ) -> CompressedBlockLayout:
-    """One ratio's block plan from the pure global-context derivation.
-
-    ``seg_blocks_all[r]`` holds rank r's per-segment ``(A, block_end,
-    strip)`` scalars.  Part 1 (the unified compressor/kernel contract) is
-    derived directly over the plan blocks; the ``gather_indices`` order
-    the pooled stream the exchange produces (``cat([x_local, recv])``)."""
-    my_blocks = seg_blocks_all[rank]
-    rows: list[int] = []
-    for seg, (A, block_end, _strip) in zip(segs, my_blocks, strict=True):
-        rows += docs[seg[0]][A:block_end]
-    block_total = len(rows)
-    order, n_foreign = _row_order(rows, rank=rank, shard_len=shard_len)
-    # The plan blocks of one rank never overlap, so every foreign row is
-    # received exactly once (the recv_offsets length is the receive count).
-    assert n_foreign == len(routing_row[3]), (n_foreign, len(routing_row[3]))
+    """Assemble the current-rank block plan from tensorized global ownership."""
+    cp_size = len(routing_row[1])
+    order, _ = _row_order_tensor(
+        rows, rank=rank, shard_len=shard_len, cp_size=cp_size
+    )
 
     # The compressor contract, derived directly over the plan blocks.
     pos_parts: list[torch.Tensor] = []
@@ -353,9 +590,6 @@ def _assemble_block_plan(
     cu_cmp = [seg[2] // ratio for seg in segs]
     rem = [seg[2] % ratio for seg in segs]
     cu_cmp_t = torch.tensor([0, *cu_cmp], dtype=torch.int32, device=device).cumsum(0, dtype=torch.int32)
-    # ---- compressed-level gather: ownership + assembly ----
-    slots, max_kept = _container_slots(segs_all, seg_blocks_all, ratio=ratio)
-    cmp_k_global_gather_indices = [slots[(seg[0], b)] for seg in segs for b in range(seg[2] // ratio)]
     return CompressedBlockLayout(
         cu_seqlens_cmp_k=cu_cmp_t,
         block_remainder=torch.tensor(rem, dtype=torch.int32, device=device),
@@ -364,8 +598,8 @@ def _assemble_block_plan(
         first_indices=_tensor(first, device),
         exchange=_build_exchange_plan(routing_row, device),
         compressed_rows=_tensor(compressed_rows, device),
-        out_width=max_kept,
-        cmp_k_global_gather_indices=_tensor(cmp_k_global_gather_indices, device),
+        out_width=out_width,
+        cmp_k_global_gather_indices=cmp_k_global_gather_indices.to(device=device, dtype=torch.long),
     )
 
 
@@ -379,61 +613,74 @@ def build_cp_plan(
     window_size: int,
     ratios: list[int],
 ) -> tuple[CPVarlenMetadata, dict[int, CompressedBlockLayout], WindowPlan]:
-    """The pure per-rank plan derivation from the global context (no
-    communication): every rank's rank-local varlen is derived in-frame via
-    ``CPVarlenMetadata.from_global`` (the shard path's own builder), so the
-    rank-local varlen, the per-ratio block plans, and the window plan all
-    fall out of the pre-shard document structure + the load-balancer
-    permutation.  The model's ``build_attention_masks`` calls this; the
-    dispatchers are wired by their owners' ``parallelize``.
+    """Derive one rank's DSV4 plan from global packed boundaries.
+
+    The common ``CPVarlenMetadata`` is built only for the current rank.  DSV4's
+    planner-only all-rank segment geometry comes directly from global document
+    boundaries plus one load-balancer layout, so no CP-sized set of temporary
+    common metadata is materialized.
     """
     global_cu = global_varlen.cu_seq_q
     device = global_cu.device
-    seq_len = int(global_cu[-1].item())
-    rearrange = (
-        load_balancer._generate_indices(restore=False).reshape(-1)
-        if load_balancer is not None
-        else torch.arange(seq_len, device=device)
+    seq_len = shard_len * cp_size
+
+    if load_balancer is not None:
+        rearrange_indices = load_balancer._generate_indices(restore=False)
+        if rearrange_indices is None:
+            raise ValueError("load_balancer._generate_indices() returned None")
+        rearrange_indices = rearrange_indices.to(global_cu.dtype)
+        if rearrange_indices.numel() != seq_len:
+            raise ValueError(
+                "DeepSeek-V4 CP planning currently requires local_batch_size=1; "
+                f"got {rearrange_indices.numel()} load-balance indices for "
+                f"seq_len={seq_len}."
+            )
+        rearrange = rearrange_indices.reshape(-1)
+        # DSV4 needs the inverse once for planner host geometry.  The common
+        # upstream-like builder keeps its own inverse contract for current-rank
+        # metadata; do not extend that public API with a DSV4-only fast path.
+        restore = torch.empty_like(rearrange)
+        restore[rearrange] = torch.arange(seq_len, dtype=rearrange.dtype, device=device)
+        cp_load_balancer = cast(_LoadBalancer, _CachedLoadBalancer(rearrange_indices))
+    else:
+        rearrange = torch.arange(seq_len, dtype=global_cu.dtype, device=device)
+        restore = rearrange
+        cp_load_balancer = None
+
+    cp_metadata = CPVarlenMetadata.from_global(
+        global_varlen,
+        _RankMesh(cp_size, rank),  # pyrefly: ignore [bad-argument-type]
+        1,
+        seq_len,
+        cp_load_balancer,
     )
-    restore = torch.argsort(rearrange)
-    varlens = [
-        CPVarlenMetadata.from_global(
-            # The ``_RankMesh`` shim implements the ``DeviceMesh`` contract
-            # (``size`` / ``get_local_rank``) the pure derivation needs.
-            global_varlen,
-            _RankMesh(cp_size, r),  # pyrefly: ignore [bad-argument-type]
-            1,
-            seq_len,
-            load_balancer,
-        )
-        for r in range(cp_size)
-    ]
-    segs_all = [segment_structure(v) for v in varlens]
-    my_segs = segs_all[rank]
-    # The full permuted document slices, keyed by the segment's doc
-    # identity (the permuted doc start): every row a plan consumes — the
-    # window range or the plan blocks — is a slice of one document's slice.
-    docs: dict[int, list[int]] = {}
-    for d in range(len(global_cu) - 1):
-        d0, d1 = int(global_cu[d].item()), int(global_cu[d + 1].item())
-        if d1 > d0:
-            docs[int(restore[d0].item())] = restore[d0:d1].tolist()
+
+    geometry = _derive_all_rank_segments_tensor(
+        global_cu,
+        rearrange,
+        restore,
+        cp_size=cp_size,
+        shard_len=shard_len,
+    )
+
+    # Only the current-rank compact compressor contract remains on host.
+    my_segs = _segment_host_rows(geometry, rank)
 
     # ---- the window plan (ratio-independent) ----
-    win_foreign: list[list[int]] = [[] for _ in range(cp_size)]
-    for r in range(cp_size):
-        for seg in segs_all[r]:
-            win_start, win_len = _window_range(seg, window_size)
-            doc = docs[seg[0]]
-            win_foreign[r] += [p for p in doc[win_start : win_start + win_len] if p // shard_len != r]
-    routing = _routing_geometry(win_foreign, shard_len=shard_len, cp_size=cp_size)
+    win_rows_t, win_dest_t, win_lens_t = _window_rows_tensor(
+        geometry, restore, window_size=window_size
+    )
+    routing = _routing_row(
+        win_rows_t, win_dest_t, rank=rank, shard_len=shard_len, cp_size=cp_size
+    )
+    my_seg_mask = geometry.ranks == rank
+    my_row_mask = win_dest_t == rank
     window = _assemble_window_plan(
-        my_segs,
-        docs,
-        routing[rank],
+        win_rows_t[my_row_mask],
+        win_lens_t[my_seg_mask],
+        routing,
         rank=rank,
         shard_len=shard_len,
-        window_size=window_size,
         device=device,
     )
 
@@ -447,27 +694,42 @@ def build_cp_plan(
                 gather_indices=None,
             )
             continue
-        block_foreign: list[list[int]] = [[] for _ in range(cp_size)]
-        seg_blocks_all: list[list[tuple[int, int, int]]] = [[] for _ in range(cp_size)]
-        for r in range(cp_size):
-            for seg in segs_all[r]:
-                A, B, strip = _block_range(seg, len(docs[seg[0]]), ratio=ratio)
-                block_end = (B // ratio) * ratio
-                seg_blocks_all[r].append((A, block_end, strip))
-                block_foreign[r] += [p for p in docs[seg[0]][A:block_end] if p // shard_len != r]
-        routing = _routing_geometry(block_foreign, shard_len=shard_len, cp_size=cp_size)
+        block_rows_t, block_dest_t, A_t, block_end_t, strip_t = (
+            _block_rows_tensor(geometry, restore, ratio=ratio)
+        )
+        my_blocks = _block_host_rows(
+            A_t, block_end_t, strip_t, geometry, rank
+        )
+        cmp_gather_t, max_kept_t = _container_layout_tensor(
+            geometry,
+            A_t,
+            block_end_t,
+            strip_t,
+            ratio=ratio,
+            rank=rank,
+            cp_size=cp_size,
+            seq_len=seq_len,
+        )
+        routing = _routing_row(
+            block_rows_t,
+            block_dest_t,
+            rank=rank,
+            shard_len=shard_len,
+            cp_size=cp_size,
+        )
         plans[ratio] = _assemble_block_plan(
             my_segs,
-            segs_all,
-            docs,
-            seg_blocks_all,
-            routing[rank],
+            block_rows_t[block_dest_t == rank],
+            my_blocks,
+            routing,
+            cmp_gather_t,
+            int(max_kept_t.item()),
             ratio=ratio,
             rank=rank,
             shard_len=shard_len,
             device=device,
         )
-    return varlens[rank], plans, window
+    return cp_metadata, plans, window
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +795,7 @@ class WindowPlan:
     Describes the Attention's ``swa_k`` gather: the exchange routing of
     the per-segment window rows ``[win_start, q0)``, the packed ori
     stream's ``gather_indices`` (indices into
-    ``cat([x_local, exchange_recv_rows])``), and the packed-ori cumsum
+    ``cat([x_local, recv])``), and the packed-ori cumsum
     (``cu_seqlens_ori_kv``) the kernels consume.  Both the window rows and
     this plan are ratio-independent — one object per rank.
     """
