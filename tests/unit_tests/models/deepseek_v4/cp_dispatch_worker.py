@@ -36,7 +36,6 @@ from torchtitan_npu.models.deepseek_v4 import metadata as meta_mod
 from torchtitan_npu.models.deepseek_v4.token_dispatcher import (
     CPTokenDispatcher,
     build_cp_plan,
-    segment_structure,
 )
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
     CPVarlenMetadata,
@@ -58,6 +57,21 @@ _perm = _lb._generate_indices(restore=False).reshape(-1)
 _shard_len = _seq_len // CP
 _x_flat = torch.randn(1, _seq_len, DIM).flatten(0, 1)
 _x_perm = _x_flat[_perm]
+
+
+
+def _segment_structure(cp_meta):
+    """CPU-only oracle view; never used by the production planner."""
+    cu_q = cp_meta.cu_seq_q.cpu().tolist()
+    cu_k = cp_meta.cu_seq_k.cpu().tolist()
+    kg = cp_meta.k_global_gather_indices.cpu().tolist()
+    out = []
+    for i in range(len(cu_q) - 1):
+        seg_len = cu_q[i + 1] - cu_q[i]
+        if seg_len:
+            seqlen_k = cu_k[i + 1] - cu_k[i]
+            out.append((kg[cu_k[i]], seg_len, seqlen_k, seqlen_k - seg_len))
+    return out
 
 
 class _PortableTransport:
@@ -186,7 +200,7 @@ def run(rank: int, group, failures: list[str]) -> None:
 def verify_plan(rank, plans, window, cp_meta, ratio, failures):
     rplan = plans[ratio]
     # the kernel tensors match the direct per-segment derivation
-    segs = segment_structure(cp_meta)
+    segs = _segment_structure(cp_meta)
     exp_cu = torch.tensor(
         [0, *[s[2] // ratio for s in segs]], dtype=torch.int32
     ).cumsum(0, dtype=torch.int32)
@@ -208,7 +222,7 @@ def verify_plan(rank, plans, window, cp_meta, ratio, failures):
 
 def verify_dispatch(rank, context, plans, window, cp_meta, ratio, failures):
     comp = build_compressor(torch.float32, ratio)
-    segs = segment_structure(cp_meta)
+    segs = _segment_structure(cp_meta)
     x_local = _x_perm[rank * _shard_len : (rank + 1) * _shard_len]
     x_local = x_local.view(1, _shard_len, DIM)
     rplan = plans[ratio]

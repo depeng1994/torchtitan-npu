@@ -68,74 +68,103 @@ def test_cp_plan_builds_only_current_rank_common_metadata(monkeypatch):
     assert window is not None
 
 
-def test_tensorized_cp_routing_matches_reference_and_fullgraph():
-    """Protect routing equality and Dynamo fullgraph capture."""
-    rows = torch.tensor([0, 1, 35, 66, 99, 34, 67, 100, 100, 7, 70, 103])
-    dest = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2])
-    cp_size, shard_len, rank = 4, 32, 1
 
-    # Python oracle for the old routing semantics.
-    foreign = [[] for _ in range(cp_size)]
-    for pos, dst in zip(rows.tolist(), dest.tolist(), strict=True):
-        if pos // shard_len != dst:
-            foreign[dst].append(pos)
-    send = [[] for _ in range(cp_size)]
-    send_splits = [[0] * cp_size for _ in range(cp_size)]
-    recv_splits, recv_offsets = [], []
-    for dst, positions in enumerate(foreign):
-        counts = [0] * cp_size
-        for pos in positions:
-            src = pos // shard_len
-            send[src].append(pos % shard_len)
-            send_splits[src][dst] += 1
-            counts[src] += 1
-        starts, total = [0] * cp_size, 0
-        for src, count in enumerate(counts):
-            starts[src], total = total, total + count
-        seen, offsets = [0] * cp_size, []
-        for pos in positions:
-            src = pos // shard_len
-            offsets.append(starts[src] + seen[src])
-            seen[src] += 1
-        recv_splits.append(counts)
-        recv_offsets.append(offsets)
-    expected = (send[rank], send_splits[rank], recv_splits[rank], recv_offsets[rank])
-
-    route = cp_mod._routing_tensors(
-        rows, dest, rank=rank, shard_len=shard_len, cp_size=cp_size
+def test_tensorized_cp_planner_helpers_fullgraph():
+    """Protect device planner math, including zero-block ranges, under Dynamo."""
+    docs = (37, 41, 63, 115)
+    cp_size = 4
+    seq_len = sum(docs)
+    shard_len = seq_len // cp_size
+    cu = torch.tensor(
+        [0, *torch.tensor(docs).cumsum(0).tolist()], dtype=torch.int32
     )
-    assert [x.tolist() for x in route] == list(expected)
-
-    rank_rows = rows[dest == rank]
-    expected_order, recv_of = [], {}
-    for pos in rank_rows.tolist():
-        if pos // shard_len == rank:
-            expected_order.append(pos - rank * shard_len)
-        else:
-            if pos not in recv_of:
-                recv_of[pos] = len(recv_of)
-            expected_order.append(shard_len + recv_of[pos])
-    order, unique = cp_mod._row_order_tensor(
-        rank_rows, rank=rank, shard_len=shard_len, cp_size=cp_size
-    )
-    assert order.tolist() == expected_order
-    assert int(unique) == len(recv_of)
+    lb = _CountingHeadTail(seq_len, cp_size)
+    rearrange = lb._generate_indices(False).reshape(-1).to(torch.int32)
+    restore = torch.empty_like(rearrange)
+    restore[rearrange] = torch.arange(seq_len, dtype=torch.int32)
 
     with torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True):
-        compiled_route = torch.compile(
-            lambda r, d: cp_mod._routing_tensors(
-                r, d, rank=rank, shard_len=shard_len, cp_size=cp_size
-            ), backend="eager", fullgraph=True, dynamic=True,
+        def segment_fields(c, r):
+            geometry = cp_mod._segment_geometry(
+                c, r, cp_size=cp_size, shard_len=shard_len
+            )
+            return geometry.ranks, geometry.doc_starts, geometry.seqlens_k
+
+        segment_fn = torch.compile(
+            segment_fields,
+            backend="eager",
+            fullgraph=True,
+            dynamic=True,
         )
-        compiled_order = torch.compile(
-            lambda r: cp_mod._row_order_tensor(
-                r, rank=rank, shard_len=shard_len, cp_size=cp_size
-            ), backend="eager", fullgraph=True, dynamic=True,
+        ranks, doc_starts, seqlens_k = segment_fn(cu, rearrange)
+
+        rows = torch.tensor([0, 35, 66, 99, 34, 67, 100], dtype=torch.int32)
+        dest = torch.tensor([0, 0, 0, 0, 1, 1, 1], dtype=torch.int64)
+        route_fn = torch.compile(
+            lambda x, d: cp_mod._routing_tensors(
+                x,
+                d,
+                rank=1,
+                shard_len=shard_len,
+                cp_size=cp_size,
+            ),
+            backend="eager",
+            fullgraph=True,
+            dynamic=True,
         )
-        assert [x.tolist() for x in compiled_route(rows, dest)] == list(expected)
-        got_order, got_unique = compiled_order(rank_rows)
-        assert got_order.tolist() == expected_order
-        assert int(got_unique) == len(recv_of)
+        route = route_fn(rows, dest)
+        assert len(route) == 5
+        recv_src = torch.div(
+            rows[(rows // shard_len != dest) & (dest == 1)],
+            shard_len,
+            rounding_mode="floor",
+        ).to(torch.long)
+        starts = torch.bincount(recv_src, minlength=cp_size).cumsum(0)
+        starts = starts - torch.bincount(recv_src, minlength=cp_size)
+        seen = [0] * cp_size
+        expected_offsets = []
+        for src_rank in recv_src.tolist():
+            expected_offsets.append(int(starts[src_rank]) + seen[src_rank])
+            seen[src_rank] += 1
+        assert route[3].tolist() == expected_offsets
+
+        # ratio=128 intentionally creates segments with no complete plan block.
+        geometry = cp_mod._segment_geometry(
+            cu, rearrange, cp_size=cp_size, shard_len=shard_len
+        )
+        p0 = geometry.p0
+        q0 = p0 + geometry.seg_lens
+        ratio = 128
+        A = q0
+        block_end = torch.div(q0, ratio, rounding_mode="floor") * ratio
+        strip = torch.zeros_like(q0)
+        container_fn = torch.compile(
+            lambda rk, ds, sk, a, e, st: cp_mod._container_layout(
+                rk,
+                ds,
+                sk,
+                a,
+                e,
+                st,
+                ratio=ratio,
+                rank=0,
+                cp_size=cp_size,
+                seq_len=seq_len,
+            ),
+            backend="eager",
+            fullgraph=True,
+            dynamic=True,
+        )
+        gather, kept_per_rank = container_fn(
+            geometry.ranks,
+            geometry.doc_starts,
+            geometry.seqlens_k,
+            A,
+            block_end,
+            strip,
+        )
+        assert gather.ndim == 1
+        assert kept_per_rank.shape == (cp_size,)
 
 
 def test_build_attention_masks_cp_runs_real_metadata_wiring(monkeypatch):
@@ -214,6 +243,8 @@ def test_build_attention_masks_cp_runs_real_metadata_wiring(monkeypatch):
 
     metadata = out_kwargs["attention_masks"]
     assert isinstance(metadata, model_mod.CompressedVarlenMetadata)
+    assert metadata.seq_len_host == 16
+    assert metadata.seq_len == 16
     assert int(metadata.varlen.cu_seq_q[-1]) == 8
     assert set(metadata.plans) == {1, 4, 128}
     assert metadata.window is not None

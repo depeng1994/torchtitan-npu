@@ -38,10 +38,7 @@ from torchtitan_npu.models.deepseek_v4 import compressor as comp_mod
 from torchtitan_npu.models.deepseek_v4 import metadata as meta_mod
 from torchtitan_npu.models.deepseek_v4 import token_dispatcher as cp_mod
 from torchtitan_npu.models.deepseek_v4.attention import Attention, CompressedSparseAttention
-from torchtitan_npu.models.deepseek_v4.token_dispatcher import (
-    build_cp_plan,
-    segment_structure,
-)
+from torchtitan_npu.models.deepseek_v4.token_dispatcher import build_cp_plan
 
 tcc.comp_mod = comp_mod
 
@@ -118,6 +115,21 @@ class _MockDispatcher(cp_mod.CPTokenDispatcher):
 
     def _all_to_all(self, x, in_splits, out_splits):
         return self.mock.all_to_all(x, in_splits, out_splits)
+
+
+
+def _segment_structure(cp_meta):
+    """CPU-only oracle view; never used by the production planner."""
+    cu_q = cp_meta.cu_seq_q.cpu().tolist()
+    cu_k = cp_meta.cu_seq_k.cpu().tolist()
+    kg = cp_meta.k_global_gather_indices.cpu().tolist()
+    out = []
+    for i in range(len(cu_q) - 1):
+        seg_len = cu_q[i + 1] - cu_q[i]
+        if seg_len:
+            seqlen_k = cu_k[i + 1] - cu_k[i]
+            out.append((kg[cu_k[i]], seg_len, seqlen_k, seqlen_k - seg_len))
+    return out
 
 
 def _doc_table(v, restore):
@@ -296,7 +308,7 @@ def test_plan_matches_experiment(dsv4_globals, case):
                 r,
                 ratio,
             )
-            segs = segment_structure(cp_metas[r])
+            segs = _segment_structure(cp_metas[r])
             # the kernel tensors match the direct per-segment derivation
             exp_cu = torch.tensor(
                 [0, *[s[2] // ratio for s in segs]], dtype=torch.int32
@@ -348,7 +360,7 @@ def test_dispatcher_vs_oracle(dsv4_globals, case):
             window_size=8,
             ratios=[ratio],
         )
-        segs_all = [segment_structure(m) for m in cp_metas]
+        segs_all = [_segment_structure(m) for m in cp_metas]
         out_width = max(plan_dicts[r][ratio].out_width for r in range(cp))
 
         # ---- per-rank: the real flow — the window borrow (the packed ori
@@ -602,7 +614,7 @@ def test_asc_extension_cp_metadata(dsv4_globals, dsv4):
         assert len(smla) == 3
         for k, c in {c[2]["cmp_ratio"]: c for c in smla}.items():
             assert torch.equal(c[2]["cu_seqlens_ori_kv"], md.window.cu_seqlens_ori_kv), k
-        segs = segment_structure(cp_metas[r])
+        segs = _segment_structure(cp_metas[r])
         for k in (4, 128):
             exp_cu = torch.tensor(
                 [0, *[s[2] // k for s in segs]], dtype=torch.int32
@@ -968,12 +980,24 @@ def test_cp_gather_compile_reuses_graph_across_dynamic_splits_gloo():
         )
 
     compiled = torch.compile(use_split_sizes, backend=counting_backend, fullgraph=True)
-    first = compiled(torch.ones(1), cp_mod._build_exchange_plan(
-        (list(range(5)), [2, 3], [4, 5], list(range(9))), torch.device("cpu")
-    ))
-    second = compiled(torch.ones(1), cp_mod._build_exchange_plan(
-        (list(range(13)), [6, 7], [8, 9], list(range(17))), torch.device("cpu")
-    ))
+    first = compiled(
+        torch.ones(1),
+        cp_mod.ExchangePlan(
+            send_indices=torch.arange(5),
+            send_splits=[2, 3],
+            recv_splits=[4, 5],
+            recv_offsets=torch.arange(9),
+        ),
+    )
+    second = compiled(
+        torch.ones(1),
+        cp_mod.ExchangePlan(
+            send_indices=torch.arange(13),
+            send_splits=[6, 7],
+            recv_splits=[8, 9],
+            recv_offsets=torch.arange(17),
+        ),
+    )
 
     assert first.shape == (6, 8)
     assert second.shape == (14, 16)
