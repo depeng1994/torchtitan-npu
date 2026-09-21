@@ -9,7 +9,7 @@
 | Review 对象 | GitHub PR #20 `[feat] compressor & query RMSNorm override support`，镜像自 GitCode PR !878 |
 | Base / Head | `master@d529f01baff629324e5c274cf1f6e0ed65c54477` ← `pr_878@6c7dc086af323a04e9ddcb93ebea9634f303c067` |
 | 变更规模 | 11 files，+357 / -7 |
-| 总体结论 | **暂不建议按当前形态合入。** 需要先处理 R1（不具备上游依据的 TorchTitan patch）、R2（真实 CANN compressor/native autograd 未进入现有 NPU ST）、R3（新增 package-level override 副作用导入）。R4-R8 属于应同步完成的删减、文档与覆盖收口。 |
+| 总体结论 | **暂不建议按当前形态合入。** 需要先处理 R1（不具备上游依据的 TorchTitan patch）、R2（真实 CANN compressor/native autograd 未进入现有 NPU ST）、R3（新增 package-level override 副作用导入）。R4-R9 属于应同步完成的删减、文档与覆盖收口。 |
 | 测试专项结论 | **补充测试后合入**。当前 CPU UT 能证明 override 组合、wrapper schema/切片/后处理及 fallback，但不能证明真实 `cann_ops_transformer.compressor` 的 forward/backward/compile；现有 integration case 未启用 compressor override。 |
 | 测试执行 | **未执行（仅静态审查）**。按 `.agents/skills/developer-tests-review/SKILL.md` 的 review 流程，本次只读代码、测试入口和固定上游，不执行 testcase。 |
 | 重点 KEEP | `CompressorImplementation` 作为独立 override seam 是有真实语义的：TorchTitan override 对 parent/child 同时 claim 会冲突，若直接替换 `Compressor.Config` 会与已有 `norm` / `rope` 子节点 override 形成祖先/后代冲突；拆出 execution node 是当前机制下最小且可组合的方案。 |
@@ -26,6 +26,7 @@
 | R6 | **P2 / 应精简** | 每个 `AscCompressor` 实例都调用 `importlib.import_module` | `torchtitan_npu/override/deepseek_v4/compressor/ascendc.py:10, 39-46` | 目的是直到 fused component 被 build 才注册可选 CANN op。 | `ascendc.py` 本身已经只在 `compressor.asc` factory 被选中后 lazy import；因此在 class `__init__` 里再做 per-instance import 没有额外的 optional-dependency 隔离价值。Python import cache 虽避免重新执行 module，但仍产生每层一次 import lookup/lock 路径，也额外需要一个无语义 `__init__`。 | 同仓 `override/deepseek_v4/sparse_attn/ascendc.py` 在其 ascendc module scope 导入 CANN API；外层 factory 保持 lazy。 | 在 `ascendc.py` module scope 注册/导入 `cann_ops_transformer.ops.compressor`，删除 `importlib` 和 `AscCompressor.__init__`。 | 删除一层 lifecycle hook 与每实例 import。 | 未选择 override 时仍不会 import `ascendc.py`；选择后行为一致。 | CPU test 仍可在导入 ascendc 前注入 stub module；真实 ST 证明 op registration。 |
 | R7 | **P2 / 文档与入口** | PR 声称“已更新文档”，但仓库没有任何 docs/example 变更，现有 DSV4 recipe 也未暴露 compressor override | PR body Checklist；`examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh:NPU_OPS_OVERRIDES` | 功能目前只能从 PR 描述知道完整 override path。 | 对一个显式 opt-in override，长期用户语义至少要说明“如何启用”和“不支持 CP”。当前主训练脚本的 `NPU_OPS_OVERRIDES` 没有 compressor，PR 也没有文档文件 diff；Checklist 与实际 diff 不一致。另起新 config/shell 会进一步破坏单一入口。 | 现有脚本已经允许通过 `--override.imports`/CLI 组合 override，并允许 `"$@"` 继续覆盖。 | 不新增脚本。若 A3/CP1 已是默认支持路径，把 compressor target 合入**现有兼容 recipe**；否则就在现有 DeepSeek-V4 文档/示例旁明确给出 `--override.imports torchtitan_npu.override.deepseek_v4.compressor.asc` 以及“当前 CP 不支持”的限制。同步修正 Checklist。 | 只改现有 recipe/doc，不引入新的 config、env 或 launcher。 | 不影响现有用户；避免用户误把 CP2 与 fused compressor 组合。 | 静态检查现有入口能表达 target；NPU ST 使用同一 target。 |
 | R8 | **P2 / 测试删减** | CPU “CANN outputs/gradients” testcase 内置了第二份 compressor 数学实现 | `tests/unit_tests/override/deepseek_v4/test_compressor.py:48-66, 102-161` | `_document_pool` 同时被 fake CANN 和 expected 使用，制造可微输出以检查 wrapper 的后处理/梯度。 | 这不是 CANN 数学或 native autograd 的独立 oracle：fake op 与 expected 共享同一 `_document_pool`。长期维护第二份 compressor pooling 公式只会增加实现耦合，且容易让测试名称/报告被误读成“已验证 CANN”。CPU 测试真正有价值的是 schema、valid-prefix slicing、norm/RoPE 后处理、fallback/CP reject 和 override composition。 | 测试规范允许 fake 隔离 NPU，但明确禁止把 fake 当成被声明验证的 target kernel；真实 kernel 由 R2 的 NPU ST/上游算子测试负责。 | 保留 wrapper-contract testcase，但把 fake CANN 缩成一个**最小、可微、可独立计算的 sentinel 输出**，expected 只验证 wrapper-owned 行为；删除/显著缩短 `_document_pool` 这份 kernel 语义复刻。测试名称明确为 wrapper contract，不宣称 CANN native autograd correctness。 | 预计可删除当前测试文件中约 30-50 行 duplicate math/reference scaffolding，同时证据边界更清楚。 | 不降低 wrapper 覆盖；真实 kernel 覆盖由 R2 补齐。 | CPU UT 只检查 wrapper；真实 NPU evidence 单独记录。 |
+| R9 | **P2 / 单一来源** | `coff` 与 `state_block_table` 的 cache geometry 从不一致的语义源推导 | `torchtitan_npu/override/deepseek_v4/compressor/ascendc.py:18-34, 56-72` | `_state_inputs` 需要 `coff` 决定 `state_cache.shape[-1]`，并需要 `Smax` 决定 `state_block_table` width；`forward` 又需要把同一个 `coff` 传给 CANN。当前 helper 内 `coff = 2 if ratio == 4 else 1`，算子入参却是 `1 + int(compressor.overlap)`；table 的**第二维**（第一维实际是 B=`lengths.numel()`）则用 `varlen.max_k`。 | 当前 `Compressor.overlap = (compress_ratio == 4)`，所以两种 `coff` 推导恒等；非 CP 全文档训练又满足 query/key 边界一致，当前 `max_q == max_k`，因此现状不报错。但这两处都把同一 kernel geometry 建立在不同 owner 上：一旦 overlap 与 ratio 解耦，`state_cache` 的 `2 * coff * head_dim` 会与算子 `coff` 静默分叉；而当前实际传给算子的是 query token 流 `x` 和 `cu_seq_q`，CANN TH/cache_mode=1 契约的 table width 应是 `ceil(Smax/block_size)`，`start_pos=None` 时 `Smax` 是这些输入 sequence lengths 的最大值，用 `max_k` 只是依赖当前 q/k 等长这一偶然不变量。 | `compressor.overlap` 已是 overlap 语义的现有 owner；上游 `VarlenMetadata.max_q` 是 query 侧最大长度的 host summary，与本 wrapper 使用的 `x` / `cu_seq_q` 同源。CANN README 明确 `coff=1/2` 分别表示 no-overlap/overlap，并规定 TH + `cache_mode=1` 的 `state_block_table` shape 为 `[B, ceil(Smax/block_size)]`。 | **统一成单一来源。** 在 `forward` 一次计算 `coff = 1 + int(compressor.overlap)`，把 `coff` 传入 `_state_inputs`，并用同一个局部变量传给 CANN；helper 不再从 `ratio` 第二次推导 `coff`。table width 改用 `varlen.max_q`（与 `cu_seq_q`/输入 token 流一致），不要在 forward 再做 `torch.diff(...).max().item()` 引入 D2H，也不要新增 `max_q == max_k` validator/state。若同时采纳 R5，则 B 直接由 `cu_seqlens.numel() - 1` 推导，继续删除 `lengths`。 | 删除 helper 内第二份 `coff` 推导，并消除 `max_k` 这一跨侧依赖；不新增 Config/field/cache/validator/test abstraction。 | 当前行为 bitwise 不变：现有支持组合里两种 `coff` 本就相等，且非 CP 全文档 metadata 的 q/k 最大长度相等。改动只让未来语义变化由单一 owner 驱动。 | 现有 wrapper schema UT 继续用 `max(cu_seqlens diff)` 作为独立 table-width expected 即可；无需为了锁定 `max_q` 字段来源新增 implementation-coupled testcase。真实 NPU ST 由 R2 承担。 |
 
 ## 3. 逐文件 Review Coverage
 
@@ -104,6 +105,8 @@
 | `AscCompressor` class/Config | NPU execution implementation | **是** | CANN op wrapper owner | **KEEP** |
 | `AscCompressor.__init__` import hook | per-instance op registration | **否** | ascendc module-scope lazy import | **DELETE / MOVE import** |
 | `_state_inputs.lengths` / `seqused=lengths` | derived tensor | **否（当前全序列语义）** | `seqused=None` | **DELETE** |
+| `_state_inputs` 内 `coff` + CANN 调用侧 `coff` | 同一 overlap geometry 的两份推导 | **否** | `compressor.overlap` 已是语义 owner | **MERGE：forward 计算一次并复用** |
+| `state_block_table` width 基于 `varlen.max_k` | query 输入路径借用了 KV 侧 summary | **否** | 与 `x` / `cu_seq_q` 同源的 `varlen.max_q` | **REUSE `max_q`；不新增 validator/state** |
 | `state_block_table` | zero table required by current CANN tiling contract per author comment | **目前接受** | schema 虽 optional，但没有足够证据证明当前 torch binding 可安全省略 | **KEEP，避免为了省 alloc 新增 cache state** |
 | `state_cache` | mutable CANN input | **是** | 算子会写入，不能跨 forward 无脑复用 | **KEEP** |
 | RoPE explicit reshape patch | local compile-style tweak | **否，至少本 PR 未证明** | upstream 原实现 / upstream-first | **DELETE / UPSTREAM** |
@@ -129,6 +132,7 @@
 | **P0 可直接删除** | 删除 `override/deepseek_v4/__init__.py` 新增 compressor side-effect import | 收紧 registry/import 面 | `override.imports ...compressor.asc` 已能直接导入 factory |
 | **P0 可直接删除** | 删除 UnitScale baseline ones buffer + init | 去掉每层额外 buffer/state/sharding 生命周期 | custom forward 不读 weight；fused replacement 自己物化 weight |
 | **P1 可复用/合并** | `seqused=None`，删除 `lengths` tensor；必要时 inline `_state_inputs` | 每层每 step 少一份 derived tensor和一层单用 helper | CANN 官方默认语义与当前全 sequence 压缩一致 |
+| **P1 单一来源** | `coff` 在 `forward` 从 `compressor.overlap` 计算一次并传给 `_state_inputs`/CANN；table width 用 query-side `max_q` | 消除 kernel geometry 的双源推导和 q/k 跨侧偶合 | 当前数值不变，同时避免未来 overlap 与 ratio 解耦后 state-cache shape 与算子属性静默分叉 |
 | **P1 可复用/合并** | 把 CANN op import 移到 ascendc module scope，删除 `AscCompressor.__init__` | 去掉 per-instance import/lifecycle hook | outer override factory 已经是 lazy import boundary |
 | **P1 可直接删减测试** | 用最小 differentiable sentinel 替代 `_document_pool` 第二份 compressor 数学实现 | 测试文件可明显收缩，避免 same-implementation oracle | wrapper UT 只验证 wrapper-owned contract；真实 kernel 由 ST/upstream test 负责 |
 | **KEEP** | `CompressorImplementation` seam | 这是新增复杂度中最有必要的一项 | 直接 parent override 会与 child norm/RoPE override 冲突 |
@@ -154,6 +158,7 @@
 | Override 激活方式 | compressor 自己的 factory/target 设计正确，但 root package 新增副作用 import 与仓内规则冲突。见 R3。 |
 | 训练入口复杂度 | 本 PR 没有新增 shell/config，这是正确方向；后续 ST/docs 也应继续复用现有 CLI/runner，禁止为 compressor 再起专用脚本。 |
 | CANN `seqused` 契约 | 官方 ops-transformer compressor 文档明确：`seqused=None` 表示每个 Batch 使用完整 Sequence Length；当前实现正是这个语义，因此可删 derived `lengths`。 |
+| CANN `coff` / `state_block_table` geometry | **R9 成立。** 官方文档定义 `coff=1/2` 对应 no-overlap/overlap；TH + `cache_mode=1` 的 table shape 是 `[B, ceil(Smax/block_size)]`。当前 table 的第一维实际是 B，使用 `varlen.max_k` 的是第二维 width。因为 wrapper 输入是 `x` + `cu_seq_q` 且 `start_pos=None`，应以 query-side `max_q` 作为已有 host summary；当前 q/k 等长只说明现状正确，不构成继续双源推导的理由。 |
 | CANN padded output | 官方文档给 TH 输出 `[min(T, T//cmp_ratio+B), D]` 并包含 per-batch compressed tokens + pad；PR 按 plan valid block count 做 prefix slice 有明确必要性，**KEEP**。 |
 
 参考基线：
@@ -172,4 +177,5 @@
 | R4-R6 | 删除 baseline UnitScale 无用 buffer；`seqused=None`；CANN op registration 移出 per-instance `__init__`。 |
 | R7 | 在现有 DSV4 文档/recipe 中说明 compressor target 与 CP 限制，不新增 shell/config；修正 PR Checklist 与实际变更一致。 |
 | R8 | 收窄 CPU fake test 的结论与实现，避免第二份 compressor 数学被误当 CANN oracle。 |
+| R9 | `coff` 改为单一来源：`forward` 从 `compressor.overlap` 计算一次并同时用于 `state_cache` geometry 与算子属性；`state_block_table` width 改用与 `x`/`cu_seq_q` 同源的 `varlen.max_q`，不新增重复 validator/state。 |
 | TP sharding | 若当前 support matrix 对外承诺 TP>1，则补真实 TP integration evidence；否则在描述中限定为 placement 配置接入，不宣称多 rank 已验证。 |
