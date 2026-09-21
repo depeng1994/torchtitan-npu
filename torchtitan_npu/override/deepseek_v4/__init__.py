@@ -1,7 +1,7 @@
 """DeepSeek-V4 AscendC overrides.
 
-Importing this package imports ``sparse_attn`` (whose ``__init__`` pulls in
-``ascendc.py`` and ``golden.py``), firing all override registrations.
+Importing this package registers the ``compressor`` and ``sparse_attn``
+override factories. Fused implementations are loaded only when selected.
 """
 
-from . import sparse_attn  # noqa: F401
+from . import compressor, sparse_attn  # noqa: F401

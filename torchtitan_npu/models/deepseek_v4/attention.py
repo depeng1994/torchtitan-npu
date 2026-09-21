@@ -25,6 +25,28 @@ from .reference import ReferenceCompressedVarlenMetadata
 from .token_dispatcher import CPTokenDispatcher
 
 
+class UnitScaleRMSNorm(RMSNorm):
+    """RMSNorm with a fixed unit scale excluded from checkpoints."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(RMSNorm.Config):
+        elementwise_affine: bool = field(default=False, init=False)
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        del self.weight
+        self.register_buffer("weight", torch.ones(config.normalized_shape), persistent=False)
+
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
+        del buffer_device
+        self.weight.fill_(1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Preserve the original query normalization's input-dtype rounding.
+        assert self.eps is not None
+        return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
+
+
 class CompressedSparseInnerAttention(FlexAttention):
     """DeepSeek sparse attention core for DeepSeek-V4 (varlen-typed reference).
 
@@ -283,6 +305,7 @@ class Attention(BaseAttention):
         # the modules are built.
         wq_a: Linear.Config
         q_norm: RMSNorm.Config
+        q_head_norm: RMSNorm.Config
         wq_b: Linear.Config
         wkv: Linear.Config
         kv_norm: RMSNorm.Config
@@ -314,6 +337,7 @@ class Attention(BaseAttention):
 
         self.wq_a = cfg.wq_a.build()
         self.q_norm = cfg.q_norm.build()
+        self.q_head_norm = cfg.q_head_norm.build()
         self.wq_b = cfg.wq_b.build()
         self.wkv = cfg.wkv.build()
         self.kv_norm = cfg.kv_norm.build()
@@ -355,7 +379,7 @@ class Attention(BaseAttention):
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr)
         q = q.view(bsz, seqlen, -1, self.head_dim)
-        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.norm_eps)
+        q = self.q_head_norm(q)
         # RoPE owns the [nope | rope] split: it receives the full-width
         # tensor and rotates only the trailing rope_head_dim channels.
         q = self.rope(q, positions=positions)

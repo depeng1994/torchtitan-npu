@@ -9,6 +9,7 @@ from functools import cache
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchtitan.config import Configurable
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
@@ -28,6 +29,20 @@ def _hadamard(dim: int, dtype: torch.dtype, device: torch.device) -> torch.Tenso
     while h.shape[0] < dim:
         h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
     return h
+
+
+class CompressorImplementation(Configurable):
+    """Select the compressor execution while keeping child overrides composable."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        pass
+
+    def __init__(self, config: Config):
+        del config
+
+    def forward(self, compressor, x, attention_masks):
+        return compressor._forward(x, attention_masks)
 
 
 class Compressor(Module):
@@ -55,6 +70,9 @@ class Compressor(Module):
         head_dim: int
         rope_head_dim: int
         compress_ratio: int
+        implementation: "CompressorImplementation.Config" = field(
+            default_factory=lambda: CompressorImplementation.Config()
+        )
         # The CP token dispatcher (the RoutedExperts mirror): owned by the
         # compressor, wired once by ``Compressor.parallelize``.
         token_dispatcher: CPTokenDispatcher.Config = field(default_factory=CPTokenDispatcher.Config)
@@ -62,6 +80,7 @@ class Compressor(Module):
     def __init__(self, config: Config):
         super().__init__()
         cfg = config
+        self.implementation = cfg.implementation.build()
         self.head_dim = cfg.head_dim
         self.rope_head_dim = cfg.rope_head_dim
         self.nope_head_dim = cfg.head_dim - cfg.rope_head_dim
@@ -117,6 +136,9 @@ class Compressor(Module):
         return torch.cat([state_a, state_b], dim=1)
 
     def forward(self, x, attention_masks):
+        return self.implementation.forward(self, x, attention_masks)
+
+    def _forward(self, x, attention_masks):
         """Project kv/score locally, gather the plan-block rows through the
         dispatcher, pool, and RoPE.
 

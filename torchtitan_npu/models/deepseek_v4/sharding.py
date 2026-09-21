@@ -154,6 +154,15 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
     at.wq_a.sharding_config = _replicate_weight
     at.q_norm.sharding_config = _replicate_weight
     at.wq_b.sharding_config = colwise_config()
+    q_head_layout = dense_activation_placement(tp=spmd.S(2))
+    at.q_head_norm.sharding_config = ShardingConfig(
+        state_shardings={"weight": _dense_param_rep},
+        in_src_shardings={"x": q_head_layout},
+        in_dst_shardings={"x": q_head_layout},
+        out_src_shardings=q_head_layout,
+        out_dst_shardings=q_head_layout,
+        local_map=LocalMapConfig(in_grad_placements=(q_head_layout,)),
+    )
     at.wkv.sharding_config = _replicate_weight
     at.kv_norm.sharding_config = _replicate_weight
     # ``wo_a`` stores per-group matrices flattened across group and output

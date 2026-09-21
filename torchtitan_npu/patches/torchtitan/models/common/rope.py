@@ -108,11 +108,11 @@ def _complex_apply_rotary_emb(
     ``key`` is ``None``, and conjugate the cache for ``inverse``."""
     if inverse:
         rope_cache = rope_cache.conj()
-    xq_ = torch.view_as_complex(query.float().reshape(*query.shape[:-1], -1, 2))
+    xq_ = torch.view_as_complex(query.float().reshape(*query.shape[:-1], query.shape[-1] // 2, 2))
     query_out = torch.view_as_real(xq_ * rope_cache).flatten(-2).type_as(query)
     if key is None:
         return query_out
-    xk_ = torch.view_as_complex(key.float().reshape(*key.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(key.float().reshape(*key.shape[:-1], key.shape[-1] // 2, 2))
     key_out = torch.view_as_real(xk_ * rope_cache).flatten(-2).type_as(key)
     return query_out, key_out
 

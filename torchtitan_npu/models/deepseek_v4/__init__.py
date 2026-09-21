@@ -27,7 +27,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan_npu.models.common.metadata_extension import LightningIndexerMetadata
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
-from .attention import Attention, CompressedSparseAttention, CompressedSparseInnerAttention
+from .attention import Attention, CompressedSparseAttention, CompressedSparseInnerAttention, UnitScaleRMSNorm
 from .compressor import Compressor, Indexer, LightningIndexer
 from .mhc import HcHead, HcPost, HcPre
 from .model import (
@@ -268,6 +268,10 @@ def _make_v4_attn_config(
             normalized_shape=q_lora_rank,
             eps=norm_eps,
             param_init=_NORM_INIT,
+        ),
+        q_head_norm=UnitScaleRMSNorm.Config(
+            normalized_shape=hd,
+            eps=norm_eps,
         ),
         wq_b=Linear.Config(
             in_features=q_lora_rank,
