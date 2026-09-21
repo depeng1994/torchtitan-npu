@@ -21,6 +21,17 @@ class AscRMSNorm(RMSNorm):
     class Config(RMSNorm.Config):
         pass
 
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        if not config.elementwise_affine:
+            del self.weight
+            self.register_buffer("weight", torch.ones(config.normalized_shape), persistent=False)
+
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
+        del buffer_device
+        if not self.elementwise_affine:
+            self.weight.fill_(1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch_npu.npu_rms_norm(x, self.weight, self.eps)[0]
 

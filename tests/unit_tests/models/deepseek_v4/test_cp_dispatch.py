@@ -775,6 +775,7 @@ def test_cp_attention_flow(dsv4_globals, dsv4):
         token_dispatcher=_MockDispatcher.Config(),
         wq_a=make_linear_cfg(DIM, 4),
         q_norm=make_rms_cfg(4),
+        q_head_norm=make_rms_cfg(HD),
         wq_b=make_linear_cfg(4, 2 * HD),
         wkv=make_linear_cfg(DIM, HD),
         kv_norm=make_rms_cfg(HD),
