@@ -16,6 +16,9 @@ from torchtitan_npu import (
     compile as _compile,
 )
 from torchtitan_npu import (
+    experiments as _experiments,
+)
+from torchtitan_npu import (
     config as _config,
 )
 from torchtitan_npu import (

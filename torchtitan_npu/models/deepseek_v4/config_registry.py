@@ -22,6 +22,7 @@ from torchtitan.distributed.flex_shard import (
 )
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.experiments.graph_trainer.configs import (
+    EpOverlapConfig,
     GraphTrainerCompileConfig,
 )
 from torchtitan.experiments.graph_trainer.configs import (
@@ -38,6 +39,9 @@ from torchtitan_npu.config import (
     MuonOptimizerProfile,
     OptimizerConfig,
     TrainingConfig,
+)
+from torchtitan_npu.extensions.graph_trainer.auto_overlap import (
+    enable_npu_auto_overlap,
 )
 from torchtitan_npu.extensions.profiler import CANNProfiler
 from torchtitan_npu.extensions.trainer import TrainerEx
@@ -461,6 +465,18 @@ def graph_trainer_deepseek_v4_flash_43layers_16experts() -> GraphTrainer.Config:
     )
     config.compile = _graph_trainer_compile_config()
     return config
+
+
+def graph_trainer_deepseek_v4_flash_43layers_16experts_auto_overlap() -> GraphTrainer.Config:
+    """43-layer GraphTrainer with the NPU cost-driven MoE scheduler."""
+    config = graph_trainer_deepseek_v4_flash_43layers_16experts()
+    config.compile.ep_overlap = EpOverlapConfig(
+        enabled=True,
+        chunk_dim="seq",
+        strategy="graph",
+        module_fqn="layers.*.moe",
+    )
+    return enable_npu_auto_overlap(config)
 
 
 def graph_trainer_deepseek_v4_pro() -> GraphTrainer.Config:

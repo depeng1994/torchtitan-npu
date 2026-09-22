@@ -15,8 +15,9 @@ from torchtitan_npu.config.configs import OptimizerConfig, TrainingConfig
 from torchtitan_npu.config.converters import TrainerConfigConverter
 from torchtitan_npu.extensions.components.checkpoint import CheckpointManager
 
-from .profiler import CANNProfiler
-from .trainer import TrainerEx
+from ..profiler import CANNProfiler
+from ..trainer import TrainerEx
+from . import auto_overlap  # noqa: F401
 
 
 class GraphTrainerEx(TrainerEx, GraphTrainer):
