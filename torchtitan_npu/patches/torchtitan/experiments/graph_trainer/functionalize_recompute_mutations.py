@@ -84,6 +84,7 @@ def _mutation_functionalization_pipeline(
     config: Any,
     *,
     parallel_dims: Any = None,
+    runtime_context: Any = None,
 ) -> list:
     """Default GraphTrainer passes with mutation functionalization inserted.
 

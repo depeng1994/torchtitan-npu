@@ -515,9 +515,12 @@ def test_ema_schema_is_inherited_by_npu_trainer_ex_config() -> None:
         from torchtitan_npu.patches.torchtitan.components.checkpoint import EMACheckpointManager
         import torchtitan.components.checkpoint as upstream_checkpoint
         import torchtitan.trainer as upstream_trainer
+        from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 
         assert upstream_trainer.Trainer is trainer_module.EMATrainer
         assert "ema_weights" in trainer_module.EMATrainer.Config.__dataclass_fields__
+        assert issubclass(GraphTrainer.Config, trainer_module.EMATrainer.Config)
+        assert "ema_weights" in GraphTrainer.Config.__dataclass_fields__
         config = TrainerEx.Config()
         assert isinstance(config, trainer_module.EMATrainer.Config)
         assert config.ema_weights.enable is False

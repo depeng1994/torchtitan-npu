@@ -8,6 +8,8 @@
 - https://github.com/pytorch/torchtitan/pull/4650
 - https://github.com/pytorch/torchtitan/pull/4651
 - https://github.com/pytorch/torchtitan/pull/4734
+- https://github.com/pytorch/torchtitan/pull/4708
+- https://github.com/pytorch/torchtitan/pull/4763
 -->
 
 # TorchTitan 临时补丁
@@ -44,6 +46,8 @@ grep -L "Pending upstream PR: https://github.com/pytorch/torchtitan/pull/" \
 | [#4516](https://github.com/pytorch/torchtitan/pull/4516) | 去重跨 chunk 共享的 EP ready node，对应 `ep_ready_nodes_dedup` |
 | [#4651](https://github.com/pytorch/torchtitan/pull/4651) | 将同一 root 的 AllToAll dim-0 shape query 保留在 chunk 内，对应 `ep_shape_live_out` |
 | [#4734](https://github.com/pytorch/torchtitan/pull/4734) | 在支持的一维 SimpleFSDP 场景下，将 GraphTrainer 每个 microbatch 的 chunk-loss head 梯度 ReduceScatter 合并为一次，对应 `experiments/graph_trainer/chunked_loss` |
+| [#4708](https://github.com/pytorch/torchtitan/pull/4708) | 修复 functionalize_recompute_mutations_pass 和 EpOverlap 的冲突 |
+| [#4763](https://github.com/pytorch/torchtitan/pull/4763) | 向 GraphTrainer graph pass 提供运行时上下文，用于 auto-overlap 调度时整图 profiling |
 
 四个 EP overlap 补丁的作用、启用方式与排查手段见
 [`docs/feature_guides/graph_trainer_ep_overlap.md`](../../../docs/feature_guides/graph_trainer_ep_overlap.md)。
