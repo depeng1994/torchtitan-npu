@@ -181,3 +181,116 @@ Upstream status verified while reviewing this part:
 ### Part 4 conclusion
 
 **Changes required.** The maintainer's inline direction on `ep_forward_accumulation.py` is correct: **split it out of PR 821**. Its claimed upstream provenance is no longer valid (#4708 is closed/unmerged and does not contain that change), and the eventual Linan/upstream solution should land independently. The runtime-context requirement is legitimate, but the current `ContextVar + _requires_runtime_context + apply_graph_passes` shim is not the upstream #4763 contract and is globally activated; it should be narrowed to a temporary, feature-detected compatibility layer or eliminated by updating the pinned dependency. Finally, remove the model-specific `..._auto_overlap` config factory and expose the feature through the existing CLI/config fields rather than multiplying training configs.
+
+
+## Part 5/5 — tests, documentation, and example scripts
+
+### Test-review baseline
+
+This part follows the repository's test-review separation:
+
+- **UT** is judged on CPU-observable production semantics and requires an independent oracle; a mock proving that a helper called another helper is not evidence for NPU behavior.
+- **ST** is a separate coverage dimension. Real NPU/HCCL/profiler/stream behavior cannot be claimed from CPU UTs, synthetic traces, or example shell scripts.
+- Test framework/runner behavior is not counted as product coverage.
+- The default assumption remains reductive: tests that only freeze a private implementation detail should be deleted or rewritten around product semantics.
+
+All newly added GraphTrainer unit tests in this PR are CPU/synthetic-FX/monkeypatch tests; none of the six extension test files executes real NPU hardware or a real distributed HCCL/CANN profiling round. That is appropriate for UT, but it leaves an ST obligation for this feature.
+
+### Findings
+
+| ID | Severity | Location | Dimension | Problem | Impact | Recommended change |
+|---|---|---|---|---|---|---|
+| P5-R1 | **BLOCKER** | Entire Part-5 test set; no corresponding case in `tests/integration_tests` | ST coverage / real NPU correctness | Auto-overlap's defining semantics are NPU- and distributed-only: CANN profiling, NPU event timing, HCCL A2A, process-group membership, cross-rank schedule agreement, D2H host synchronization, and multi-round execution of the transformed training graph. The PR adds ~2.5K lines of CPU/mock tests but **no registered real-NPU integration case**. The A3/A5 shell scripts are manual examples; they have no oracle and are not CI ST. This is especially serious because Parts 1–3 found several deadlock/failure modes that CPU mocks cannot reproduce. | The suite can be fully green while the feature deadlocks at compile time, mis-associates profiler work, diverges communication order across ranks, or trains incorrectly on NPU. | Add an integration/ST case under the existing `tests/integration_tests` infrastructure before merge. At minimum run a real GraphTrainer MoE config with EP>1 through: native chunk preparation → auto scheduler → CANN standalone benchmark → whole-graph calibration → transformed graph execution for multiple training steps. Assert the feature was actually entered (not silently falling back), all ranks complete, and numerics are checked against an independent/native-overlap baseline or a deterministic dynamic reference. Add a rank-asymmetric/PG-scoped case when PP/local-layer asymmetry is supported. |
+| P5-R2 | **HIGH** | `test_auto_overlap.py:L32-L333`, especially `L54-L76`, `L40-L52`, `L262-L333` | UT oracle correctness | Several tests encode implementation choices already identified as defects. `test_npu_auto_overlap_runs_after_chunk_shape_concretization` explicitly requires the replacement scheduler **after** concretization, contradicting TorchTitan's scheduling-before-concretization contract (P3-R6). `test_deepseek_v4_auto_overlap_config_selects_npu_pipeline` protects the bespoke model config factory that Part 4 recommends deleting. `test_two_whole_graph_rounds...` freezes exactly two rounds and a third unprofiled schedule instead of testing convergence/fixed-point semantics. | These tests will fail when the production code is corrected, creating pressure to preserve the wrong architecture. | Rewrite around semantic invariants: the NPU scheduler replaces the native scheduler at the same upstream anchor; CLI/pipeline selection does not require a new model factory; calibration stops on an unchanged schedule/cycle/max-round guard and never returns a newly generated unmeasured candidate. Delete tests whose only subject is code scheduled for removal. |
+| P5-R3 | **HIGH** | `test_whole_graph_benchmark.py:L323-L405` | Cross-rank oracle correctness | `test_align_costs_uses_rank_minimum` explicitly asserts WORLD-wide **minimum** latency as correct. `test_collective_count_validation_only_compares_group_type_counts` explicitly protects the weaker count-only WORLD manifest. Both are the exact behaviors rejected in P3-R3/P3-R4. The tests do not model actual process-group membership. | Incorrect topology/statistics are promoted to a regression contract. A later fix to use real PG membership and completion-critical aggregation would look like a test regression. | Replace these with group-scoped semantic-manifest tests. Build at least two logical PGs with overlapping/different members, assert unrelated ranks are excluded, mismatched ordered role/type/shape manifests are rejected, and the aligned completion cost uses the statistic defined by the scheduling model (normally participant max, not global min). |
+| P5-R4 | **HIGH** | `test_collective_benchmark.py:L57-L192` | Benchmark protocol / timing coverage | The CANN tests validate a synthetic trace parser and local dedup only. `test_cann_batch_deduplicates_before_materialization` forces `get_world_size(...)=1`, so it cannot expose P2-R1's divergent per-rank dedup/manifest deadlock. The event test stubs out `_benchmark_a2a_with_npu_events` entirely, so it proves delegation but not event record/wait/end synchronization, warmup, or timing semantics. No test compares CANN and event fallback as the same cost quantity. | The highest-risk distributed/timing protocol has almost no independent unit oracle, while mocks make the control flow appear covered. | Add deterministic multi-rank protocol tests with a fake process-group transport that gives ranks intentionally different local request orders/cache hits and verifies they derive one shared signature sequence or collectively fail. Unit-test event ordering/wait/synchronize explicitly. Add a backend-semantic test that rejects/keeps separate incompatible CANN vs event cost definitions. Real timing accuracy still belongs to P5-R1 ST. |
+| P5-R5 | **MEDIUM** | `test_compute_benchmark.py:L113-L384`, especially permutation parametrization `L241-L355` | Input-construction coverage | GMM balanced-boundary tests and routing-balance tests are useful independent oracles, but the dynamic permutation matrix covers only `("unpermute", True)`; **dynamic permute is absent**. That is exactly the path where P2-R6 found `assumed_rows` conflating source-token rows with routed rows. The suite also does not assert that host/D2H nodes are excluded from device-only generic benchmarking (P2-R8). | The specialized input builder can overstate permute workload by top-k while all existing tests pass. Host-bound copies can also remain measured with the wrong metric. | Add a dynamic-permute case whose oracle is `source_tokens * topk == routed_tokens`, with source and routed counts independently named. Add a test that CPU-destination/blocking D2H is routed to an explicit host-transfer cost path or rejected from generic device-only benchmarking. |
+| P5-R6 | **HIGH** | `test_npu_moe_auto_scheduler.py:L35-L703` | Scheduler correctness / distributed coverage | Every scheduler construction in this file sets `align_across_ranks=False`; the file never exercises the scheduler's actual rank-consensus path. It therefore misses P1-R1's WORLD deadlock/rank-asymmetric graph problem and does not test group-scoped communication manifests. It also lacks malformed token-count closure cases (1+3 copies, stray/non-CPU copies) for P1-R2 and a case proving mandatory D2H correctness edges are never dropped when regional ordering conflicts (P1-R3). Finally, `test_count_a2a_d2h_and_light_compute_are_benchmarked` codifies scheduling generic `all_reduce` as an exchange, reinforcing the over-broad communication domain from P1-R7. | The largest test file gives strong coverage of local greedy ordering while leaving the actual distributed-safety contract effectively untested. | Split the oracle into mandatory correctness and performance policy. Add group-aware fake-rank tests for manifest/agreement, malformed D2H rejection, and conflicting mandatory-edge rejection/revert. Restrict communication tests to explicitly annotated EP exchange roles unless the upstream contract is deliberately broadened. Keep local greedy tests only for policy decisions after those safety invariants are established. |
+| P5-R7 | **MEDIUM** | `test_graph_trainer_runtime_context.py:L1-L90`; related assertions in `test_auto_overlap.py:L192-L257` | Patch test / upstream compatibility | These tests validate the private `_requires_runtime_context` marker, `ContextVar` transport, and patched `apply_graph_passes` contract. Part 4 established that upstream #4763 intentionally uses a typed `GraphPassRuntimeContext` passed at pipeline construction and ordinary `partial`, without this marker or `apply_graph_passes` rewrite. | The tests make the temporary compatibility shim harder to delete and do not protect compatibility with the actual upstream API. | If the v0.3.0 shim must remain temporarily, test only the version-gated adapter boundary and add a case showing it **no-ops when the #4763 seam is present**. Once the minimum dependency contains #4763, delete this file and replace it with a thin pipeline-binding test using the upstream typed context. |
+| P5-R8 | **MEDIUM / split with feature** | `test_ep_forward_accumulation.py:L1-L107` | PR scope / independent oracle | The positive test is a reasonable CPU oracle for the narrow `buffer + delta0 + delta1` reconstruction, and the negative test verifies the proof does not broaden to arbitrary live-outs. However, Part 4 requires the production `ep_forward_accumulation.py` patch to leave PR 821; these tests have no independent auto-overlap semantics. | Keeping the tests after removing/splitting the patch leaves unrelated test churn; keeping both in this PR keeps the unwanted ChunkLoss/functionalization dependency alive. | Move these tests together with the eventual Linan/upstream-approved forward-accumulation PR. Do not delete their semantic assertions if that feature lands; delete them only from **this** PR. |
+| P5-R9 | **HIGH** | `docs/feature_guides/graph_trainer_auto_overlap.md:L1-L249` | Documentation correctness | The guide confidently documents several behaviors that Parts 1–4 show are either false or unsafe: it says the feature “只将 `ep_overlap_schedule_pass` 替换” while this PR also depends on runtime-context and Inductor patches; it presents scheduling **after** concretization as intended despite the upstream contract; it says positional first-round rank alignment is safe because ranks have the same node count/order (P1-R5 disproves this); it documents WORLD-min whole-graph costs as a correctness strategy (P3-R3); it says conflicting ordering constraints retain a safe acyclic subset although mandatory D2H edges may be dropped (P1-R3); and priority 5 claims “较大的就绪计算” while the implementation chooses canonical earliest filler (P1-R6). It also documents benchmark failures as zero cost, which P1-R8/P2-R7 identify as an unsafe fallback. | Users and future maintainers will rely on guarantees the implementation does not provide, making later debugging and upstream upgrades harder. | Refresh the guide only after the architecture is corrected. Describe the upstream pass contract exactly, process-group scope exactly, the chosen timing metric exactly, convergence/termination exactly, and distinguish “unsupported/fallback” from zero cost. Do not document intended behavior that is not enforced by code/tests. |
+| P5-R10 | **MEDIUM** | `examples/deepseek_v4/debug/*a3_auto_overlap.sh:L1-L25`, `*a5_auto_overlap.sh:L1-L25`, `*a5_graphtrainer.sh:L1-L10` | Example convention / entrypoint reduction | The maintainer comment on `a5_graphtrainer.sh` is correct: it is a path-swapped copy of the existing A3 GraphTrainer wrapper and adds only `--parallelism.spmd-backend partial_dtensor`; the A5 auto-overlap wrapper can pass that CLI override directly to the existing A5 script. The two auto-overlap wrappers are also near-duplicates and depend on the bespoke `..._auto_overlap` config factory rejected in P4-R6. Placement under `examples/` is correct; multiplication of wrappers is not. | A simple feature grows three shell entrypoints and one Python config name, creating A3/A5/config combinations that must all stay synchronized. | Delete `deepseek_v4_flash_8p_cpt_4k_a5_graphtrainer.sh`. After removing the bespoke config factory, make the minimum number of example wrappers call the existing A3/A5 launchers and express EP-overlap + pass-pipeline selection through CLI. If A3/A5 auto-overlap scripts are retained as measured hardware recipes, factor their common auto-overlap flags once and keep only hardware-specific deltas. |
+| P5-R11 | **LOW / cleanup after fixes** | `test_utils.py:L19-L108` | Utility test value / hidden config | The reshape/storage and canonical-order tests are useful. The profiler-directory matrix mostly exists to protect the new `NPU_AUTO_OVERLAP_DEBUG` environment variable that P3-R11 recommends deleting in favor of existing CLI/debug configuration. The stable-ID test covers first assignment but not P3-R12's idempotence/re-entry hazard. | Test volume protects a hidden env surface while missing the more important stable-ID invariant. | When the env knob is removed, delete the env-retention matrix and test the existing debug config integration instead. Add one idempotence/duplicate-ID test if stable IDs remain a shared utility. |
+| P5-R12 | **INFO / scope hygiene** | `test_rope_recompute_integration.py` rename only, from `tests/unit_tests/patches/torchtitan/graph_trainer/` to `.../experiments/graph_trainer/` | Test move impact | The file is a pure rename with zero content changes. Pytest recursive discovery and imports are unaffected, and the new directory mirrors the production patch path more accurately. It tests mutation functionalization/RoPE recompute, not auto-overlap itself. | No functional regression from the move; only review/scope noise. | The destination is structurally better. Keep the move only if this PR is intentionally doing the GraphTrainer patch-test directory cleanup; otherwise revert it here and land the rename as housekeeping so PR 821 stays feature-focused. |
+
+### Coverage assessment by file
+
+| File | What the tests genuinely prove | What they do **not** prove |
+|---|---|---|
+| `test_auto_overlap.py` | Registry composition, local pass-list rewriting, callback plumbing, previous-cost fallback bookkeeping | Correct upstream pass anchor, convergence, real runtime-context transport, NPU execution |
+| `test_collective_benchmark.py` | Pure split arithmetic, local dispatch delegation, synthetic HCOM parser behavior | Multi-rank benchmark protocol, actual HCCL timing, CANN/event metric equivalence |
+| `test_compute_benchmark.py` | GMM legal offsets, balanced routing, cache-shape plumbing, several permutation forms | Dynamic permute routed/source row semantics, real NPU profiler compatibility, host-bound D2H cost |
+| `test_npu_moe_auto_scheduler.py` | Many local ready-set/slack/order decisions and projected graph dependencies | Any cross-rank agreement path, actual PG scoping, malformed upstream token-count contract, mandatory-edge conflict safety |
+| `test_utils.py` | Metadata classification, one-time stable tags, temp profiling-directory behavior, FX dump | Stable-ID re-entry and CLI-based debug integration |
+| `test_whole_graph_benchmark.py` | Synthetic trace association/filtering, buffer/RNG preservation, current semantic-key construction | Real CANN correlation, group-scoped alignment, distributed failure coordination, correct aggregation statistic |
+| `test_graph_trainer_runtime_context.py` | Current private shim mechanics | Upstream #4763 compatibility |
+| `test_ep_forward_accumulation.py` | Narrow toy forward-accumulation proof | Auto-overlap behavior; real DSV4/ChunkLoss integration |
+| `test_rope_recompute_integration.py` | Existing CPU mutation/recompute regression behavior | Auto-overlap; rename changes no semantics |
+
+## 总体结论
+
+### 1. 五段问题统计
+
+Across Parts 1–5 this review records **59 findings**:
+
+| Severity | Count |
+|---|---:|
+| **BLOCKER** | **7** |
+| **HIGH** | **25** |
+| **MEDIUM** | **18** |
+| **LOW** | **4** |
+| **INFO** | **5** |
+| **Total** | **59** |
+
+The count is less important than the concentration: the blockers/highs are not cosmetic. They cluster around distributed liveness, scheduler correctness, cost-model validity, upstream contract compatibility, and the absence of real-NPU validation.
+
+### 2. 必须修复项
+
+Before this PR is mergeable, at least the following classes of issues must be resolved:
+
+1. **Distributed protocol and liveness**
+   - Replace WORLD-wide scheduler/benchmark/calibration agreement with the actual participating process-group scope (P1-R1, P2-R1, P3-R3/P3-R4).
+   - Add coordinated failure/timeout behavior so one rank cannot throw or hang while peers enter the next collective (P2-R3, P3-R1).
+   - Add real-NPU ST that executes the full distributed path rather than relying on mocks/examples (P5-R1).
+
+2. **Scheduler correctness contract**
+   - Restore the upstream token-count D2H structural validation before changing synchronization semantics (P1-R2).
+   - Separate mandatory correctness dependencies from optional performance-ordering edges; never drop a mandatory edge to make a regional order acyclic (P1-R3).
+   - Scope communication modeling to real/annotated EP exchanges and model independent process groups correctly (P1-R4/P1-R7).
+
+3. **Cost model correctness**
+   - Remove positional rank alignment and WORLD-min alignment; use stable semantic identity and the correct participant group/statistic (P1-R5, P3-R3).
+   - Make CANN and event fallback measure the same quantity or store them as different metrics (P2-R2).
+   - Fix dynamic permute source-token vs routed-token assumptions and host-bound/D2H cost handling (P2-R6/P2-R8).
+   - Stop converting benchmark failures/invalid values into zero-cost compute (P1-R8/P2-R7).
+   - Replace fixed “two rounds then return a third unprofiled schedule” with fixed-point/cycle-aware termination (P3-R5).
+
+4. **Upstream GraphTrainer/Inductor contracts**
+   - Replace the native scheduler at the native scheduler position; do not move scheduling after chunk-symbol concretization unless that new contract is upstreamed (P3-R6).
+   - Use PyTorch's existing device benchmark registration seam instead of permanently monkey-patching `TorchProfilerBenchmarker.benchmark_gpu`; keep the torch_npu workaround explicitly temporary/upstream-bound (P2-R4/P2-R5).
+   - Converge runtime context to upstream #4763's construction-time typed context/partial binding; the current `ContextVar + _requires_runtime_context` contract must not become a second GraphTrainer API (P4-R3/P4-R4/P4-R5).
+
+5. **Tests and documentation**
+   - Rewrite UTs that currently freeze known-wrong behavior (P5-R2/P5-R3).
+   - Add missing distributed safety unit oracles and real NPU ST (P5-R4/P5-R6/P5-R1).
+   - Refresh the feature guide after implementation fixes so documented safety/performance guarantees are enforced by code (P5-R9).
+
+### 3. 建议拆分 / 删除项
+
+To reduce PR scope and isolate ownership:
+
+- **Remove `ep_forward_accumulation.py` and its test from PR 821.** The maintainer's inline direction is correct; #4708 is closed/unmerged and does not carry this EP-chunk patch. Wait for the Linan/upstream-approved ChunkLoss/functionalization solution and land it independently (P4-R1/P4-R2/P5-R8).
+- **Treat the GraphTrainer runtime-context bridge as a separate upstream/backport concern** if the dependency cannot be bumped to #4763. The auto-overlap implementation should consume that seam, not own a permanent private protocol (P4-R3/P4-R4).
+- **Keep the torch_npu Inductor benchmark compatibility patch independently upstream-tracked** by its Ascend/pytorch PR and delete it once the minimum torch_npu contains the required profiler capability (P2-R4/P2-R5).
+- **Delete the bespoke DeepSeek-V4 `..._auto_overlap` config factory** and select the feature through existing CLI/config fields (P4-R6/P4-R7).
+- **Delete `a5_graphtrainer.sh`** and reduce the A3/A5 auto-overlap wrappers to the minimum hardware-specific examples; do not create one shell/config combination per model/hardware/feature tuple (P5-R10).
+- The pure `test_rope_recompute_integration.py` directory move is harmless but can be split/reverted as housekeeping if a minimal feature diff is desired (P5-R12).
+- Remove the unrelated top-level empty `torchtitan_npu.experiments` import (P4-R10) and replace the new debug env surface with existing CLI-visible debug configuration (P3-R11/P5-R11).
+
+### 4. Maintainer 判断
+
+**当前不建议合入；应 Request Changes。**
+
+The core idea—measured-cost EP overlap scheduling with whole-graph feedback—is reasonable, and several local input builders/tests are well-motivated. However, the current implementation creates a second scheduler correctness contract around upstream GraphTrainer while simultaneously introducing WORLD-scoped distributed coordination, private monkey patches, inconsistent timing/alignment semantics, and no real-NPU ST. Those are architectural and correctness risks, not follow-up polish.
+
+The preferred direction is to substantially shrink the PR: retain upstream EP chunk/validation contracts, add a thin NPU cost-policy/scheduling extension at the upstream scheduler seam, use process-group-scoped distributed protocols, converge runtime context and benchmark registration to upstream hooks, and keep only the tests/docs/examples that prove those reduced semantics.
