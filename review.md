@@ -294,3 +294,85 @@ To reduce PR scope and isolate ownership:
 The core idea—measured-cost EP overlap scheduling with whole-graph feedback—is reasonable, and several local input builders/tests are well-motivated. However, the current implementation creates a second scheduler correctness contract around upstream GraphTrainer while simultaneously introducing WORLD-scoped distributed coordination, private monkey patches, inconsistent timing/alignment semantics, and no real-NPU ST. Those are architectural and correctness risks, not follow-up polish.
 
 The preferred direction is to substantially shrink the PR: retain upstream EP chunk/validation contracts, add a thin NPU cost-policy/scheduling extension at the upstream scheduler seam, use process-group-scoped distributed protocols, converge runtime context and benchmark registration to upstream hooks, and keep only the tests/docs/examples that prove those reduced semantics.
+
+
+## Final Cross-Check
+
+本节对 Part 1~5 的 59 条分段意见做跨段复核。结论以本节为最终裁决；前文保留作为审查轨迹，但若与本节冲突，以本节为准。
+
+### 冲突裁决表
+
+| 相关 ID | 表面冲突 / 不一致 | 最终裁决 |
+|---|---|---|
+| P1-R5 vs P3-R3 | P1-R5 建议“复用 whole-graph 的 semantic-key alignment”，但 P3-R3 又指出当前 whole-graph alignment 使用 WORLD + rank minimum，本身有问题。 | **两条都保留，但修正 P1-R5 的建议措辞。** 可复用的是 `_cross_rank_semantic_keys()` 这类“语义身份”机制，**不能直接复用当前 `_align_costs()` 的 WORLD/min 实现**。Standalone 与 whole-graph 都应先按真实通信/调度参与 PG 定义 rank scope，再使用统一 semantic identity；聚合统计另按 cost model 明确定义。 |
+| P3-R6 vs `auto_overlap.py` / 文档对“先 concretize 再 benchmark”的设计理由 | 当前实现确实需要 concrete shape 才能物化 NPU benchmark 输入，因此把 NPU scheduler 放在 concretize 后；而 P3-R6 要求保持 upstream scheduler-before-concretize 契约。 | **保留 P3-R6（HIGH）。** “benchmark 需要 concrete shape”不能反向改写 upstream scheduling contract。更稳妥的架构是：在 scheduler 原锚点保留权威图的 symbolic contract；需要 profiling 时对临时 clone/benchmark descriptor 做 concretization，再把 cost 映射回权威图后调度。若确实要把正式 scheduling 移到 concretize 后，应先上游明确该新 contract。 |
+| P2-R2 vs 其他段把 CANN/HCOM cost 当作可用通信 cost | P2-R2 看起来像在否定 CANN HCOM occupancy，而 scheduler queue model 又可能正需要 service-time 类指标。 | **保留 P2-R2（HIGH），但最终问题是“混用两种 metric”，不是“CANN metric 天生错误”。** CANN queued HCOM occupancy 可以作为 queue service-time prior；event fallback 的 launch→wait completion latency 也可以有意义。错误在于两者当前进入同一 `collective_cost_ms` 后被无区分比较。 |
+| P3-R3 中“participant maximum”建议 vs compute 节点实际语义 | P3-R3 原文把 participant max 作为 compute/communication 的通常聚合方案，表述过宽。 | **部分修正 P3-R3。** WORLD scope 和“取所有 rank 最小值且称 best performance”仍是 HIGH 问题；但**撤回“所有 compute cost 都应统一取 participant max”这一泛化建议**。通信完成时间常受最慢参与者约束；compute 对齐该取 max/median/别的统计需由 scheduler 模型证明。最终要求是“PG-scoped + 明确定义/可解释的 statistic”，而不是预设所有节点都取 max。 |
+| P2-R5 的 HIGH 严重级别 vs pinned torch_npu 证据强度 | 该意见引用 legacy `ProfilerStubs` 的 static current-stream 缓存来说明 custom-stream 计时风险；最初证据来自当前 Ascend/pytorch。 | **保留问题，但最终严重级别从 HIGH 调整为 MEDIUM。** 已额外核对 Ascend/pytorch 2026-08-10 的代码（接近本仓 `torch_npu==2.14.0.dev20260808` pin）仍存在 `static auto stream = getCurrentNPUStream()`，所以 stream-coupling 不是幻觉；但本仓 pin 是 wheel 日期而不是精确 commit SHA，不能百分之百证明 8 月 8 日 wheel 与 8 月 10 日源码逐行一致。核心“legacy profiler fallback 是脆弱内部契约”成立，custom-stream 错计时作为风险而非已证实故障。 |
+| P1-R6 的 HIGH 严重级别 vs 其实际影响 | P1-R6 证明实现没有兑现“large-op-first”，但这主要影响性能策略，不直接破坏图正确性。 | **保留问题，最终严重级别从 HIGH 调整为 MEDIUM。** 代码确实在可行 filler 中按 canonical/original order 取 earliest，而非按大算子/最佳 fit 排序；应修文档或修算法，但不应与 D2H/分布式 deadlock 类问题同级。 |
+
+### 重复合并表
+
+下表中的“并入”表示不再作为独立唯一问题计数；原 ID 保留在历史段落中，最终 action 归到“保留 ID”。
+
+| 并入 ID | 保留 ID | 合并理由 / 最终处理 |
+|---|---|---|
+| P2-R12 | **P1-R10** | 两条都是同一结论：GMM/permutation 的特殊输入语义是必要的，问题在于 scheduler 与 benchmark layer 双重持有 target-specific 假设。保留首次提出的 P1-R10。 |
+| P3-R9 | **P2-R4** | P3-R9 的“skip auto-overlap 前就安装全局 Inductor monkey patch”是 P2-R4“不要 class monkey patch、改用 registry”的直接副作用。修 P2-R4 后 P3-R9 基本消失。 |
+| P3-R2 | **P3-R7** | 两条都属于 FX→CANN cost 的非因果 name/order 匹配。P3-R2 的 clone/buffer snapshot 污染是 P3-R7 的一个具体可复现来源；统一保留更一般的 P3-R7，并把“profiling scaffold 必须排除”作为其验收条件。 |
+| P3-R10 | **P4-R4** | “runtime context 缺失时静默降级为 standalone-only”是当前私有 marker/feature-detection transport 不稳的可见后果。统一归入 P4-R4 的 runtime-context contract/upgrade-safety 问题。 |
+| P4-R7 | **P4-R6** | 都是在反对为 43-layer/16-expert 单独新增 `..._auto_overlap` Python config。P4-R7 的“其他 flavor 不对称”只是 P4-R6 配置矩阵膨胀的证据。 |
+| P4-R8 | **P4-R3** | `runtime_context` 又塞一份 `traced_result` 是本地 shim 偏离 upstream #4763 typed context 的同一设计问题，作为 P4-R3 的减法项处理。 |
+| P4-R11, P4-R12 | **P4-R5** | EMA 断言和 Trainer import-order comment 都是在为“全局 import 即 patch GraphTrainer”这一副作用兜底。它们本身不是新的产品问题；保留为 P4-R5 的证据。 |
+| P5-R2 | **P3-R5 / P3-R6 / P4-R6** | 这是测试把三个已知错误设计固化成 oracle：固定两轮、post-concretize scheduler、新 model config factory。测试需随对应生产修复改写，不再额外计一个独立问题。 |
+| P5-R3 | **P3-R3 / P3-R4** | 测试显式断言 WORLD-min 和 count-only WORLD manifest，只是在固化 P3-R3/P3-R4。作为错误 oracle 证据并入生产问题。 |
+| P5-R4 | **P2-R1 / P2-R2** | 单 rank dedup mock 与 stubbed event benchmark 没覆盖分布式 manifest 和 timing semantic；这是 P2-R1/P2-R2 缺少独立 oracle 的测试证据。 |
+| P5-R5（dynamic-permute 部分） | **P2-R6** | “没有 dynamic permute 测试”直接对应 P2-R6 的 source-token/routed-token 混淆。D2H 部分另见撤回表。 |
+| P5-R6 | **P1-R1 / P1-R2 / P1-R3 / P1-R7** | scheduler UT 全部 `align_across_ranks=False`、缺 malformed D2H/mandatory-edge case、并接受 generic all_reduce，分别只是 Part 1 四条生产问题的测试缺口。 |
+| P5-R7 | **P4-R3 / P4-R4** | 测试保护 `ContextVar + _requires_runtime_context + patched apply_graph_passes`，本质是在固化 Part 4 已指出的第二套 runtime-context 协议。 |
+| P5-R8 | **P4-R1** | 如果 `ep_forward_accumulation.py` 按 maintainer 要求从 PR 821 拆出，其测试自然随该 feature 一起拆出；无需再独立计一条。 |
+| P5-R11 | **P3-R11 / P3-R12** | debug-env 测试矩阵归 P3-R11；stable-ID 缺 idempotence test 归 P3-R12。测试条目本身不再单独计数。 |
+
+### 撤回表
+
+| ID | 撤回范围 | 原因与最终结论 |
+|---|---|---|
+| **P2-R8** | **整条撤回** | 原意见把“generic compute selector 会 benchmark token-count D2H copy”作为关键依据。重新核对后，真实 TorchTitan 标准 token-dispatch 路径的 split counts 来自 boolean routing map 的 `sum(dim=...)`，是整数 count tensor；而 `_is_npu_benchmark_compute_node()` 明确通过 `_has_value_sensitive_tensor_inputs()` 排除非 floating/complex tensor。也就是说，真实 token-count D2H 不能据此证明会进入 generic random-input benchmark。UT 中人为用 float metadata 构造 D2H 只证明 synthetic fixture 可走该路径，不证明真实产品路径。若未来存在其他 floating CPU-destination `_to_copy`，需要单独定位真实节点后再提意见。 |
+| **P5-R5** | **撤回其中“缺 D2H generic benchmark 测试”半条** | 该半条完全建立在 P2-R8 上，因此一并撤回。P5-R5 的 dynamic-permute coverage 缺口仍成立，但已并入 P2-R6。 |
+| **P3-R3** | **仅撤回“compute 统一应取 participant max”的泛化建议** | WORLD-wide scope、local group ordinal、rank-min 没有模型论证这些问题仍成立；但 compute cost 的正确跨 rank statistic 不能仅凭“慢 rank 决定通信完成”直接推导为统一 max。保留 P3-R3（HIGH），要求由调度模型明确 statistic。 |
+
+除上表外，重新对照 PR #21 changed-files 与 `pr_821` 源码后，未发现其他需要整条撤回的 P1~P5 production finding。尤其以下此前容易产生疑问的项已复核有直接代码依据：P1-R2 的 4-copy 弱 gate、P1-R3 的 maximal-acyclic-subset fallback、P2-R1 的 local dedup 后进入 PG collective、P3-R1 的 local profile failure 后 WORLD gather 风险、P3-R5 的“2 次 profile 后返回第 3 次 schedule”、P4-R4 的错误 feature-detection seam，以及 P4-R10 的空 `experiments` 顶层 import。
+
+### 新增补充意见表
+
+| ID | Severity | Location | 横切问题 | 依据 / 影响 | 建议 |
+|---|---|---|---|---|---|
+| FC-R1 | **MEDIUM** | `torchtitan_npu/patches/torchtitan/experiments/graph_trainer/functionalize_recompute_mutations.py:L84-L101`; `auto_overlap.py:L248-L279` | **分段范围漏审的 changed file / runtime-context composition** | PR #21 实际还修改了 `functionalize_recompute_mutations.py`（只新增 `runtime_context=None` 参数），但 Part 1~5 的明确 scope 都没有覆盖这个文件。重新检查发现：该 pipeline 接受 `runtime_context` 后并不向 `construct_default_graph_passes(...)` 透传；同时 `_construct_npu_auto_overlap_pipeline()` 调 base pipeline 时也只传 `parallel_dims`。当前 #4763 的 default pipeline 暂时不消费 runtime context，所以今天通常不出错；但 composition contract 已被截断——一旦 base pipeline 内新增第二个 runtime-aware pass，auto-overlap 组合会静默吞掉 context。 | 组合器应透明转发 base pipeline 支持的 construction-time 参数。最小修法：在 minimum TorchTitan 包含 #4763 后统一按其 typed signature 调 `pipeline_fn(..., parallel_dims=..., runtime_context=...)`；兼容旧版本时可基于 pipeline **constructor** signature 做一次明确适配，而不是让参数在 wrapper 层被接受后丢弃。 |
+| FC-R2 | **LOW** | `examples/deepseek_v4/debug/*a3_auto_overlap.sh:L15-L24`, `*a5_auto_overlap.sh:L15-L24` + base `deepseek_v4_flash_8p_cpt_4k_a3.sh` profiler args | **example 默认 profiler 配置自相矛盾** | 两个 auto-overlap wrapper 都设置 trace folder / warmup / profiler start/end，但最终调用的 A3 base script 默认包含 `--profiler.no-enable-profiling`；wrapper 没有追加 `--profiler.enable-profiling`。因此默认执行时这些新增 trace-window 参数不会产生训练 profiler trace。若它们只为“用户将来手工 enable”预置，则当前脚本里属于噪声；若本意是 auto-overlap 性能采样，则脚本行为与意图不一致。 | 二选一：若 example 默认就要产出性能 trace，显式在 wrapper 末尾加 `--profiler.enable-profiling`；若不希望默认 profiling，则删掉 save-folder/warmup/start/end 这些无效默认参数，保持 example 最小化。内部 auto-overlap CANN benchmark 与训练 profiler 是两回事，不应靠这些 no-op flags 暗示已采集训练 trace。 |
+
+### Final effective issue set
+
+前文“总体结论”的 **59** 是分段审查的 raw finding 数。经过本次交叉审查后：
+
+- 合并/吸收重复项：16 条；
+- 整条撤回：1 条（P2-R8）；
+- 新增横切遗漏：2 条（FC-R1、FC-R2）；
+- 两条严重级别最终下调：P1-R6 HIGH→MEDIUM，P2-R5 HIGH→MEDIUM；
+- P3-R3 保留 HIGH，但收窄其 statistic 建议。
+
+因此最终唯一 actionable finding 为 **44 条**：
+
+| Severity | Final count |
+|---|---:|
+| **BLOCKER** | **7** |
+| **HIGH** | **18** |
+| **MEDIUM** | **13** |
+| **LOW** | **3** |
+| **INFO** | **3** |
+| **Total unique** | **44** |
+
+### Final maintainer decision
+
+此前“当前不建议合入；应 Request Changes”的判断 **不变**。交叉审查撤回了一条站不住的 D2H generic-benchmark 意见，并对两条严重级别做了降级，但 7 个 blocker 均仍成立；新增的 FC-R1 还说明 runtime-context composition 在一个此前漏审的 changed file 上存在升级耦合。
+
+最终修复顺序仍应优先：分布式 liveness / PG scope → D2H correctness contract → scheduler DAG materialization → benchmark metric/manifest → upstream pass/runtime-context contract → real-NPU ST；配置、文档和脚本减法在上述 contract 稳定后收尾。
