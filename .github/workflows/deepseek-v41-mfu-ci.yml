@@ -28,7 +28,7 @@ jobs:
           git clone --depth 1 --branch v0.3.0 https://github.com/pytorch/torchtitan.git /tmp/torchtitan
           python -m pip install -e /tmp/torchtitan
           python -m pip install --no-deps -e .
-          python -m pip install pytest attn-gym==0.0.9 scipy tokenizers
+          python -m pip install pytest attn-gym==0.0.9 scipy tokenizers triton
 
       - name: Run focused MFU unit tests
         env:
