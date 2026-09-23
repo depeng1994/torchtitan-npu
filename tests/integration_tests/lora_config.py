@@ -10,6 +10,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from safetensors.torch import load_file
 from torch.distributed.tensor import DTensor
 from torchtitan.tools.logging import logger
@@ -28,7 +29,25 @@ class LoRATrainer(TrainerEx):
     class Config(TrainerEx.Config):
         pass
 
+    def _optimizer_snapshot(self):
+        return {
+            name: _cpu_tensor(value)
+            for name, value in self.optimizers.state_dict().items()
+            if isinstance(value, torch.Tensor)
+        }
+
+    def _optimizer_snapshot_path(self, step):
+        return Path(self.config.dump_folder) / f"optimizer_state_step{step}_rank{dist.get_rank()}.pt"
+
     def train_step(self, data_iterator):
+        checkpoint = self.config.checkpoint
+        if checkpoint.save_training_state and (checkpoint.load_step or 0) > 0 and self.step == checkpoint.load_step + 1:
+            expected = torch.load(
+                self._optimizer_snapshot_path(checkpoint.load_step),
+                map_location="cpu",
+                weights_only=True,
+            )
+            torch.testing.assert_close(self._optimizer_snapshot(), expected, rtol=0, atol=0)
         model = self.model_parts[0]
         frozen = {name: _cpu_tensor(p) for name, p in model.named_parameters() if not p.requires_grad}
         biases = {name: _cpu_tensor(b) for name, b in model.named_buffers() if name.endswith("expert_bias_E")}
@@ -47,6 +66,14 @@ class LoRATrainer(TrainerEx):
         assert not torch.equal(_cpu_tensor(adapter), before)
         if adapter_a.requires_grad and torch.count_nonzero(before):
             assert not torch.equal(_cpu_tensor(adapter_a), before_a)
+
+        if checkpoint.save_training_state and checkpoint.interval > 0 and self.step % checkpoint.interval == 0:
+            state = self._optimizer_snapshot()
+            fields = ("momentum_buffer", "exp_avg") if self.config.optimizer.name == "Muon" else ("exp_avg",)
+            for field in fields:
+                values = [value for name, value in state.items() if field in name]
+                assert values and any(torch.count_nonzero(value) for value in values), field
+            torch.save(state, self._optimizer_snapshot_path(self.step))
 
     def train(self):
         super().train()

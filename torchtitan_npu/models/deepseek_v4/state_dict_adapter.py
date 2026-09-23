@@ -15,20 +15,30 @@ from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDict
 from .lora import (
     _PEFT_MODULE_SUFFIXES,
     DEEPSEEK_V4_LORA_TARGETS,
+    MODULE_PATHS,
+    PEFT_PREFIX,
     DeepSeekV4LoRAConverter,
     LoRAOptions,
+    pack_expert_factor,
     peft_target_modules,
 )
 from .model import DeepSeekV4Model
 
-_PEFT_PREFIX = "base_model.model."
+OFFICIAL_WEIGHT_MAP = {
+    (f"{official}.weight" if local == "lm_head" else f"layers.{{}}.{official}.weight"): (
+        f"{local}.weight" if local == "lm_head" else f"layers.{{}}.{local}.weight"
+    )
+    for local, _, official in MODULE_PATHS
+    if ".compressor." not in local
+}
+
 _ROUTED_EXPERT_PEFT_PARAMETERS = ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
 
 
 def _peft_key(hf_weight_key: str, factor: str) -> str:
     if not hf_weight_key.endswith(".weight"):
         raise ValueError(f"PEFT LoRA base key must end in .weight: {hf_weight_key}")
-    return f"{_PEFT_PREFIX}{hf_weight_key.removesuffix('.weight')}.lora_{factor}.weight"
+    return f"{PEFT_PREFIX}{hf_weight_key.removesuffix('.weight')}.lora_{factor}.weight"
 
 
 class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
@@ -49,17 +59,12 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
         self._peft_targets = self._lora_module_names or tuple(targets)
 
         self.from_hf_map = {
+            **OFFICIAL_WEIGHT_MAP,
             "embed.weight": "tok_embeddings.weight",
-            "head.weight": "lm_head.weight",
             # Attention
             "layers.{}.attn.attn_sink": "layers.{}.attention.attn_sink",
             "layers.{}.attn.kv_norm.weight": "layers.{}.attention.kv_norm.weight",
             "layers.{}.attn.q_norm.weight": "layers.{}.attention.q_norm.weight",
-            "layers.{}.attn.wo_a.weight": "layers.{}.attention.wo_a.weight",
-            "layers.{}.attn.wo_b.weight": "layers.{}.attention.wo_b.weight",
-            "layers.{}.attn.wkv.weight": "layers.{}.attention.wkv.weight",
-            "layers.{}.attn.wq_a.weight": "layers.{}.attention.wq_a.weight",
-            "layers.{}.attn.wq_b.weight": "layers.{}.attention.wq_b.weight",
             # Norms
             "layers.{}.attn_norm.weight": "layers.{}.attention_norm.weight",
             "layers.{}.ffn_norm.weight": "layers.{}.ffn_norm.weight",
@@ -67,11 +72,7 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             "layers.{}.ffn.experts.{}.w1.weight": "layers.{}.moe.routed_experts.inner_experts.w1_EFD",
             "layers.{}.ffn.experts.{}.w3.weight": "layers.{}.moe.routed_experts.inner_experts.w3_EFD",
             "layers.{}.ffn.experts.{}.w2.weight": "layers.{}.moe.routed_experts.inner_experts.w2_EDF",
-            "layers.{}.ffn.gate.weight": "layers.{}.moe.router.gate.weight",
             "layers.{}.ffn.gate.bias": "layers.{}.moe.expert_bias_E",
-            "layers.{}.ffn.shared_experts.w1.weight": "layers.{}.moe.shared_experts.w1.weight",
-            "layers.{}.ffn.shared_experts.w3.weight": "layers.{}.moe.shared_experts.w3.weight",
-            "layers.{}.ffn.shared_experts.w2.weight": "layers.{}.moe.shared_experts.w2.weight",
             # mHC
             "layers.{}.hc_attn_base": "layers.{}.hc_attn_pre.hc_base",
             "layers.{}.hc_attn_fn": "layers.{}.hc_attn_pre.hc_fn",
@@ -83,8 +84,6 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             # the local ``mtp_layers.{depth}.*`` namespace.
             "layers.{}.enorm.weight": "layers.{}.enorm.weight",
             "layers.{}.hnorm.weight": "layers.{}.hnorm.weight",
-            "layers.{}.e_proj.weight": "layers.{}.e_proj.weight",
-            "layers.{}.h_proj.weight": "layers.{}.h_proj.weight",
             "layers.{}.norm.weight": "layers.{}.mtp_norm.weight",
             "layers.{}.hc_head_base": "layers.{}.hc_head.hc_base",
             "layers.{}.hc_head_fn": "layers.{}.hc_head.hc_fn",
@@ -242,14 +241,8 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                 # PEFT nests gate_up_proj inside down_proj, in target_parameters order.
                 if factor.startswith("w13_"):
                     prefix += ".base_layer"
-                if factor.endswith("lora_a"):
-                    value = value.reshape(-1, value.shape[-1])
-                    peft_factor = "A"
-                else:
-                    if factor == "w13_lora_b":
-                        value = torch.cat((value[:, :, 0, :], value[:, :, 1, :]), dim=1)
-                    value = value.permute(1, 2, 0).reshape(value.shape[1], -1)
-                    peft_factor = "B"
+                value = pack_expert_factor(value, factor)
+                peft_factor = "A" if factor.endswith("lora_a") else "B"
                 if isinstance(value, DTensor):
                     # DCP needs contiguous shards after flattening the expert/rank axes.
                     value = value.redistribute(placements=[Shard(0)] * value.device_mesh.ndim)

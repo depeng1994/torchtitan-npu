@@ -256,6 +256,6 @@ bash examples/deepseek_v4/deepseek_v4_flash_lora_4k_a3.sh \
   --checkpoint.interval 100
 ```
 
-该入口使用 `deepseek_v4_flash_lora` recipe（dense/expert rank 16、alpha 32），并开启 checkpoint 保存。当前 LoRA 训练仅支持 AdamW；公共 A3 launcher 默认使用 Muon，因此运行时须显式传入 `--optimizer.name AdamW`。周期 checkpoint 用于续跑，最后一步导出 PEFT adapter。模型规模、并行配置和其余默认参数继承 A3 公共入口，命令末尾的 CLI 参数仍可覆盖默认值。LoRA 暂不支持量化基座。
+该入口使用 `deepseek_v4_flash_lora` recipe（dense/expert rank 16、alpha 32），并开启 checkpoint 保存。优化器沿用 CPT 默认值，传入 `--optimizer.name` 可覆盖。周期 checkpoint 用于续跑，最后一步导出 PEFT adapter。模型规模、并行配置和其余默认参数继承 A3 公共入口，命令末尾的 CLI 参数仍可覆盖默认值。A5 使用 `deepseek_v4_flash_lora_4k_a5.sh`，直接调用 A5 CPT 入口并继承其 block-FP8 默认配置。
 
-配置、部分参数训练、native checkpoint 恢复和 PEFT 导出见 [LoRA 功能指南](../../docs/feature_guides/deepseek_v4_lora.md)。
+配置、部分参数训练、native checkpoint 恢复、PEFT 导出和离线合并见 [LoRA 功能指南](../../docs/feature_guides/deepseek_v4_lora.md)。
