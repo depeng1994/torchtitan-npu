@@ -150,7 +150,8 @@
 <ul>
 <li><strong>参数（权重）</strong>：CPU pinned 存储，forward 前异步预取到 NPU</li>
 <li><strong>梯度</strong>：backward 后 reduce-scatter 结果直接落 CPU（pinned），第二个 microbatch 起在 NPU 上做分块累加</li>
-<li><strong>优化器状态</strong>：CPU 常驻，每次 step 在 NPU 上执行更新计算</li>
+<li><strong>优化器状态</strong>：两种驻留面——默认 <strong>NPU 常驻、step 原地更新</strong>（无逐 step 往返）；
+  列出 <code>swap_optimizer</code> override 时退回 CPU 常驻 + 每 step 在 NPU 上执行更新计算</li>
 </ul>
 <p><strong>核心思想</strong>：PyTorch FSDP2 的 <code>CPUOffloadPolicy</code> 负责参数/梯度的 CPU offload 基础设施；本仓在其上补齐 NPU 侧的性能关键路径（异步预取、NPU 梯度累加、NPU 侧 clip、CPU 常驻优化器），使全 offload 训练达到可用的吞吐。</p>
 <h2 id="_3">启用方式</h2>
@@ -158,7 +159,29 @@
 <pre><code class="language-bash"># 命令行
 --training.enable-cpu-offload
 </code></pre>
-<p>且需要同步在脚本中添加torchtitan_npu.override.common.optimizer.swap_optimizer 的 overrides</p>
+<p>优化器状态的驻留面由是否列出 <code>torchtitan_npu.override.common.optimizer.swap_optimizer</code>
+的 override 决定（数据面始终 offload）：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>参数/梯度</th>
+<th>优化器状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>仅 <code>--training.enable-cpu-offload</code>（无需列 override）</td>
+<td>CPU 常驻</td>
+<td><strong>NPU 常驻</strong>，step 原地更新，无逐 step H2D/D2H 往返</td>
+</tr>
+<tr>
+<td>再列出 <code>swap_optimizer</code> override</td>
+<td>CPU 常驻</td>
+<td>CPU 常驻（历史行为），每 step H2D → NPU 计算 → D2H</td>
+</tr>
+</tbody>
+</table>
 <p>该开关同时驱动两条路径：</p>
 <table>
 <thead>
@@ -174,7 +197,7 @@
 </tr>
 <tr>
 <td>优化器容器</td>
-<td><code>swap_optimizer</code> override 分支 → <code>CpuOffloadOptimizersContainer</code>（安装 FSDP/grad-clip 补丁）</td>
+<td><code>TrainerEx</code> 默认派生 <code>CpuOffloadNpuStateOptimizersContainer</code>；列出 <code>swap_optimizer</code> 时 override 再派生 <code>CpuOffloadOptimizersContainer</code>（两者都安装 FSDP/grad-clip 补丁）</td>
 </tr>
 </tbody>
 </table>
@@ -186,11 +209,13 @@
 │   └── backward: foreach_reduce → 梯度 reduce-scatter → D2H 落 CPU pinned
 │                                    → 第二个 microbatch 起在 NPU 分块累加（本仓补丁）
 │
-├── swap_optimizer 分支 → CpuOffloadOptimizersContainer
+├── TrainerEx 默认派生 → CpuOffloadNpuStateOptimizersContainer（列出 swap_optimizer 时
+│   override 再派生 → CpuOffloadOptimizersContainer）
 │   ├── 安装 grad_accum.install() + grad_clip.install()（显式、幂等）
 │   ├── clip: NPU 侧范数计算 + 系数发布 → 优化器直接消费已缓存的 NPU 梯度
 │   └── optimizer: CpuOffloadAdamW / CpuOffloadDistributedMuon
-│       └── 每 step: CPU 参数/状态 H2D → NPU ping-pong buffer → 计算 → D2H 回 CPU
+│       ├── 状态 CPU 常驻: 每 step CPU 参数/状态 H2D → NPU ping-pong buffer → 计算 → D2H 回 CPU
+│       └── 状态 NPU 常驻: 仅 CPU 参数 H2D，状态在 NPU 原地更新，D2H 仅回写参数
 │
 └── TrainerEx → cpu_dtensor_init.install()
     └── init_weights 时 CPU DTensor 参数在 NPU 上初始化后拷回
