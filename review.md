@@ -212,3 +212,106 @@ These are **not duplicate review IDs**; they are required documentation updates 
 - The smoke uses the real detector and real DCP primitives on NPU for its happy path; the limitation is its hand-built Trainer/model/checkpointer boundary, not that it is a CPU mock.
 - There are three test functions in the unit file; the lifecycle function has two device parameters. Thus “4 passed” is structurally possible only when the NPU parameter is actually runnable; CPU-only execution would necessarily include a skip. This review does not claim either result because tests were not executed.
 - No GitCode maintainer line comment was supplied for the test/documentation files in this segment.
+
+
+## Final Cross-Check
+
+- Cross-check base for production code: `a8004a9a47aeb2a601f8eb0a89ab8c1f3ab44339` (`feat: Loss spike rollback`). Commits after it on `pr_875` only append review text.
+- Original feature commit `a8004a9` changes exactly **13 files / +2172 lines**, matching the four review segments.
+- Current mirror PR UI reports **19 changed files** because its base is still `828c0c5`, while the feature commit is based on `edb3133` (a prior master CPU-offload fix), plus this review has added `review.md`. This scope drift is handled as FC-R1 below.
+- Final overall conclusion remains **Request Changes**.
+- Of the original 28 review IDs: **24 remain effective independent findings**, **3 IDs are absorbed into stronger findings**, and **1 ID is withdrawn**. Two retained findings are severity-normalized from S2 to S3.
+
+### Scope coverage audit
+
+The original 13-file feature commit is fully covered by Parts 1–4:
+
+| Feature file in `a8004a9` | Reviewed in | Coverage |
+|---|---|---|
+| `torchtitan_npu/extensions/experiment/anticipatory_routing/detector.py` | Part 1 | Covered |
+| `torchtitan_npu/extensions/experiment/anticipatory_routing/config.py` | Part 1 | Covered |
+| `torchtitan_npu/extensions/experiment/anticipatory_routing/__init__.py` | Part 1 | Covered |
+| `torchtitan_npu/extensions/experiment/anticipatory_routing/schedule.py` | Part 2 | Covered |
+| `torchtitan_npu/extensions/experiment/anticipatory_routing/engine.py` | Part 2 | Covered |
+| `torchtitan_npu/extensions/experiment/anticipatory_routing/router.py` | Part 3 | Covered |
+| `torchtitan_npu/extensions/experiment/anticipatory_routing/cache.py` | Part 3 | Covered |
+| `torchtitan_npu/extensions/experiment/anticipatory_routing/data.py` | Part 3 | Covered |
+| `torchtitan_npu/extensions/trainer.py` | Part 3 | Covered |
+| `tests/unit_tests/test_sdc.py` | Part 3 | Covered |
+| `tests/unit_tests/extensions/experiment/anticipatory_routing/test_anticipatory_routing.py` | Part 4 | Covered |
+| `tests/smoke_tests/anticipatory_routing/test_anticipatory_routing.py` | Part 4 | Covered |
+| `docs/feature_guides/anticipatory_routing.md` | Part 4 | Covered |
+
+The five additional non-review files currently shown by the mirror PR are **not part of `a8004a9`**. They come from parent commit `edb3133` (`fix(cpu_offload): address review findings for NPU-resident optimizer state`): `docs/feature_guides/cpu_offload.md`, `tests/unit_tests/extensions/cpu_offload/test_no_optimizer_state.py`, `tests/unit_tests/override/common/test_swap_optimizer.py`, `torchtitan_npu/extensions/cpu_offload/cpu_offload_muon.py`, and `torchtitan_npu/override/common/optimizer.py`. `review.md` is the sixth extra file and is review output, not product scope.
+
+### Conflict adjudication
+
+No two production findings require opposite fixes after re-reading the implementation. The apparent conflicts below are scope/wording tensions; the final ruling is:
+
+| Involved findings / statements | Apparent conflict | Final ruling |
+|---|---|---|
+| P2-R2 vs Part 2 “`_isolated_forward` restores RNG” verification and the feature guide's RNG statement | One says RNG is restored; one says rollback does not restore RNG. | **No conflict.** They refer to different boundaries. `_isolated_forward()` correctly restores the *current* Python/NumPy/PyTorch RNG after WARMUP capture. DCP rollback to an earlier checkpoint does **not** restore checkpoint-time RNG because upstream v0.3.0 `Trainer.state_dict()` contains only `step` and `ntokens_seen`. Keep P2-R2 as an explicit rollback-semantic concern; do not weaken the verified forward-isolation statement. |
+| P2-R6 vs Part 2 verification that NORMAL/ACTIVE/DRAIN queue arithmetic drains correctly | One criticizes `_queue.clear()`; one says the queue drains correctly. | **No conflict.** Normal ACTIVE→DRAIN→NORMAL drain is correct. P2-R6 is specifically about redundant/dead cleanup surfaces: `AnticipatorySchedule.close()` has no caller, and NORMAL→WARMUP clears a queue that should already be empty. Keep P2-R6. |
+| P3 Part 3 verification that the HostSparse conflict resolution is correct vs FC-R1 mirror-scope finding | Part 3 says the squash merge preserved HostSparse correctly; FC-R1 says CPU-offload files should not be in this PR diff. | **No conflict.** The HostSparse code in `trainer.py` is correct relative to parent `edb3133`; it must **not** be reverted. The problem is that GitHub mirror `master` is still at `828c0c5`, so the already-merged master commit `edb3133` appears as part of PR #24. Fix the mirror base/rebase, not the HostSparse implementation. |
+| P2-R4 vs `schedule.py` Phase docstring claiming checkpointing/validation/profiling keep upstream cadence | The code comment claims preserved cadence while P2-R4 shows rollback rewinds `trainer.step` before the outer `train()` tail. | **P2-R4 wins.** The docstring/comment is too strong under the current implementation. Retain P2-R4 and expand its fix to update this statement (and any equivalent feature-guide wording) once the post-step rollback contract is fixed. |
+| P3-R2 severity | Initially S2, but the malformed-shape case requires an internal cache contract violation; the normal producer records the exact router output shape. | **Downgrade to S3.** Exact-shape validation and removing `zeros_like()+copy_` remain worthwhile defensive/performance cleanup, but this is not an independently demonstrated user-facing correctness failure in the current producer/consumer path. |
+| P3-R3 severity | Initially S2, assuming all-hash routers make the feature semantically invalid. | **Downgrade to S3.** All-hash models can still receive loss-spike rollback; fixed hash routing simply makes delayed route replay unnecessary. The valid issue is wasted WARMUP/queue work and ambiguous product semantics, not incorrect expert selection. Keep the “fail/explicit rollback-only no-op/bypass work” decision, but treat it as cleanup/product clarity. |
+
+### Duplicate merge / consolidation
+
+| Retained finding | Absorbed finding(s) | Final consolidated finding |
+|---|---|---|
+| **P3-R4 (S2)** | **P1-R5** | One architecture issue: keep the cross-field validation **call site** at `TrainerEx.Config.__post_init__()`, but move `validate_anticipatory_config` implementation out of runtime `engine.py` into `config.py`; then lazy-import router/schedule runtime only when enabled and use the optional schedule object as the hot-path switch. This preserves the valid maintainer conclusion about validation placement while reducing experiment leakage from the common Trainer. |
+| **P1-R1 / P1-R2 / P1-R3 / P1-R4** | **P4-R2** | P4-R2 is not a separate product defect; it is the missing regression coverage for the four detector defects. Each retained detector finding now includes its corresponding acceptance test: sustained onset freeze, cooldown across rewind, degenerate variance/non-finite state, and NaN/Inf config validation. Do not keep a standalone “detector tests missing” review item after these are fixed. |
+| **P2-R5 (S2)** | **P4-R3** | One checkpoint-completeness issue: strengthen target selection from prefix existence to complete required-state metadata and cover it with an older-complete/newer-incomplete checkpoint regression. The test gap is acceptance criteria for P2-R5, not a second independent finding. |
+| **P2-R8 (S3)** | The `SuppliedBatches` sub-point inside **P3-R6** | P2-R8 owns the duplicate one-shot iterator issue (`SuppliedMicrobatches` vs unused `SuppliedBatches`). P3-R6 remains only for the independent `PrefetchedStep` → `StepData` duplicate data container. |
+| Existing production IDs P1-R1, P1-R6, P2-R1, P2-R4, P2-R5, P3-R3 | Part 4 “Documentation consistency with earlier production findings” rows | Those Part 4 rows are documentation sync requirements, not new IDs. Keep them attached to the corresponding production finding. Add P2-R4's cadence/docstring correction, which Part 4 omitted. |
+
+### Withdrawal / hallucination self-check
+
+| ID | Final status | Re-check result |
+|---|---|---|
+| **P2-R7** | **撤回** | `schedule.py::_check_staleness` uses `assert` for an internal queue/lag invariant. Repository `.agents/AGENTS.md` explicitly says `assert` is appropriate for **program-error internal invariants**; this check is exactly that category. The earlier review over-weighted `python -O` behavior and incorrectly demanded a user-facing `RuntimeError`. No change required solely for this point. |
+
+All other original IDs can be located in the reviewed feature diff and remain technically supportable after the consolidations/severity changes above. For completeness, the per-ID final disposition is:
+
+| ID | Final disposition | Evidence / final note |
+|---|---|---|
+| P1-R1 | Keep S1 | `detector.py::_maybe_update_statistics` resets `_frozen_steps` after one accepted sample, allowing repeated freeze windows. |
+| P1-R2 | Keep S1 | Cooldown uses rewound logical `step`; `reset()` preserves `_last_trigger_step`. |
+| P1-R3 | Keep S2 | Fixed `1e-12` denominator makes near-zero residual variance hypersensitive; non-finite variance can poison later detection. |
+| P1-R4 | Keep S2 | NaN/Inf thresholds are not explicitly rejected; NaN bypasses the current comparisons. |
+| P1-R5 | **Absorbed into P3-R4** | Call-site conclusion retained; ownership/import issue consolidated. |
+| P1-R6 | Keep S2 | `max_rollbacks=0` is documented as no rollback, and schedule checks budget before target lookup, yet validation still requires writable checkpointing. |
+| P2-R1 | Keep S1 | Schedule counts only gradient-accumulation groups, while upstream PP fetches an extra `num_pipeline_parallel_microbatches` dimension; forward-only also directly calls `model_parts[0]`. |
+| P2-R2 | Keep S2 | Upstream v0.3.0 `Trainer.state_dict()` stores only step/token count; checkpoint-time RNG is not restored. |
+| P2-R3 | Keep S2 | Rollback hard-codes `zero_grad(set_to_none=True)` instead of upstream's CUDA-graph-sensitive policy. |
+| P2-R4 | Keep S2, expanded | Rollback rewinds `trainer.step` inside `train_step`, but outer `train()` still runs save/validation/profiler/timeout tail; also correct the overstated cadence docstring/docs. |
+| P2-R5 | Keep S2 | Non-model required states are validated only by top-level prefix presence; absorb P4-R3 test requirement. |
+| P2-R6 | Keep S3 | `schedule.close()` is uncalled and NORMAL→WARMUP queue clear is redundant under the phase invariant. |
+| P2-R7 | **撤回** | Internal invariant `assert` is allowed by repository policy. |
+| P2-R8 | Keep S3 | Two one-shot supplied-batch iterators duplicate one semantic. |
+| P3-R1 | Keep S2 | Enabled `batch_generator(data_iterable)` discards its argument and always uses the trainer-owned wrapper. |
+| P3-R2 | **Keep, downgrade S3** | Broadcast-capable `copy_` plus zero-fill is unnecessary; exact-shape check/direct int64 conversion is cleaner, but current normal producer gives matching shapes. |
+| P3-R3 | **Keep, downgrade S3** | All-hash routers make replay caching unnecessary, but rollback itself can still be meaningful; classify as wasted work/ambiguous mode rather than correctness. |
+| P3-R4 | Keep S2; absorbs P1-R5 | Runtime experiment import/config coupling remains broader than necessary. |
+| P3-R5 | Keep S3 | Cache `device` field/argument is passive and unread. |
+| P3-R6 | Keep S3, narrowed | Keep only the redundant `PrefetchedStep` container issue; iterator duplication belongs to P2-R8. |
+| P3-R7 | Keep S3 | `auto` claims narrowest representable type but lacks int64 fallback past int32 range. |
+| P4-R1 | Keep S1 | Unit/smoke manually construct the mechanism; no registered integration case exercises CLI/config converter/override/real model/checkpointer path. |
+| P4-R2 | **Absorbed into P1-R1..R4** | Detector regression coverage becomes acceptance criteria of those production findings. |
+| P4-R3 | **Absorbed into P2-R5** | Completeness/fallback regression becomes acceptance criteria of checkpoint-selection finding. |
+| P4-R4 | Keep S2 | Test manually sets `engine.failed`; it does not prove exception→failure cleanup→save suppression transition. |
+| P4-R5 | Keep S2 | Documented debug script leaves `checkpoint.load_only=True`; validator deterministically rejects the shown anticipatory invocation. |
+| P4-R6 | Keep S3 | PR body points pytest at a non-existent `tests/unit_tests/experiments/...` path instead of `tests/unit_tests/extensions/experiment/...`. |
+| P4-R7 | Keep S3 | NPU parametrization is in CPU-UT tree and duplicates NPU execution layer; `HashRouter` imports are unused in both new test files. |
+
+### New supplemental findings
+
+| ID | Severity | Location / evidence | New finding | Required action |
+|---|---|---|---|---|
+| **FC-R1** | S2 | Mirror PR #24 current base `828c0c5`; first branch commit `edb3133`; feature commit `a8004a9` parent=`edb3133`; current Files changed=19 | **The mirror PR currently contains unrelated already-merged master work because the mirror base is stale.** `edb3133` is the prior master CPU-offload fix (!914) and contributes five CPU-offload files before the 13-file anticipatory commit. This is why the current PR no longer matches its advertised “+2172 / 13 files” scope. Treating those files as PR875 changes would mix two reviews and make future merge history misleading. | Sync the GitHub mirror `master` so it contains `edb3133` (or rebase/recreate the mirror PR onto a base that contains it), then verify the product diff collapses back to the 13 anticipatory files. **Do not revert the HostSparse/CPU-offload changes from the feature branch**, because they are prerequisite master content, not PR875 code. `review.md` may remain as review-only output per this review workflow. |
+
+### Final effective blockers
+
+After consolidation, the merge-blocking/core correctness set is: **P1-R1, P1-R2, P2-R1, P4-R1**, plus the S2 correctness/architecture issues that must be resolved or explicitly scoped out before merge: **P1-R3, P1-R4, P1-R6, P2-R2, P2-R3, P2-R4, P2-R5, P3-R1, P3-R4, P4-R4, P4-R5, FC-R1**. S3 items are cleanup/maintainability and should be addressed opportunistically in the same simplification pass, especially where deletion reduces PR complexity.
