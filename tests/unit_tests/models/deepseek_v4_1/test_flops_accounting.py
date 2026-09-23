@@ -86,7 +86,7 @@ def test_flops_are_window_plus_compressed_plus_hierarchical_indexer(
     assert nparams == 0
     assert flops == expected
 
-    
+
 
 def test_flash_4k_full_model_flops_keep_engram_as_lookup_storage():
     """Real model coverage: Engram tables count toward size, not dense 6P."""
