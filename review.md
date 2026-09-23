@@ -188,3 +188,67 @@
 
 本轮不需要新增 Config、env、专用 shell 或新的 testcase 文件；R4 应继续收敛在已经新增的 2-rank UT 上。
 
+## Re-review Round 2 (dc480ec)
+
+> Re-review source: GitCode head `dc480ec`, mirrored as squash branch `pr_891_v2@e0ba27de437a3827daa8fdcb0c7810bbf9cf01e9`.  
+> Previous re-review source: `e535f4ea3301198fdaadbe1ba92c3a79e43af818`.  
+> 测试执行：**未执行（仅静态审查）**。本轮按 `.agents/skills/developer-tests-review` 的 review 测试规则核对生产代码、CPU UT、NPU integration 定义、runner 注册与固定 TorchTitan v0.3.0 调用链。  
+> 本节只重新裁决上一轮仍回写在 GitCode 上的 R1 / R2 / R4 / R5 / R6；R3 保持上一轮“已解决”。
+
+### 1. 五条意见最终裁决
+
+| ID | 最终状态 | 新 head 证据 | 最终裁决 | 已回写 GitCode 评论处理 |
+|---|---|---|---|---|
+| R1 | **已解决** | `torchtitan_npu/models/deepseek_v4_1/engram/checkpoint.py:6-19` 已不再定义 Tensor subclass；当前 `checkpoint_shard()` 对普通 `weight.detach()` 设置 `global_shape/global_offsets/local_offsets/local_sizes`，并仅附加 `_engram_native_key/_engram_valid_rows` 两个 adapter-local marker。原 `_make_wrapper_subclass`、`__torch_dispatch__`、`__create_chunk_list__`、`__create_write_items__`、`__get_tensor_shard__` 均已删除。 `state_dict_adapter.py:252-269` 的 EP shard 路径改为调用 `checkpoint_shard()`；`:180-183` 仅用最小 marker 恢复 native key/padding。新 2-rank worker `tests/unit_tests/models/deepseek_v4_1/engram_hf_worker.py:53-67` 先按生产顺序把 native state 转 BF16，再 `to_hf`，并在 `:56` 明确断言 Engram shard 的运行时类型就是普通 `torch.Tensor`。 | 这正是 Final Cross-Check 对 R1 的条件式目标：**能复用 pinned DCP 的 CheckpointableTensor duck-typing 时删除 wrapper，只保留独立产品语义所需的最小 marker。** 当前实现已做到；不再保留 R1 blocker。 | **需刷新重发并关闭原意见。** 原评论关于 wrapper/subclass/dunder 复杂度已被实质修复。 |
+| R2 | **已解决** | 共享层 `torchtitan_npu/extensions/mx_storage_reader/common.py` 已集中承载：E8M0 dtype 兼容 `:36-39`、`.weight/.scale` sidecar discovery `:46-52`、safetensors/DCP shard metadata 扫描与 raw storage map `:55-114`、跨文件 region read `:116-148`。通用 reader `hf_storage.py:82-106` 通过 `SafetensorsReaderMixin` 复用 raw metadata，`:133-162` 只保留通用 MX shape/packing 识别。Engram reader 已移到 `extensions/mx_storage_reader/engram.py`，`:32` 继承同一个 mixin；`:50-90` 只做 Engram scale/geometry 校验与 mapping，`:104-136` 只做 1×32 / 32×32 block alignment 和 CPU dequant。新增 `tests/unit_tests/extensions/mx_storage_reader/test_engram_reader.py:34-76` 覆盖 scale 与 weight 跨文件、row/block 两种 geometry、非零 slice offset 和 unknown/orphan scale fail-loud。 | 上一轮要求的两点均满足：**公共 HF metadata/private plumbing 下沉共享；Engram-specific 层只保留真正不同的 geometry/CPU dequant 语义。** `_HFStorageInfo/_getdtype` 等上游 private 依赖仍存在，但已集中到一个 common seam，不再维护两份平行实现；这符合前一轮收敛方案。R2 可关闭。 | **需刷新重发并关闭原意见。** 原“两套 reader 平行维护”的事实已过时。 |
+| R4 | **已解决** | `engram_hf_worker.py:33-46` 在 rank0 生成 mini `model.safetensors.index.json`，为 Engram embed 与 q_weight 指定两个 HF shard；`:50-58` 同时遍历 mapped/unmapped 两种 adapter，其中 mapped 传真实 assets path，得到非空 `fqn_to_index_mapping`。`:59-73` 与 TorchTitan v0.3.0 的生产分支一致：mapped 时先写 `sharded/`、传 `fqn_to_index_mapping`、关闭 writer 内 consolidation，再调用 `consolidate_safetensors_files_on_every_rank`；unmapped 走 writer 内 consolidation。`:53-55` 已修正 dtype 顺序：**先把 native state 转 BF16，再调用 `adapter.to_hf`**，且使用的是支持的 `bfloat16`，不再是上一轮的 post-`to_hf` float64 模拟。`:74-88` readback 同时检查 41 logical rows、mapped q_weight、rank boundary 与 native padding 清零。 | 上一轮 R4 剩余的两个缺口——**mapped consolidation 分支**和**真实 export_dtype 顺序/受支持 dtype**——均已补齐；原 2-rank distributed save 主体也保留。R4 可关闭。 | **需刷新重发并关闭原意见。** 旧评论里“未覆盖 mapped consolidation / dtype 顺序”的内容已失效。 |
+| R5 | **部分解决** | 新增的 ST 结构本身已覆盖原要求的大部分真实链路：`tests/integration_tests/engram_hf.py:20-23` 直接包装仓内真实 `CheckpointManager.dcp_save/dcp_load`；`:26-53` snapshot 同时抓 Engram 参数与 `_quantized_storage/_quantized_scale` 有效行字节，并在无 cache 时 fail；`:69-77` 调用真实 load 后逐 rank 与 source snapshot 精确比较；`:80-91` 注册 4-NPU `dsv41_engram_mxfp8_hf_ep4`；`:95-125` 再比较 native-load 与 HF-load 两次 3-step 训练的 loss/grad_norm。 `run_engram_hf.sh:17-23` 显式启用 `host_offload_mxfp8`、EP4/FSDP4、4 NPU；`:36-47` 复用真实 A5 Trainer 入口。 `run_tests.py:52-67` 已把它注册为 `deepseek_v4_1_engram_hf` suite。**但 launcher 当前有一个确定的静态错误：**基础 A3 脚本 `examples/deepseek_v4_1/deepseek_v4_1_flash_cpt_4k_a3.sh:30-32` 默认把 `CKPT_INIT_LOAD_PATH` 设成 `/path/to/init_load_ckpt`，`:119-125` 又无条件传 `--checkpoint.initial-load-path ... --checkpoint.initial-load-in-hf`。而 `run_engram_hf.sh:24-34` 的 source phase 只覆盖 `load-only/last-save`，**没有清空 initial-load-path、也没有关闭 initial-load-in-hf**；native phase 虽改成 native DCP 路径，**同样没有关闭 initial-load-in-hf**。固定 TorchTitan v0.3.0 会因此让 source 尝试从占位路径初始加载，让 native phase 把 DCP 目录按 HF safetensors 读取，无法形成设计中的 fresh-source → native-load → HF-load 三阶段闭环。 | **ST 设计与断言已达到可以关闭 R5 的强度，但当前启动参数使它尚不能证明目标路径。** 最小修复应只改现有 `run_engram_hf.sh`：source phase 显式给 falsy `initial_load_path` 并传 `--checkpoint.no-initial-load-in-hf --checkpoint.no-initial-load-in-hf-quantized`；native phase 显式传 `--checkpoint.no-initial-load-in-hf --checkpoint.no-initial-load-in-hf-quantized`；HF phase 保持 `initial-load-in-hf` 并最好显式关闭 quantized flag。修复后按 README 的 4-NPU 命令实际运行并保存 PASS 证据即可关闭 R5。另有一处同类文档小不一致：`tests/integration_tests/README.md:6` 仍写“当前注册 DeepSeek-V4 与 DeepSeek-V3.2”，表格 `:10-24` 也未列新 V4.1 case，建议随 launcher 修复一起刷新；不单独新增 review ID。 | **需刷新重发，但保持 unresolved。** 原评论“没有真实 NPU ST”已不准确，应替换为“ST 已落地，但 source/native checkpoint mode 被基础脚本默认 HF 参数污染”；修复并有真实运行证据后再关闭。 |
+| R6 | **已解决** | `examples/deepseek_v4_1/readme.md:74-82` 新增完整 Checkpoint 加载范围：`:78` 原生 DCP、`:79` 普通 HF、`:80` 明确写出 `--checkpoint.initial-load-in-hf-quantized` 及其与训练 MXFP8 override 独立，`:82` 明确限定“当前只补 Engram 表/gate 的 MXFP8 seam，非 Engram 官方整包量化权重仍不能据此直接训练”，并说明 HF export 不生成官方 MXFP8 发布格式。 `tests/integration_tests/README.md:130-143` 也补了 Engram HF 专项验证范围和不覆盖项。 | 原 R6 的 CLI 使用方法与支持边界均已补齐，没有新增 env/config/shell 用户入口。R6 可关闭。 | **需刷新重发并关闭原意见。** 原文档缺口已修复。 |
+
+### 2. R5 新 ST 的覆盖边界
+
+从静态代码看，launcher 参数问题修正后，这个 case 已经具备关闭原 R5 所需的全部观测点：
+
+| R5 要求 | 当前实现 |
+|---|---|
+| 真实 NPU，而不是 CPU/Gloo 替代 | `engram_hf.py:83-91` 声明 4 NPU；`run_engram_hf.sh:18-23,36-47` 进入真实 A5 训练 launcher 与 NPU override |
+| 真实 `CheckpointManager` initial HF load | `engram_hf.py:20-23,69-77` 包装真实 extension CheckpointManager 的 `dcp_load`，不替换 load 实现；HF phase `run_engram_hf.sh:33` 指向 source 生成的 HF checkpoint |
+| MXFP8 Host Engram post-load cache rebuild | `host_offload_mxfp8` override 在 `run_engram_hf.sh:17` 被显式选中；snapshot `engram_hf.py:39-53` 要求 `_quantized_storage/_quantized_scale` 存在，并比较 load 前 source 与 load 后每 rank 有效行的原始字节 |
+| load 后真实训练 | native/HF 两个 phase 都跑 3 steps；`engram_hf.py:95-125` 比较 step 1-3 的 `loss_metrics/global_avg_loss` 与 `grad_norm`，要求 finite 且逐值相等 |
+| 现有 integration runner 注册 | `run_tests.py:52-67` 注册 opt-in suite；README `:134-139` 给出标准 runner 调用 |
+
+因此 **R5 不是“缺测试设计”了，而是“测试设计已经足够，但当前参数接线让测试不能按设计运行”**。该专项 suite 是明确的硬件型 opt-in case，不进入默认 `models` CI 本身不构成新的 blocker；但本轮是静态 review，不能把“代码里有 case”写成“ST 已通过”。修复 flags 后仍需实际运行并留存结果。
+
+### 3. Round-2 架构/Reducer 复核
+
+本轮没有发现需要新增 R7 的生产问题：
+
+- `checkpoint.py` 从约 190 行 wrapper/reader 混合文件收敛到 19 行纯 shard-protocol helper，**删除复杂度方向正确**。
+- R2 的共享抽取把原来两份 safetensors plumbing 收到一个 `common.py`；新增 `engram.py` 的独立文件有明确剩余语义（Engram 1×32/32×32 geometry + CPU dequant），不是重复 wrapper。
+- 当前 `state_dict_adapter.py` 不再存在 `prepare_dcp_state_dict`，也没有 `getattr(...prepare_dcp_state_dict...)` fallback；它只消费 `checkpoint_shard` 与 shared Engram reader。
+- 当前 canonical `torchtitan_npu/scripts/checkpoint_conversion/convert_to_hf.py` 仍是上一轮确认过的 plugin-owned 实现（约 276 行）；**从 e535f4e 到本轮 squash 的 13-file diff 并没有再次修改这个文件**。其 `load_dcp_model()` 仍显式 fail-loud，standard/quantized exporter 继续直接复用；patch 仍只是 28 行 re-export shim。
+- 对 `state_dict_adapter.py`、canonical converter、quantized exporter、patch shim 再次全文检查，均没有重新出现 `prepare_dcp_state_dict` 或针对它的 `getattr` 静默兜底。
+
+### 4. 最终统计与 Merge Gate
+
+| 状态 | 数量 | IDs |
+|---|---:|---|
+| **已解决** | **4** | R1、R2、R4、R6 |
+| **部分解决** | **1** | R5 |
+| **维持** | **0** | - |
+| **新增** | **0** | - |
+
+**最终 Merge Gate：Request Changes。**
+
+现在只剩一个实质 gate：修正 `tests/integration_tests/run_engram_hf.sh` 的三阶段 checkpoint mode 继承问题，并用注册好的 4-NPU `deepseek_v4_1_engram_hf` suite 实际跑通；同时把 integration README 顶部“已注册模型/测试矩阵”同步到 V4.1。测试专项结论为：**补充测试后合入**（更准确地说，是修正已新增 ST 的启动参数并完成真实执行证据）。
+
+### 5. GitCode 已回写评论处理汇总
+
+| ID | 处理方式 |
+|---|---|
+| R1 | **需刷新重发**：说明 wrapper 已删除并改用 upstream CheckpointableTensor duck-typing，随后关闭该意见 |
+| R2 | **需刷新重发**：说明 common I/O 已抽取、Engram 层已缩薄，随后关闭该意见 |
+| R4 | **需刷新重发**：说明 mapped consolidation 与真实 BF16 dtype 顺序均已覆盖，随后关闭该意见 |
+| R5 | **需刷新重发并保持 unresolved**：删除“没有 NPU ST”的旧表述，改为 source/native phase 继承基础脚本 HF 初始加载参数导致路径错误；修复 + 实跑后关闭 |
+| R6 | **需刷新重发**：说明 CLI/支持边界文档已补齐，随后关闭该意见 |
+
