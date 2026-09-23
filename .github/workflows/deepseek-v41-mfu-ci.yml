@@ -1,0 +1,41 @@
+name: DeepSeek V4.1 MFU CI
+
+on:
+  push:
+    branches:
+      - fix/deepseek-v41-mfu-flops
+
+permissions:
+  contents: read
+
+jobs:
+  focused-cpu:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned PyTorch and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --pre --index-url https://download.pytorch.org/whl/nightly/cpu             torch==2.14.0.dev20260719
+          git clone --depth 1 --branch v0.3.0 https://github.com/pytorch/torchtitan.git /tmp/torchtitan
+          python -m pip install -e /tmp/torchtitan
+          python -m pip install --no-deps -e .
+          python -m pip install pytest attn-gym==0.0.9 scipy tokenizers
+
+      - name: Run focused MFU unit tests
+        env:
+          TORCHTITAN_DIR: /tmp/torchtitan
+        run: |
+          python -m pytest -v --tb=short             tests/unit_tests/models/deepseek_v4_1/test_flops_accounting.py
+
+      - name: Compile changed Python files
+        run: |
+          python -m py_compile             torchtitan_npu/models/deepseek_v4_1/model.py             tests/unit_tests/models/deepseek_v4_1/test_flops_accounting.py
