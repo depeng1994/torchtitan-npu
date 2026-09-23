@@ -33,16 +33,6 @@ class _NoParameters:
         return iter(())
 
 
-class _NamedParameters:
-    """Minimal named-parameter model for testing the 6P correction."""
-
-    def __init__(self, parameters):
-        self._parameters = parameters
-
-    def named_parameters(self):
-        return iter(self._parameters)
-
-
 @pytest.mark.parametrize(
     ("flavor", "seq_len", "expected"),
     (
@@ -96,26 +86,24 @@ def test_flops_are_window_plus_compressed_plus_hierarchical_indexer(
     assert nparams == 0
     assert flops == expected
 
+    
 
-def test_engram_table_counts_as_storage_not_dense_matmul_flops():
-    """Engram table rows stay in model size but do not contribute a full 6P."""
+def test_flash_4k_full_model_flops_keep_engram_as_lookup_storage():
+    """Real model coverage: Engram tables count toward size, not dense 6P."""
 
-    config = model_registry("deepseek_v4_1_debugmodel").model
-    _, attention_only = config.get_nparams_and_flops(
-        _NoParameters(),
-        seq_len=512,
-    )
+    config = model_registry("deepseek_v4_1_flash").model
+    with torch.device("meta"):
+        model = config.build()
 
-    table = torch.nn.Parameter(torch.empty(11, 7))
-    gate_projection = torch.nn.Parameter(torch.empty(5, 3))
-    model = _NamedParameters(
-        (
-            ("layers.1.engram.table.weight", table),
-            ("layers.1.engram.gate.wkv", gate_projection),
-        )
-    )
+    engram_tables = [
+        layer.engram.table.weight
+        for layer in model.layers.values()
+        if layer.engram is not None
+    ]
+    engram_table_nparams = sum(table.numel() for table in engram_tables)
 
-    nparams, flops = config.get_nparams_and_flops(model, seq_len=512)
+    nparams, flops = config.get_nparams_and_flops(model, seq_len=4096)
 
-    assert nparams == table.numel() + gate_projection.numel()
-    assert flops == attention_only + 6 * gate_projection.numel()
+    assert engram_table_nparams == 196_614_815_744
+    assert nparams == sum(parameter.numel() for parameter in model.parameters())
+    assert flops == 107_101_336_224
