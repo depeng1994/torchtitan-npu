@@ -567,6 +567,7 @@ def _patch_trainer_sdc_flow(monkeypatch) -> tuple[list[object], TrainerEx.Config
         "TrainerEx.Config",
         SimpleNamespace(
             sdc=SimpleNamespace(build=build_sdc),
+            anticipatory=SimpleNamespace(enable=False),
             extension=SimpleNamespace(quantization=SimpleNamespace(enable_quantized_training=False)),
             training=SimpleNamespace(extension=SimpleNamespace(allow_hf32=True)),
         ),
@@ -574,6 +575,7 @@ def _patch_trainer_sdc_flow(monkeypatch) -> tuple[list[object], TrainerEx.Config
 
     def base_init(trainer: TrainerEx, received_config: object) -> None:
         events.append(("base-init", received_config))
+        trainer.config = received_config
         trainer.init_distributed()
         trainer.model_parts = ["model"]
         trainer.gradient_accumulation_steps = 2
@@ -629,6 +631,7 @@ def test_trainer_failed_backward_does_not_advance_gradient_accumulation(monkeypa
     sdc = _build_gradient_sdc([model], accumulation_steps=2)
     trainer = cast("TrainerEx", object.__new__(TrainerEx))
     vars(trainer)["_sdc"] = sdc
+    vars(trainer)["config"] = SimpleNamespace(anticipatory=SimpleNamespace(enable=False))
     outcomes = iter(["ok", "failure", "ok"])
 
     def forward_backward_step(_trainer: Trainer, *_args: Any, **_kwargs: Any) -> str:
