@@ -18,9 +18,11 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any
 
+import torch
 from torch.distributed.tensor import DTensor
 from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 
+from .engram.checkpoint import EngramCheckpointTensor, EngramHuggingFaceStorageReader, dequantize_engram_weight
 from .indexer import REUSE
 
 if TYPE_CHECKING:
@@ -38,7 +40,9 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
 
     def __init__(self, model_config, hf_assets_path):
         self._vision_adapter: DeepSeekV41VisionStateDictAdapter | None = None
-        self._has_engram = any(getattr(layer, "engram", None) is not None for layer in model_config.layers)
+        self._engram_tables = {
+            i: layer.engram.table for i, layer in enumerate(model_config.layers) if layer.engram is not None
+        }
         super().__init__(model_config, hf_assets_path)
 
         self.from_hf_map = {
@@ -65,6 +69,11 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
             "layers.{}.ffn.shared_experts.w1.weight": "layers.{}.moe.shared_experts.w1.weight",
             "layers.{}.ffn.shared_experts.w3.weight": "layers.{}.moe.shared_experts.w3.weight",
             "layers.{}.ffn.shared_experts.w2.weight": "layers.{}.moe.shared_experts.w2.weight",
+            # Engram
+            "layers.{}.engram.embed.weight": "layers.{}.engram.table.weight",
+            "layers.{}.engram.wkv.weight": "layers.{}.engram.gate.wkv",
+            "layers.{}.engram.q_weight": "layers.{}.engram.gate.q_weight",
+            "layers.{}.engram.k_weight": "layers.{}.engram.gate.k_weight",
             # mHC
             "layers.{}.hc_attn_base": "layers.{}.hc_attn_pre.hc_base",
             "layers.{}.hc_attn_fn": "layers.{}.hc_attn_pre.hc_fn",
@@ -127,7 +136,6 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
         return self._vision_adapter is not None and self._vision_adapter.owns_local_key(key)
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
-        self._check_engram_hf_support()
         vision_hf = {k: v for k, v in hf_state_dict.items() if self._owns_vision_hf_key(k)}
         base_hf = {k: v for k, v in hf_state_dict.items() if not self._owns_vision_hf_key(k)}
         result = self._from_hf_text(base_hf)
@@ -135,12 +143,45 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
             result.update(self._vision_adapter.from_hf(vision_hf))
         return result
 
-    def _check_engram_hf_support(self):
-        if self._has_engram:
-            raise NotImplementedError("Engram HF conversion is not supported; use native DCP with the same EP degree")
+    def prepare_dcp_state_dict(self, state_dict, metadata):
+        """Load an EP-sharded native checkpoint into an offline full CPU model.
+
+        The destination views share storage with the original state dict, so
+        the generic converter can continue using canonical parameter names.
+        """
+        targets = dict(state_dict)
+        for layer_id in self._engram_tables:
+            key = f"layers.{layer_id}.engram.table.weight"
+            if key not in targets or key in metadata.state_dict_metadata:
+                continue
+            shards = sorted(k for k in metadata.state_dict_metadata if k.startswith(key + ".ep_shard_"))
+            if not shards:
+                continue
+            target = targets.pop(key)
+            offset = 0
+            for rank, shard_key in enumerate(shards):
+                suffix = f".ep_shard_{rank:05d}_of_{len(shards):05d}"
+                if shard_key != key + suffix:
+                    raise ValueError(f"Incomplete Engram checkpoint shards for {key}")
+                shape = metadata.state_dict_metadata[shard_key].size
+                if shape[1] != target.shape[1] or offset + shape[0] > target.shape[0]:
+                    raise ValueError(f"Engram checkpoint geometry differs from model config: {shard_key}")
+                targets[shard_key] = target[offset : offset + shape[0]]
+                offset += shape[0]
+            if offset != target.shape[0]:
+                raise ValueError(f"Engram checkpoint does not cover the full table: {key}")
+        return targets
+
+    def get_hf_storage_reader(self, path: str, from_quantized: bool = False):
+        if self._engram_tables:
+            shapes = {
+                f"layers.{i}.engram.embed.weight": (sum(config.head_vocab_sizes), config.embedding_dim)
+                for i, config in self._engram_tables.items()
+            }
+            return EngramHuggingFaceStorageReader(path, table_shapes=shapes, from_quantized=from_quantized)
+        return super().get_hf_storage_reader(path, from_quantized)
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-        self._check_engram_hf_support()
         vision_local = {k: v for k, v in state_dict.items() if self._owns_vision_local_key(k)}
         base_local = {k: v for k, v in state_dict.items() if not self._owns_vision_local_key(k)}
         result = self._to_hf_text(base_local)
@@ -155,7 +196,36 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
         expert_weights = {}
 
         for key, value in hf_state_dict.items():
-            if any(t in key for t in ("compressor", "indexer")):
+            if ".engram." in key:
+                if key.endswith(".scale"):
+                    continue
+                layer_id = int(key.split(".")[1])
+                if layer_id not in self._engram_tables:
+                    raise ValueError(f"HF checkpoint contains Engram for unconfigured layer {layer_id}")
+                abstract = re.sub(r"(\d+)", "{}", key, count=1)
+                local_key = self.from_hf_map[abstract].format(layer_id)
+                if isinstance(value, EngramCheckpointTensor):
+                    value.weight[value.rows.shape[0] :].zero_()
+                    state_dict[value.key] = value.weight
+                    continue
+                scale = hf_state_dict.get(key.removesuffix("weight") + "scale") if key.endswith(".weight") else None
+                if scale is not None:
+                    value = dequantize_engram_weight(value, scale, row_block=1 if ".embed." in key else 32)
+                elif value.dtype == torch.float8_e4m3fn:
+                    raise ValueError(f"Missing scale for quantized Engram weight {key}")
+                if key.endswith(".embed.weight"):
+                    config = self._engram_tables[layer_id]
+                    logical_rows = sum(config.head_vocab_sizes)
+                    if tuple(value.shape) != (logical_rows, config.embedding_dim):
+                        raise ValueError(f"Unexpected HF Engram table shape for {key}: {value.shape}")
+                    padded = torch.zeros(
+                        (config.num_embeddings, config.embedding_dim), dtype=torch.float32, device="cpu"
+                    )
+                    padded[:logical_rows].copy_(value)
+                    value = padded
+                state_dict[local_key] = value
+
+            elif any(t in key for t in ("compressor", "indexer")):
                 state_dict[self.from_hf_map[key]] = value
 
             elif "ffn.experts" in key:
@@ -206,7 +276,26 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
         hf_state_dict = {}
 
         for key, value in state_dict.items():
-            if any(t in key for t in ("compressor", "indexer")):
+            if ".engram.table.weight" in key:
+                match = re.fullmatch(r"layers\.(\d+)\.engram\.table\.weight(?:\.ep_shard_(\d+)_of_(\d+))?", key)
+                if match is None:
+                    raise ValueError(f"Unexpected Engram table key: {key}")
+                layer_id = int(match[1])
+                config = self._engram_tables[layer_id]
+                rank, size = (int(match[2]), int(match[3])) if match[2] else (0, 1)
+                if not 0 <= rank < size or config.num_embeddings % size:
+                    raise ValueError(f"Invalid Engram EP shard: {key}")
+                shard_rows = config.num_embeddings // size
+                if tuple(value.shape) != (shard_rows, config.embedding_dim):
+                    raise ValueError(f"Unexpected native Engram shard shape for {key}: {value.shape}")
+                logical_rows = sum(config.head_vocab_sizes)
+                hf_state_dict[f"layers.{layer_id}.engram.embed.weight"] = (
+                    value[:logical_rows]
+                    if size == 1
+                    else EngramCheckpointTensor(value, key=key, offset=rank * shard_rows, logical_rows=logical_rows)
+                )
+
+            elif any(t in key for t in ("compressor", "indexer")):
                 hf_state_dict[to_hf_map[key]] = value
 
             elif "moe.routed_experts.inner_experts" in key:

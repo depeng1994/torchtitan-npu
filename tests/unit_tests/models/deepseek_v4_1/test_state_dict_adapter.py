@@ -5,7 +5,12 @@
 
 """V4.1 StateDict adapter round-trip test: verify ownership-based partition."""
 
+import json
+
 import torch
+import torch.distributed.checkpoint as dcp
+from safetensors.torch import save_file
+from torch.distributed.checkpoint import HuggingFaceStorageReader, HuggingFaceStorageWriter
 
 from torchtitan_npu.models.deepseek_v4_1 import (
     model_registry,
@@ -149,6 +154,105 @@ class TestComposedAdapterPartition:
         assert set(local1.keys()) == set(local2.keys())
         for k in local1:
             assert torch.equal(local1[k], local2[k]), f"key {k} differs"
+
+
+def test_engram_hf_shard_load_and_export(tmp_path):
+    """DCP reads global HF rows into an EP shard and omits native padding on save."""
+    config = model_registry("deepseek_v4_1_debugmodel_text").model
+    table = config.layers[1].engram.table
+    table.head_vocab_sizes = (2, 3, 5, 7, 11, 13)
+    table.num_embeddings = 48
+    table.embedding_dim = 32
+    adapter = DeepSeekV41StateDictAdapter(config, None)
+    weight = torch.arange(41 * 32, dtype=torch.float32).view(41, 32)
+    source = tmp_path / "source"
+    source.mkdir()
+    save_file({"layers.1.engram.embed.weight": weight}, str(source / "model-00001-of-00001.safetensors"))
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {}, "weight_map": {"layers.1.engram.embed.weight": "model-00001-of-00001.safetensors"}})
+    )
+    key = "layers.1.engram.table.weight.ep_shard_00001_of_00002"
+    native = {key: torch.full((24, 32), -1.0)}
+    hf = adapter.to_hf(native)
+    dcp.load(hf, storage_reader=adapter.get_hf_storage_reader(str(source)))
+    loaded = adapter.from_hf(hf)
+    assert set(loaded) == {key}
+    torch.testing.assert_close(loaded[key][:17], weight[24:], rtol=0, atol=0)
+    assert torch.count_nonzero(loaded[key][17:]) == 0
+
+    full_native = adapter.from_hf({"layers.1.engram.embed.weight": weight})
+    native_path = tmp_path / "native"
+    full_key = "layers.1.engram.table.weight"
+    dcp.save(
+        {
+            full_key + ".ep_shard_00000_of_00002": full_native[full_key][:24].clone(),
+            full_key + ".ep_shard_00001_of_00002": full_native[full_key][24:].clone(),
+        },
+        checkpoint_id=str(native_path),
+    )
+    full_native[full_key].fill_(-1)
+    reader = dcp.FileSystemReader(str(native_path))
+    targets = adapter.prepare_dcp_state_dict(full_native, reader.read_metadata())
+    dcp.load(targets, storage_reader=reader)
+    exported = adapter.to_hf(full_native)
+    output = tmp_path / "export"
+    dcp.save(exported, storage_writer=HuggingFaceStorageWriter(str(output)))
+    restored = {"layers.1.engram.embed.weight": torch.empty_like(weight)}
+    dcp.load(restored, storage_reader=HuggingFaceStorageReader(str(output)))
+    torch.testing.assert_close(restored["layers.1.engram.embed.weight"], weight, rtol=0, atol=0)
+
+
+def test_engram_quantized_hf_load(tmp_path):
+    """Official row-MX table and block-MX gate scales can live in a separate file."""
+    config = model_registry("deepseek_v4_1_debugmodel_text").model
+    table = config.layers[1].engram.table
+    table.head_vocab_sizes = (2, 3, 5, 7, 11, 13)
+    table.num_embeddings = 48
+    table.embedding_dim = 32
+    adapter = DeepSeekV41StateDictAdapter(config, None)
+    weights = {
+        "layers.1.engram.embed.weight": torch.ones(41, 32).to(torch.float8_e4m3fn),
+        "layers.1.engram.wkv.weight": torch.full((64, 64), 2.0).to(torch.float8_e4m3fn),
+    }
+    scales = {
+        "layers.1.engram.embed.scale": torch.full((41, 1), 4.0).to(torch.float8_e8m0fnu),
+        "layers.1.engram.wkv.scale": torch.tensor([[1.0, 2.0], [4.0, 8.0]]).to(torch.float8_e8m0fnu),
+    }
+    save_file(weights, str(tmp_path / "model-00001-of-00002.safetensors"))
+    save_file(scales, str(tmp_path / "model-00002-of-00002.safetensors"))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {},
+                "weight_map": {
+                    **dict.fromkeys(weights, "model-00001-of-00002.safetensors"),
+                    **dict.fromkeys(scales, "model-00002-of-00002.safetensors"),
+                },
+            }
+        )
+    )
+    key = "layers.1.engram.table.weight.ep_shard_00001_of_00002"
+    hf = adapter.to_hf({key: torch.empty(24, 32), "layers.1.engram.gate.wkv": torch.empty(64, 64)})
+    dcp.load(hf, storage_reader=adapter.get_hf_storage_reader(str(tmp_path), from_quantized=True))
+    loaded = adapter.from_hf(hf)
+    torch.testing.assert_close(loaded[key][:17], torch.full((17, 32), 4.0), rtol=0, atol=0)
+    gate = loaded["layers.1.engram.gate.wkv"]
+    torch.testing.assert_close(gate[:32, :32], torch.full((32, 32), 2.0), rtol=0, atol=0)
+    torch.testing.assert_close(gate[32:, 32:], torch.full((32, 32), 16.0), rtol=0, atol=0)
+
+    direct = adapter.from_hf(
+        weights
+        | scales
+        | {
+            "layers.1.engram.q_weight": torch.arange(12, dtype=torch.float32).view(3, 4),
+            "layers.1.engram.k_weight": torch.full((3, 4), 0.5),
+        }
+    )
+    torch.testing.assert_close(direct["layers.1.engram.table.weight"][:41], torch.full((41, 32), 4.0), rtol=0, atol=0)
+    torch.testing.assert_close(direct["layers.1.engram.gate.wkv"], gate, rtol=0, atol=0)
+    round_trip = adapter.to_hf(direct)
+    torch.testing.assert_close(round_trip["layers.1.engram.q_weight"], torch.arange(12, dtype=torch.float32).view(3, 4))
+    torch.testing.assert_close(round_trip["layers.1.engram.k_weight"], torch.full((3, 4), 0.5))
 
 
 class TestAdapterPartitionIsTotal:

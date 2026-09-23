@@ -181,10 +181,10 @@ def convert_to_hf(args: argparse.Namespace):
 
     # allocate state dict memory with empty weights to load checkpoint
     state_dict = model.state_dict()
-    dcp.load(
-        state_dict,
-        storage_reader=ParallelFileSystemReader(input_dir, thread_count=read_threads),
-    )
+    reader = ParallelFileSystemReader(input_dir, thread_count=read_threads)
+    prepare = getattr(sd_adapter, "prepare_dcp_state_dict", None)
+    load_targets = prepare(state_dict, reader.read_metadata()) if prepare is not None else state_dict
+    dcp.load(load_targets, storage_reader=reader)
 
     target_dtype = TORCH_DTYPE_MAP[export_dtype]
     _save_as_hf(state_dict, sd_adapter, target_dtype, output_dir)

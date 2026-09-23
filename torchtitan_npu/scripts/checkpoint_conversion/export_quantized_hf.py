@@ -386,7 +386,7 @@ def _build_model_and_adapter(model_name: str, model_flavor: str, hf_assets_path:
     return ModelWrapper(raw_model), sd_adapter
 
 
-def _load_dcp_state_dict(model, input_dir: Path, master_dtype: str, read_threads: int):
+def _load_dcp_state_dict(model, input_dir: Path, master_dtype: str, read_threads: int, sd_adapter=None):
     """Load the DCP checkpoint into the model's state-dict container."""
     from convert_to_hf import ParallelFileSystemReader  # pyrefly: ignore [missing-import]
     from torchtitan.config import TORCH_DTYPE_MAP
@@ -398,9 +398,12 @@ def _load_dcp_state_dict(model, input_dir: Path, master_dtype: str, read_threads
     # inputs. Rebind the container to the checkpoint's master dtype first.
     container_dtype = TORCH_DTYPE_MAP[master_dtype]
     for fqn, value in state_dict.items():
-        if value.is_floating_point() and value.dtype != container_dtype:
+        if value.is_floating_point() and value.dtype != container_dtype and ".engram.table.weight" not in fqn:
             state_dict[fqn] = value.detach().to(container_dtype)
-    dcp.load(state_dict, storage_reader=ParallelFileSystemReader(str(input_dir), thread_count=read_threads))
+    reader = ParallelFileSystemReader(str(input_dir), thread_count=read_threads)
+    prepare = getattr(sd_adapter, "prepare_dcp_state_dict", None)
+    targets = prepare(state_dict, reader.read_metadata()) if prepare is not None else state_dict
+    dcp.load(targets, storage_reader=reader)
     return state_dict
 
 
@@ -426,7 +429,7 @@ def export_quantized_hf(args: argparse.Namespace) -> None:
     read_threads = args.read_threads
 
     model, sd_adapter = _build_model_and_adapter(model_name, model_flavor, hf_assets_path)
-    state_dict = _load_dcp_state_dict(model, input_dir, master_dtype, read_threads)
+    state_dict = _load_dcp_state_dict(model, input_dir, master_dtype, read_threads, sd_adapter)
     logger.info("Loaded DCP checkpoint %s (%d tensors)", input_dir, len(state_dict))
 
     hf_state_dict = sd_adapter.to_hf(state_dict)
