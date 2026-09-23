@@ -29,10 +29,20 @@ jobs:
           python -m pip install -e /tmp/torchtitan
           python -m pip install --no-deps -e .
           python -m pip install pytest attn-gym==0.0.9 scipy tokenizers triton
+          mkdir -p /tmp/stubs/torch_npu
+          cat >/tmp/stubs/torch_npu/__init__.py <<'PY'
+          class _NPU:
+              @staticmethod
+              def is_available():
+                  return False
+
+          npu = _NPU()
+          PY
 
       - name: Run focused MFU unit tests
         env:
           TORCHTITAN_DIR: /tmp/torchtitan
+          PYTHONPATH: /tmp/stubs:/tmp/torchtitan
         run: |
           python -m pytest -v --tb=short             tests/unit_tests/models/deepseek_v4_1/test_flops_accounting.py
 
