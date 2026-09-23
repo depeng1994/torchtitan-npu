@@ -196,3 +196,82 @@ The PR direction is coherent — it keeps NPU/model-specific code out of \`patch
 ### Non-blocking cleanup after the required fixes
 
 The remaining cleanup is primarily test reduction: remove the selective-AC projection that does not exercise a changed mechanism (P3-R3), avoid locking generic upstream Float8Linears into the LoRA support contract with a type-only optional test (P3-R4), and address the Part 2 low-value/reverse-order test cases (P2-R9). These should be handled while touching the surrounding tests, but they are not the reason for the Request Changes verdict.
+
+## Final Review（最终裁决）
+
+> **以本节为最终裁决。** 前述 Part 1/3、Part 2/3、Part 3/3 与“总体结论”保留为分段审查过程记录；如其严重级别、范围或修复方向与本节不一致，以本节为准。最终复核对象仍为原始 PR 提交 \`a9e35cae84a77424e17899cccb24e33e95591aa2\`；本节不把后续 maintainer 写入 \`review.md\` 的提交计入产品 diff。
+
+### 1. 冲突、重复与原意见最终归属
+
+三段之间没有发现“同一事实给出相反技术结论”的硬冲突。主要需要处理的是：生产问题与测试缺口重复拆开、同一特性的严重级别分散，以及个别表述超过了仓库可直接证明的范围。最终归并如下：
+
+| 原 ID | 最终裁决 | 归属 |
+| --- | --- | --- |
+| P1-R1 | 保留，吸收对应测试缺口 | **FR-1** |
+| P1-R2 | 保留并与量化 LoRA 的真实执行证据合并；最终严重级别按闭环问题提升为 P1 | **FR-2** |
+| P1-R3 | 保留，与 SAC 数值测试/门控不一致合并 | **FR-3** |
+| P1-R4 | 保留，与单向 Muon 测试缺口合并 | **FR-4** |
+| P2-R1 | 与 P1-R1 重复，不再单列 | **FR-1** |
+| P2-R2 | 保留，与文档中量化基座合并前置条件合并 | **FR-5** |
+| P2-R3 | 与 P2-R4 同属 merge 工具资源/失败安全，合并 | **FR-6** |
+| P2-R4 | 与 P2-R3 合并 | **FR-6** |
+| P2-R5 | 保留 | **FR-7** |
+| P2-R6 | 与 P1-R2 合并，作为量化 LoRA 缺少真实 NPU 闭环的主要证据 | **FR-2** |
+| P2-R7 | 保留，并吸收文档/测试矩阵不一致 | **FR-8** |
+| P2-R8 | 与 P1-R4 重复，不再单列 | **FR-4** |
+| P2-R9 | 与 Part 3 中低价值/非生产路径测试一起合并为非阻塞删减项 | **FR-10** |
+| P3-R1 | **撤回作为本 PR 独立 finding**：该参数化测试和 \`include_mtp\` 生产逻辑在 \`a9e35ca\` 中均未修改，虽测试强度可提高，但不能作为本 PR 新增缺陷成立 | 撤回 |
+| P3-R2 | 与 P1-R3 合并 | **FR-3** |
+| P3-R3 | 与 P2-R9/P3-R4 合并为测试删减项 | **FR-10** |
+| P3-R4 | 与 P2-R9/P3-R3 合并为测试删减项 | **FR-10** |
+| P3-R5 | 与 P1-R2/P2-R6 合并；“一定会被 root UT 跳过”的措辞修正为“仓内声明依赖不能保证执行，fixture 本身允许 skip” | **FR-2** |
+| P3-R6 | 保留 | **FR-9** |
+| P3-R7 | **修正后保留部分**：撤回“A5 文档明确声称已被默认 CI 验证”的表述；保留可直接证明的 resume case 未进入默认 CI、README 未登记该 LoRA resume case 的不一致 | **FR-8** |
+| P3-R8 | 与 P2-R2 合并 | **FR-5** |
+
+严重级别方面，仅有一处需要最终统一：P1-R2 原为 P2、P2-R6 为 P1。两条不是相互矛盾，而是分别描述“量化参数选择语义存在重复真源”和“该 headline NPU 路径缺少真实 NPU 端到端验证”。合并后按后者的风险面裁决为 **FR-2 / P1**。其余重复项的严重级别一致，无需改判。
+
+### 2. 去重提炼后的最终意见集
+
+| Final ID | Severity | 文件 + 行号 | 最终闭环意见 |
+| --- | --- | --- | --- |
+| **FR-1** | **P1** | \`torchtitan_npu/models/deepseek_v4/lora.py:322-412\`; \`tests/unit_tests/models/deepseek_v4/test_lora_merge.py:203-220\` | **离线 merge 缺少 rank 与专家基数的语义校验，且现有负向测试没有覆盖这个静默成功路径。** Dense A/B 只要矩阵内维自洽，即使物理 rank 与 \`adapter_config.r\` 不一致也会按错误的 \`alpha/r\` 缩放成功；专家 adapter 又从 packed A 推导专家数，split base 若包含更多专家会只生成前缀 target，剩余专家静默不合并。最小修复是：dense 明确要求 A/B rank 等于配置 rank；expert 明确从 base/model 元数据得到期望专家数并校验 packed A/B 为 \`E*rank\`，split expert key 集合要求完整连续；随后增加“rank 错但 B@A shape 仍合法”和“adapter 专家数少于 base”两个必须失败的测试。**合并自 P1-R1、P2-R1。** |
+| **FR-2** | **P1** | \`lora.py:98-123\`; \`test_lora_training.py:121-259\`; \`tests/integration_tests/deepseek_v4.py:105-124\`; \`test_peft.py:32-68,177-194\` | **量化基座 + LoRA 的产品语义没有形成单一实现真源和真实 NPU 验证闭环。** \`base_filter\` 重新硬编码 \`weight/w1_EFD/w2_EDF/w3_EFD + ndim\`，不是在原 \`ParamSwapConfig.params_filter_fn\` 上只排除 adapter，因此未来 base 参数选择会在 LoRA/非 LoRA 间漂移；同时现有默认 NPU \`dsv4_lora_ep2_fsdp2\` 没有打开 quantized training，CPU case 会 stub NPU kernel，block-FP8 DCP case又通过 \`importorskip("torchao_npu")\` 允许跳过，而根 \`requirements-dev.txt\` 也未声明该 experiment 依赖，所以这些不能替代真实 NPU 证据。最小修复是：复制 policy 后保留 \`original_filter(param,fqn)\`，只附加“不是 LoRA 参数”的否定条件；增加一个仓库正式注册、真实启用一种 TorchAO-NPU recipe 的 NPU LoRA ST，实际走 forward/backward/optimizer，并断言 base 被量化、adapter 仍为浮点且可训练；让 block-FP8 checkpoint UT 在其所属 job 明确安装/加载依赖而不是依赖可选 skip。**合并自 P1-R2、P2-R6、P3-R5。** |
+| **FR-3** | **P2** | \`lora.py:45-52\`; \`parallelize.py:100-103\`; \`test_lora_layers.py:28-120\`; \`test_lora.py:222-247\` | **Selective AC workaround 的 owner 与激活条件不一致，测试正在固化这层错误归属。** 代码注释和数值测试都表明需要去掉 saved \`aten.bmm\` 的直接原因是 \`Indexer.select\` 对 bmm 输出执行 \`relu_()\`，但生产路径只在“有 LoRA 且 \`type(ac_config) is SelectiveAC.Config\`”时替换为 \`LoRASelectiveAC\`；因此一个 Indexer 级 mutation workaround 被挂在 LoRA 开关上，自定义 SelectiveAC 子类又会静默绕过。最小修复是先把 policy 放回真正拥有该 mutation 的 DSV4/Indexer SAC 层，或给出并测试“为什么只有 LoRA 才需要”的独立语义；不要用简单 \`isinstance + derive(LoRASelectiveAC.Config)\` 丢掉第三方子类字段。测试应沿生产 parallelize 路径验证真正的 owner，而不是单独调用 \`LoRASelectiveAC\` 来证明 Indexer 数值。**合并自 P1-R3、P3-R2。** |
+| **FR-4** | **P2** | \`config_registry.py:146-205\`; \`test_lora_training.py:49-86\` | **Muon 的 LoRA membership 与 compute layout 有两个拓扑真源，且测试只验证了单向包含关系。** layout 由现有 sharding + \`DEEPSEEK_V4_LORA_TARGETS\` 派生，而 \`muon_pattern\` 又手写一遍 LoRA FQN；新增 target 时可能已有 layout 却静默落入 catch-all AdamW，当前测试只检查“已经被 DistMuon 选中的参数都有 layout”，检测不到反向遗漏。最小修复是从同一声明生成 Muon LoRA pattern/layout，唯一显式例外保留 \`w13_lora_b[E,F,2,R]\` → AdamW，并把测试改成“期望进入 Muon 的 LoRA FQN 集合 == 实际 DistMuon 分配集合”，再验证这些 FQN 均有 layout。**合并自 P1-R4、P2-R8。** |
+| **FR-5** | **P2** | \`scripts/lora/merge_adapter.py:66-88\`; \`test_lora_merge.py:250-267\`; \`docs/feature_guides/deepseek_v4_lora.md:72-80\` | **量化 checkpoint 的 merge 前置校验与仓内 TorchAO-NPU 序列化格式不闭环，文档也缺少可执行转换路径。** 脚本只在 config 标记量化或目标逻辑 tensor 本身为非 FP dtype 时给出“先转浮点”的提示；仓内 \`save_hf_safetensors()\` 会把量化逻辑 \`.weight\` 展平为 \`._weight_qdata/._weight_scale\`，这时 merge plan 会先报“找不到 base weight”，用户看不到文档承诺的 actionable guidance。最小修复是 build plan 前识别 TorchAO metadata/量化 sibling keys，统一报出“先由对应 backend 导出普通 FP16/BF16/FP32 logical weight checkpoint”；测试必须用仓内 writer 构造量化 safetensors；文档要链接/写明实际可用的转换方式，若仓内目前没有支持流程，就明确标记“quantized training output 不能直接离线 merge”，而不是给出未落地的泛化指令。**合并自 P2-R2、P3-R8。** |
+| **FR-6** | **P2** | \`scripts/lora/merge_adapter.py:75-103\` | **merge 工具虽然按 base shard 重写，但资源与失败安全仍没有真正做到 shard-bounded。** 第 75 行先 \`load_file\` 把整个 adapter materialize；DeepSeek-V4 Flash 本身有 43 层、256 routed experts，专家 LoRA 正是 adapter 体积最大的部分，因此峰值内存仍包含“完整 adapter + 当前 base shard + FP32 delta 临时”；随后第 90 行直接创建最终 output，任何后续 copy/save 失败都会留下一个以后又因“output 必须不存在”而拒绝重跑的半成品目录。最小修复是用 \`safe_open\` 按 target/shard 懒加载 A/B，并写到 sibling temp directory，全部成功后一次 rename 到最终 output，异常时清理 temp。无需再增加通用 checkpoint abstraction。**合并自 P2-R3、P2-R4。** |
+| **FR-7** | **P2** | \`test_lora_merge.py:56-58,160-199\`; \`requirements-dev.txt:9\` | **唯一真正覆盖 Transformers fused expert storage + reload/logits 的 oracle 在仓库声明依赖下不可达。** fixture 使用 \`pytest.importorskip("transformers.models.deepseek_v4")\`，而仓库固定 \`transformers==4.57.6\`；该版本不存在该 module，所以这条最强 fused \`gate_up_proj/down_proj\` consumer test 会 skip。现有“transformers layout”CPU test仍是 split per-expert key rename，不等价于 fused tensor consumer。最小修复是删除对尚不可用 Transformers model package 的依赖，直接构造最小 fused expert safetensors/base module，并用独立 PyTorch 公式验证 merged tensor/forward；只有产品本身确实需要时才升级整个 Transformers pin。**保留自 P2-R5。** |
+| **FR-8** | **P2** | \`tests/integration_tests/deepseek_v4.py:63-103\`; \`tests/integration_tests/lora_config.py:32-76\`; \`.ci/integration_test.sh:15-17\`; \`tests/integration_tests/README.md:38-55\`; \`docs/feature_guides/deepseek_v4_lora.md:91\` | **LoRA resume 的 oracle 是有效的，但它没有进入仓库默认 integration CI，文档测试矩阵也没有登记对应 case。** \`LoRATrainer\` 在 resumed 第一步 optimizer update 前对 step-2 flat optimizer tensor state 做 exact compare，runner 还比较 resumed loss/grad_norm；问题不是断言弱，而是 \`dsv4_lora_resume_ep2_fsdp2\` 只在 \`deepseek_v4_checkpoint\` suite 中，而 CI 明确只跑 \`--test_suite models\`。README 只记录普通 \`dsv4_checkpoint_resume_ep2_fsdp2\`，feature guide 却直接引用 LoRA resume case。最小修复是把该 case 接入仓库控制的默认/必跑 integration 选择机制（不要新建 runner），同步 README/feature guide 的 testcase 与命令。**合并自 P2-R7，并吸收修正后的 P3-R7。** |
+| **FR-9** | **P2** | \`examples/deepseek_v4/deepseek_v4_flash_lora_4k_a5.sh:10-13\`; \`deepseek_v4_flash_cpt_4k_a5.sh:38-54\`; \`examples/deepseek_v4/readme.md:259\`; \`docs/feature_guides/deepseek_v4_lora.md:20\` | **新增 A5 LoRA shell 没有独立训练语义，应按本仓“单一入口 + CLI/config”原则删除。** 它只设置已有 \`CONFIG=deepseek_v4_flash_lora\`，再把 \`--checkpoint.no-load-only --checkpoint.save-training-state\` 交给已有 A5 CPT；而 A5 CPT 已负责 block-FP8、A5 override、optimizer override 与用户尾部 CLI 优先级。新增 wrapper 只是把三个已有配置项包装成第二个名字（且新增文件 mode 为 \`100644\`，也不同于现有 executable launcher 约定）。最小修复是删除该新脚本，在文档直接给 \`CONFIG=deepseek_v4_flash_lora bash .../deepseek_v4_flash_cpt_4k_a5.sh --checkpoint.no-load-only --checkpoint.save-training-state ...\`；已有 A3 LoRA wrapper 属于 pre-existing 入口，不应作为继续复制入口的理由。**保留自 P3-R6。** |
+| **FR-10** | **P3** | \`test_lora_training.py:39-46,141-169,236-259\`; \`test_lora_layers.py:28-38,132-190\`; \`test_lora.py:104-114\` | **测试新增量仍可明显删减，当前有多组并不代表独立用户语义。** \`test_smoke_recipe_optimizer_selection\` 从 unit test 反向依赖 integration config；\`quantize_first=True\` 手工走私有 \`_make_lora_config()\`，不是仓库实际 registry→LoRA→\`TrainerEx\` quantization 顺序；selective-AC fixture 把 grouped expert 数值测试也翻倍，但 grouped path 不涉及本 PR 的 Linear clone/Indexer bmm 变更；upstream \`Float8Linear.Config\` case 只断言类型，又把非 PR 主诉求的 generic quantization support 变成长期契约。最小修复是删除这些非生产/重复 projection，只保留真实 config order、Muon 分组、LoRALinear clone/SAC 和 grouped expert 自身 eager 数值 oracle；若要正式支持 upstream Float8Linear，则补行为级 forward/backward 后再保留。**合并自 P2-R9、P3-R3、P3-R4。** |
+
+### 3. 撤回与修正清单
+
+| 原 ID | 类型 | 最终处理 |
+| --- | --- | --- |
+| **P3-R1** | **撤回** | \`test_default_targets_follow_mtp_configuration()\` 与 \`include_mtp\` 转换逻辑均不是本 PR 的改动。它可以作为后续测试质量改进，但不应作为 \`a9e35ca\` 的 Request Changes finding。 |
+| **P3-R5** | **措辞修正** | 不能仅凭仓内 workflow/requirements 断言外部下载的 \`torchtitan-npu_ut.sh\` 一定不安装 TorchAO-NPU；最终只保留可证明事实：root \`requirements-dev.txt\` 不声明该依赖、fixture 明确允许 \`importorskip\`，因此仓库可见契约不能把这条 UT 当成必跑证据。核心 NPU ST 缺口仍由 FR-2 独立成立。 |
+| **P3-R7** | **部分撤回/收窄** | 文档确实描述 A5 block-FP8 LoRA 的实现用法，但没有明确写“默认 CI 已验证”，因此此前“文档 overstate A5 验证状态”的说法过强；最终只保留可定位的不一致：LoRA resume case 不在默认 CI、integration README 未登记，但 feature guide 引用了它（FR-8）。 |
+| **P1-R3** | **措辞收窄** | 原文“为每个 LoRA block 移除所有 bmm 保存”表述不够精确；实际是 LoRA 路径下替换整个 DSV4 \`SelectiveAC\` policy 的 save-op 集。owner/gating 不一致的技术结论不变，见 FR-3。 |
+| 其余 17 条 | 保留或吸收 | 均能在 \`a9e35ca\` diff、仓库固定依赖/CI入口，或 TorchTitan v0.3.0 对应接口中定位到直接依据；没有发现需要因事实错误而进一步撤回的 finding。 |
+
+### 4. 遗漏检查与横切结论
+
+最终跨文件复核未发现新的独立 P1/P2 缺陷需要在 21 条之外追加。此前分段容易遗漏的几个横切面重新核对后结论如下：原始 15 个产品文件均围绕 LoRA/Muon/量化/export/test/example/doc，没有无关 patch、PyTorch patch 或 override 混入；非 LoRA 路径仍保持 AdamW 默认、量化 filter 包装只存在于 LoRA 动态 Config，当前普通训练入口没有被直接改变；A5 CPT 的用户 CLI 位于量化默认值之后，因此复用 CPT 本身能保持用户 override 能力；\`MODULE_PATHS\`/state-dict mapping 与 expert pack/unpack 在合法 metadata 下没有发现额外映射错误。也就是说，Final Review 的新增工作是**去重、收窄与严重级别统一**，不是再堆叠新的 finding。
+
+### 5. 最终整体判定
+
+**Request Changes。**
+
+必须修复项精简为六组：
+
+1. **离线 merge 正确性与工具安全**：修 FR-1、FR-5、FR-6、FR-7，确保 rank/专家数不静默错合并、量化输入有可操作错误、内存/输出失败安全，以及 fused expert consumer oracle 真正可运行。
+2. **量化 LoRA 闭环**：修 FR-2，删除独立 base allowlist 真源，并补一个真实 TorchAO-NPU LoRA NPU ST；不能以可 skip 的 CPU wrapper test 代替。
+3. **Selective AC owner**：修 FR-3，让 bmm recompute policy 跟随真正的 Indexer/DSV4 mutation 语义，而不是 LoRA 条件。
+4. **Muon 单一真源**：修 FR-4，让 target membership、compute layout 与测试从同一声明派生，显式保留 \`w13_lora_b\` AdamW 例外。
+5. **Resume 进入必跑验证**：修 FR-8，把已有强 snapshot/resume oracle 接入仓库控制的 CI suite，并同步测试文档。
+6. **训练入口收敛**：修 FR-9，删除无独立语义的 A5 LoRA wrapper，用现有 A5 CPT + \`CONFIG\`/CLI 暴露同一能力。
+
+**FR-10 为非阻塞删减项**，建议在本 PR 同步清理以降低新增测试维护面，但它本身不是 Request Changes 的决定因素。
+
