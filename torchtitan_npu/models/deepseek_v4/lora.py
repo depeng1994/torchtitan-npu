@@ -10,6 +10,8 @@ from __future__ import annotations
 __all__ = ["DEEPSEEK_V4_LORA_TARGETS", "DeepSeekV4LoRAConverter", "peft_target_modules"]
 
 import math
+import re
+from copy import copy
 from dataclasses import dataclass, fields, replace
 from functools import cache
 from typing import TYPE_CHECKING, cast
@@ -19,8 +21,8 @@ import torch
 import torch.nn as nn
 from torch.distributed.tensor import DTensor
 from torchtitan.components.lora import LoRAConverter
-from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.config import derive
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.spmd_types import spmd_mesh_size
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.decoder_sharding import dense_param_placement
@@ -38,6 +40,16 @@ from .model import DeepSeekV4Model
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
     from typing import Protocol
+
+
+class LoRASelectiveAC(SelectiveAC):
+    @dataclass(kw_only=True, slots=True)
+    class Config(SelectiveAC.Config):
+        pass
+
+    def get_save_ops(self) -> set:
+        # Indexer applies in-place ReLU to bmm output; recompute it instead of caching.
+        return super().get_save_ops() - {torch.ops.aten.bmm.default}
 
 
 @dataclass(kw_only=True)
@@ -83,7 +95,32 @@ def adapter_sharding(
 def _make_lora_adapter_config_cls(parent_config_cls: type) -> type:
     @dataclass(kw_only=True, slots=True)
     class Config(LoRAOptions, parent_config_cls):  # type: ignore[misc]
-        pass
+        def __post_init__(self):
+            parent_post_init = getattr(parent_config_cls, "__post_init__", None)
+            if parent_post_init is not None:
+                parent_post_init(self)
+            policy = getattr(self, "_torchao_npu_config", None)
+            if policy is None:
+                return
+
+            from torchao_npu.configs import ParamSwapConfig
+
+            if not isinstance(policy, ParamSwapConfig):
+                raise ValueError(
+                    f"{type(policy).__name__} module replacement is not supported by "
+                    f"{parent_config_cls.__qualname__} LoRA; its adapter forward must be preserved"
+                )
+            original_filter = policy.params_filter_fn
+
+            def base_filter(param, fqn):
+                return (
+                    fqn in {"weight", "w1_EFD", "w2_EDF", "w3_EFD"}
+                    and param.ndim >= 2
+                    and (original_filter is None or original_filter(param, fqn))
+                )
+
+            self._torchao_npu_config = copy(policy)
+            self._torchao_npu_config.params_filter_fn = base_filter
 
     return Config
 
@@ -128,7 +165,7 @@ def linear_lora_class(parent_cls: type[Module]) -> type[_LoRAModule]:
             return self.lora_b(self.lora_a(rows) if batched else rows)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            output = super().forward(x)
+            output = super().forward(x).clone()
             if batched:
                 adapter_rows = x.reshape(-1, x.shape[-2], x.shape[-1])
                 output_rows = output.reshape(-1, output.shape[-2], output.shape[-1])
@@ -252,22 +289,132 @@ def grouped_lora_class(parent_cls: type[Module]) -> type[_LoRAModule]:
     return GroupedLoRAExperts
 
 
-_PEFT_MODULE_SUFFIXES = {
-    "lm_head": "lm_head",
-    "attention.wq_a": "self_attn.q_a_proj",
-    "attention.wq_b": "self_attn.q_b_proj",
-    "attention.wkv": "self_attn.kv_proj",
-    "attention.wo_a": "self_attn.o_a_proj",
-    "attention.wo_b": "self_attn.o_b_proj",
-    "attention.compressor.wkv": "self_attn.compressor.kv_proj",
-    "attention.compressor.wgate": "self_attn.compressor.gate_proj",
-    "moe.router.gate": "mlp.gate",
-    "moe.shared_experts.w1": "mlp.shared_experts.gate_proj",
-    "moe.shared_experts.w2": "mlp.shared_experts.down_proj",
-    "moe.shared_experts.w3": "mlp.shared_experts.up_proj",
-    "e_proj": "e_proj",
-    "h_proj": "h_proj",
-}
+MODULE_PATHS = (
+    ("lm_head", "lm_head", "head"),
+    ("attention.wq_a", "self_attn.q_a_proj", "attn.wq_a"),
+    ("attention.wq_b", "self_attn.q_b_proj", "attn.wq_b"),
+    ("attention.wkv", "self_attn.kv_proj", "attn.wkv"),
+    ("attention.wo_a", "self_attn.o_a_proj", "attn.wo_a"),
+    ("attention.wo_b", "self_attn.o_b_proj", "attn.wo_b"),
+    ("attention.compressor.wkv", "self_attn.compressor.kv_proj", "attn.compressor.wkv"),
+    ("attention.compressor.wgate", "self_attn.compressor.gate_proj", "attn.compressor.wgate"),
+    ("moe.router.gate", "mlp.gate", "ffn.gate"),
+    ("moe.shared_experts.w1", "mlp.shared_experts.gate_proj", "ffn.shared_experts.w1"),
+    ("moe.shared_experts.w2", "mlp.shared_experts.down_proj", "ffn.shared_experts.w2"),
+    ("moe.shared_experts.w3", "mlp.shared_experts.up_proj", "ffn.shared_experts.w3"),
+    ("e_proj", "e_proj", "e_proj"),
+    ("h_proj", "h_proj", "h_proj"),
+)
+
+_PEFT_MODULE_SUFFIXES = {local: hf for local, hf, _ in MODULE_PATHS}
+OFFICIAL_MODULES = {hf: official for _, hf, official in MODULE_PATHS}
+PEFT_PREFIX = "base_model.model."
+
+
+def pack_expert_factor(value, factor):
+    if factor.endswith("lora_a"):
+        return value.reshape(-1, value.shape[-1])
+    if factor == "w13_lora_b":
+        value = torch.cat((value[:, :, 0, :], value[:, :, 1, :]), dim=1)
+    return value.permute(1, 2, 0).reshape(value.shape[1], -1)
+
+
+def unpack_expert_factors(a, b, rank):
+    if rank is None or rank <= 0 or a.ndim != 2 or b.ndim != 2:
+        raise ValueError("Routed-expert adapters require a positive rank and two-dimensional factors")
+    if a.shape[0] % rank or b.shape[1] != a.shape[0] or not a.shape[0]:
+        raise ValueError("Routed-expert A/B shapes do not match expert count and rank")
+    experts = a.shape[0] // rank
+    return a.reshape(experts, rank, a.shape[1]), b.reshape(b.shape[0], rank, experts).permute(2, 0, 1)
+
+
+_LORA_A_SUFFIX = ".lora_A.weight"
+_LORA_B_SUFFIX = ".lora_B.weight"
+
+
+def _official_base_key(module: str) -> str | None:
+    if module == "lm_head":
+        return "head.weight"
+    match = re.fullmatch(r"model\.layers\.(\d+)\.(.+)", module)
+    if match and match[2] in OFFICIAL_MODULES:
+        return f"layers.{match[1]}.{OFFICIAL_MODULES[match[2]]}.weight"
+    return None
+
+
+def _expert_targets(module: str, lora_a: torch.Tensor, lora_b: torch.Tensor, rank: int | None, weight_map: dict):
+    match = re.fullmatch(r"model\.layers\.(\d+)\.mlp\.experts(\.base_layer)?", module)
+    if not match:
+        return None
+    a, b = unpack_expert_factors(lora_a, lora_b, rank)
+    experts = a.shape[0]
+    gate_up = match[2] is not None
+    parameter = "gate_up_proj" if gate_up else "down_proj"
+    fused = f"model.layers.{match[1]}.mlp.experts.{parameter}"
+    if fused in weight_map:
+        return [(fused, a, b)]
+    prefix = f"model.layers.{match[1]}.mlp.experts"
+    if f"{prefix}.0.w1.weight" not in weight_map and f"{prefix}.0.w2.weight" not in weight_map:
+        prefix = f"layers.{match[1]}.ffn.experts"
+    if f"model.{prefix}.0.w1.weight" in weight_map or f"model.{prefix}.0.w2.weight" in weight_map:
+        prefix = f"model.{prefix}"
+    if gate_up:
+        if b.shape[1] % 2:
+            raise ValueError("Routed gate/up adapter requires an even output dimension")
+        gate, up = b.chunk(2, dim=1)
+        return [
+            (f"{prefix}.{expert}.{projection}.weight", a[expert], values[expert])
+            for expert in range(experts)
+            for projection, values in (("w1", gate), ("w3", up))
+        ]
+    return [(f"{prefix}.{expert}.w2.weight", a[expert], b[expert]) for expert in range(experts)]
+
+
+def build_lora_merge_plan(
+    adapter_tensors: dict[str, torch.Tensor], base_weight_map: dict[str, str], *, rank: int | None = None
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    targets_by_key = {}
+    lora_a_keys = {key for key in adapter_tensors if key.endswith(_LORA_A_SUFFIX)}
+    if not lora_a_keys:
+        raise ValueError("Adapter contains no LoRA A/B pairs")
+    expected_keys = lora_a_keys | {key.removesuffix(_LORA_A_SUFFIX) + _LORA_B_SUFFIX for key in lora_a_keys}
+    unexpected_keys = set(adapter_tensors) - expected_keys
+    if unexpected_keys:
+        raise ValueError(f"Adapter contains unsupported or unpaired tensors: {sorted(unexpected_keys)[:5]}")
+
+    for lora_a_key in sorted(lora_a_keys):
+        module_key = lora_a_key[: -len(_LORA_A_SUFFIX)]
+        lora_b_key = f"{module_key}{_LORA_B_SUFFIX}"
+        if lora_b_key not in adapter_tensors:
+            raise ValueError(f"Adapter has {lora_a_key} but no matching {lora_b_key}")
+        if not module_key.startswith(PEFT_PREFIX):
+            raise ValueError(f"Expected adapter module key to start with {PEFT_PREFIX!r}, got {module_key!r}")
+        module = module_key.removeprefix(PEFT_PREFIX)
+        lora_a, lora_b = adapter_tensors[lora_a_key], adapter_tensors[lora_b_key]
+        targets = _expert_targets(module, lora_a, lora_b, rank, base_weight_map)
+        if targets is None:
+            base_key = f"{module}.weight"
+            if base_key not in base_weight_map:
+                base_key = _official_base_key(module) or base_key
+                if base_key not in base_weight_map and f"model.{base_key}" in base_weight_map:
+                    base_key = f"model.{base_key}"
+            targets = [(base_key, lora_a, lora_b)]
+        for base_key, a, b in targets:
+            if base_key not in base_weight_map:
+                raise ValueError(f"Adapter target has no matching base weight: {base_key}")
+            if base_key in targets_by_key:
+                raise ValueError(f"Multiple adapter pairs map to the same base weight: {base_key}")
+            targets_by_key[base_key] = (a, b)
+    return targets_by_key
+
+
+def merge_lora_weight(base: torch.Tensor, lora_a: torch.Tensor, lora_b: torch.Tensor, scaling: float) -> torch.Tensor:
+    if base.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"LoRA merge requires a decoded floating-point base, got {base.dtype}")
+    delta = scaling * (lora_b.to(torch.float32) @ lora_a.to(torch.float32))
+    if delta.shape != base.shape:
+        raise ValueError(f"LoRA delta shape {tuple(delta.shape)} does not match base weight shape {tuple(base.shape)}")
+    return (base.to(torch.float32) + delta).to(base.dtype)
+
 
 DEEPSEEK_V4_LORA_TARGETS = tuple(_PEFT_MODULE_SUFFIXES)
 
@@ -322,11 +469,6 @@ class DeepSeekV4LoRAConverter(LoRAConverter):
         matched = dict.fromkeys(targets, 0)
         grouped_matches = 0
         configs = list(model_config.traverse(Module.Config, recurse=True))
-        if has_quantization(model_config) or any(
-            getattr(cfg, "_torchao_npu_config", None) is not None for _, cfg, _, _ in configs
-        ):
-            raise NotImplementedError("DeepSeek-V4 LoRA requires an unquantized base model")
-
         for fqn, cfg, parent, attr in reversed(configs):
             if not isinstance(cfg, Module.Config):
                 raise TypeError(f"Expected a Module.Config at {fqn!r}, got {type(cfg).__name__}")
@@ -402,8 +544,3 @@ class DeepSeekV4LoRAConverter(LoRAConverter):
 @dataclass(kw_only=True, slots=True)
 class _LoRAModelConfig(DeepSeekV4Model.Config):
     lora: DeepSeekV4LoRAConverter.Config
-
-    def update_from_config(self, *, config, **kwargs) -> None:
-        if config.extension.quantization.enable_quantized_training:
-            raise NotImplementedError("DeepSeek-V4 LoRA requires an unquantized base model")
-        DeepSeekV4Model.Config.update_from_config(self, config=config, **kwargs)

@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import replace
+
 from tests.integration_tests import OverrideDefinitions
 
 # DeepSeek-V4 NPU recipe from the example scripts.  Ascend attention and MHC
@@ -89,7 +91,15 @@ def build_deepseek_v4_checkpoint_resume_test_list() -> list[OverrideDefinitions]
         check_loss=False,
         check_resume=True,
     )
-    return [checkpoint_case]
+    lora_args = GOLDEN_OVERRIDES + checkpoint_args + ("--checkpoint.save-training-state", "--optimizer.name=Muon")
+    lora_checkpoint_case = replace(
+        checkpoint_case,
+        test_name="dsv4_lora_resume_ep2_fsdp2",
+        test_descr="DeepSeek-V4 LoRA checkpoint resume EP2/FSDP2",
+        env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_training"},
+        override_args=[lora_args, (*lora_args, "--checkpoint.load-step=2")],
+    )
+    return [checkpoint_case, lora_checkpoint_case]
 
 
 def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
@@ -99,7 +109,7 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             test_descr="DeepSeek-V4 LoRA A/B training, frozen base and PEFT export EP2/FSDP2",
             env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_training"},
             override_args=[(*GOLDEN_OVERRIDES,
-                "--training.steps=2", "--training.global-batch-size=2",
+                "--training.steps=2", "--training.global-batch-size=2", "--optimizer.name=Muon",
                 "--parallelism.data-parallel-shard-degree=2", "--parallelism.expert-parallel-degree=2",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--checkpoint.enable", "--checkpoint.interval=10000",

@@ -101,15 +101,18 @@ def test_converter_accepts_unquantized_linear_despite_class_name():
     torch.testing.assert_close(projection(inputs), F.linear(inputs, projection.weight))
 
 
-def test_converter_rejects_upstream_quantization_config():
+def test_converter_preserves_upstream_quantization_config():
     pytest.importorskip("torchao")
     from torchtitan.components.quantization.float8 import Float8Linear
     from torchtitan.config import derive
 
     config = _build_model_config()
     config.layers[0].attention.wq_a = derive(config.layers[0].attention.wq_a, Float8Linear.Config)
-    with pytest.raises(NotImplementedError, match="unquantized base"):
-        lora.DeepSeekV4LoRAConverter.Config().build().convert(config)
+    converted = lora.DeepSeekV4LoRAConverter.Config(target_modules=["attention.wq_a"]).build().convert(config)
+    projection = converted.layers[0].attention.wq_a
+    assert isinstance(projection, Float8Linear.Config)
+    assert issubclass(type(projection)._owner, Float8Linear)
+    assert isinstance(projection, lora.LoRAOptions)
 
 
 def test_strict_matching_rejects_unmatched_targets():
@@ -214,20 +217,24 @@ def test_registry_model_forward_backward_freezes_base_and_differentiates_adapter
     assert all(value.grad is None for name, value in model.named_parameters() if "lora_" not in name)
 
 
-def test_lora_recipe_rejects_quantization_enabled_after_recipe_selection():
-    from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
-
-    config = deepseek_v4_debugmodel(converters=[lora.DeepSeekV4LoRAConverter.Config()])
-    config.extension.quantization.enable_quantized_training = True
-    with pytest.raises(NotImplementedError, match="unquantized base"):
-        config.model_spec.model.update_from_config(config=config)
-
-
 @pytest.mark.parametrize("use_lora", [False, True])
-def test_shared_parallelization_and_optimizer_hook_preserve_training_mode(monkeypatch, use_lora, parallelize_kwargs):
+@pytest.mark.parametrize("selective_ac", [False, True])
+def test_shared_parallelization_and_optimizer_hook_preserve_training_mode(monkeypatch, use_lora, selective_ac, parallelize_kwargs):
     from unittest.mock import Mock
+    from torchtitan.distributed.activation_checkpoint import SelectiveAC
 
-    monkeypatch.setattr(dsv4_parallelize, "parallelize_deepseekv3", lambda model, **kwargs: model)
+    original_ac = SelectiveAC.Config(preserve_rng_state=False) if selective_ac else parallelize_kwargs["ac_config"]
+    parallelize_kwargs = {**parallelize_kwargs, "ac_config": original_ac}
+    def parallelize(model, **kwargs):
+        ac = kwargs["ac_config"]
+        if use_lora and selective_ac:
+            assert type(ac) is lora.LoRASelectiveAC.Config
+            assert ac.preserve_rng_state is False
+            assert ac.build().get_save_ops() == original_ac.build().get_save_ops() - {torch.ops.aten.bmm.default}
+        else:
+            assert ac is original_ac
+        return model
+    monkeypatch.setattr(dsv4_parallelize, "parallelize_deepseekv3", parallelize)
     register_hook = Mock()
     monkeypatch.setattr(dsv4, "register_moe_load_balancing_hook", register_hook)
     converters = [lora.DeepSeekV4LoRAConverter.Config(rank=2, rank_experts=2)] if use_lora else []

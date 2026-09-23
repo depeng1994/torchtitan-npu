@@ -28,6 +28,13 @@ def preserve_rng():
         yield
 
 
+@pytest.fixture
+def wrapper_scope(request, monkeypatch):
+    if request.param == "block-fp8":
+        monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[4] / "experiments" / "torchao-npu"))
+    return request.param
+
+
 def _make_checkpoint_fixture(tmp_path, save_training_state, checkpoint_format, wrapper_scope, trainable_base):
     class RoutingState(torch.nn.Module):
         def __init__(self):
@@ -48,6 +55,16 @@ def _make_checkpoint_fixture(tmp_path, save_training_state, checkpoint_format, w
 
     def build_model():
         model = Model()
+        if wrapper_scope == "block-fp8":
+            pytest.importorskip("torchao_npu")
+            from interfaces.torchao_converter import _block_fp8_param_swap
+            from torchao_npu.wrapper_tensors.block_mx_wrapper_tensor import BlockMXTrainingWeightWrapperTensor
+
+            policy = _block_fp8_param_swap()
+            model.base = torch.nn.Parameter(
+                BlockMXTrainingWeightWrapperTensor(model.base.detach(), policy.weight_config, policy.activation_config),
+                requires_grad=False,
+            )
         return checkpoint_wrapper(model) if wrapper_scope == "model" else model
 
     class StepState:
@@ -128,7 +145,10 @@ def _check_periodic_dcp_round_trip(
     target.dcp_load(restored.state_dict(), target.initial_load_path)
     for key, value in initial_adapters.items():
         torch.testing.assert_close(restored.state_dict()[key], value, rtol=0, atol=0)
+    with torch.no_grad():
+        restored.get_parameter("base").zero_()
     target.dcp_load(target._flattened_model_states_sd(target.states), checkpoint)
+    assert type(restored.get_parameter("base")) is type(original.get_parameter("base"))
 
     for key, tensor in original.state_dict().items():
         expected = (
@@ -158,6 +178,7 @@ def _check_periodic_dcp_round_trip(
     [
         (False, "adapter_buffers", "plain"),
         (True, "adapter_buffers", "plain"),
+        (True, "adapter_buffers", "block-fp8"),
         (False, "legacy_adapter", "plain"),
         (True, "legacy_adapter", "plain"),
         (False, "full_model", "plain"),
@@ -165,6 +186,7 @@ def _check_periodic_dcp_round_trip(
         (False, "adapter_buffers", "model"),
         (False, "adapter_buffers", "submodule"),
     ],
+    indirect=["wrapper_scope"],
 )
 def test_periodic_dcp_round_trip_keeps_base_out_and_restores_selected_state(
     tmp_path, save_training_state, checkpoint_format, wrapper_scope

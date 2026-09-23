@@ -49,7 +49,7 @@ from . import (
     memory_policy,  # noqa: F401
     model_registry,
 )
-from .lora import DeepSeekV4LoRAConverter
+from .lora import DEEPSEEK_V4_LORA_TARGETS, DeepSeekV4LoRAConverter
 from .model import DeepSeekV4Model, GraphTrainerDeepSeekV4Model
 from .mtp import MTPChunkedLossWrapper
 from .parallelize import parallelize_graph_trainer_deepseek_v4
@@ -143,6 +143,15 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
             for projection in mtp_projections:
                 shardings[f"{prefix}.{projection}.weight"] = owned
             shardings[f"{prefix}.hc_head.hc_fn"] = owned
+        for base_key, layout in tuple(shardings.items()):
+            if base_key.endswith(".weight"):
+                owner = base_key.removesuffix(".weight")
+                if owner.removeprefix(f"{prefix}.") in DEEPSEEK_V4_LORA_TARGETS:
+                    shardings[f"{owner}.lora_a.weight"] = owned
+                    shardings[f"{owner}.lora_b.weight"] = layout
+        # Interleaved w13_lora_b [E, F, 2, R] stays in AdamW to preserve the PEFT layout.
+        for projection in ("w13_lora_a", "w2_lora_a", "w2_lora_b"):
+            shardings[f"{prefix}.moe.routed_experts.inner_experts.{projection}"] = expert_sharding
         return shardings
 
     main_layer_shardings = tuple(
@@ -188,6 +197,12 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
         rf"(?:{'|'.join(hc_pre_modules)})\.hc_fn|"
         rf"(?:{'|'.join(mtp_projections)})\.weight|"
         r"hc_head\.hc_fn"
+        r"|attention\.(?:wq_a|wkv|wo_b|wq_b|wo_a)\.lora_[ab]\.weight"
+        r"|attention\.compressor\.(?:wkv|wgate)\.lora_[ab]\.weight"
+        r"|moe\.shared_experts\.w[123]\.lora_[ab]\.weight"
+        r"|moe\.router\.gate\.lora_[ab]\.weight"
+        r"|moe\.routed_experts\.inner_experts\.(?:w13_lora_a|w2_lora_a|w2_lora_b)"
+        r"|(?:e_proj|h_proj)\.lora_[ab]\.weight"
         r")$"
     )
     return MuonOptimizerProfile(

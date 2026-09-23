@@ -11,7 +11,8 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
-from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig, derive
+from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
@@ -96,6 +97,10 @@ def parallelize_deepseek_v4(
     dump_folder: str,
 ):
     """Apply DSV4 parallelism with per-parameter FP32 SmoE policies."""
+    if getattr(model, "lora_config", None) is not None and type(ac_config) is SelectiveAC.Config:
+        from .lora import LoRASelectiveAC
+
+        ac_config = derive(ac_config, LoRASelectiveAC.Config)
     with policy_overrides(_dsv4_fp32_overrides(model, training)):
         parallelized_model = parallelize_deepseekv3(
             model,
