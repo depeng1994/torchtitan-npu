@@ -27,10 +27,17 @@ from torchtitan_npu.models.deepseek_v4_1 import model_registry
 
 
 class _NoParameters:
-    """A model stand-in: TorchTitan's helper reads ``named_parameters``."""
+    """Parameter-free model stand-in for attention-only arithmetic tests."""
+
+    def __init__(self, n_layers):
+        self.layers = {str(idx): _NoEngramLayer() for idx in range(n_layers)}
 
     def named_parameters(self):
         return iter(())
+
+
+class _NoEngramLayer:
+    engram = None
 
 
 @pytest.mark.parametrize(
@@ -79,7 +86,7 @@ def test_flops_are_window_plus_compressed_plus_hierarchical_indexer(
     config = model_registry(flavor).model
 
     nparams, flops = config.get_nparams_and_flops(
-        _NoParameters(),
+        _NoParameters(config.n_layers),
         seq_len=seq_len,
     )
 
@@ -106,4 +113,4 @@ def test_flash_4k_full_model_flops_keep_engram_as_lookup_storage():
 
     assert engram_table_nparams == 196_614_815_744
     assert nparams == sum(parameter.numel() for parameter in model.parameters())
-    assert flops == 107_101_336_224
+    assert flops == 107_101_428_384
