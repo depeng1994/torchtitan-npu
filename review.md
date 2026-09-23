@@ -117,3 +117,74 @@
 
 没有新增 Config/env/专用 shell 的必要性；final 方案仍应优先减少抽象和重复代码。
 
+## Re-review on Updated Head (e535f4e)
+
+> Re-review source: `pr_891_v2@e535f4ea3301198fdaadbe1ba92c3a79e43af818`  
+> Previous reviewed source: `613babc714256fd3da2858528b3c57c03b46b9b2`  
+> 测试执行：**未执行（仅静态审查）**。本轮按 `.agents/skills/developer-tests-review` 的 review 测试规则，只核对更新后的生产代码、CPU UT、现有 integration 入口和固定 TorchTitan v0.3.0 调用链。  
+> 若本节与前文 R1–R6 的旧状态冲突，**以本节对 updated head 的裁决为准**。
+
+### 1. R1–R6 Updated-Head 裁决
+
+| ID | 最终状态 | 新 head 证据 | 裁决 / 剩余修改 | 已回写 GitCode 评论 |
+|---|---|---|---|---|
+| R1 | **维持** | `torchtitan_npu/models/deepseek_v4_1/engram/checkpoint.py:28-84` 仍保留 `EngramCheckpointTensor`、`_make_wrapper_subclass`、`__torch_dispatch__` 和 3 个 DCP dunder；`state_dict_adapter.py:245-267` 的 EP>1 路径仍构造该 wrapper。新 worker `tests/unit_tests/models/deepseek_v4_1/engram_hf_worker.py:32-39` 已开始真实使用它：`:34` 的 `detach().clone().to(...)` 会进入 dispatch，随后 distributed DCP save 会消费其 shard protocol。 | **维持 Final Cross-Check 中的条件式 R1，不恢复成“wrapper 必删”的绝对要求。** 新测试证明的是当前 wrapper 在 pinned 环境目标路径上可工作，不是“plain Tensor + `CheckpointableTensor` metadata 在当前 HF writer 上也可工作/不可工作”的对照证据。仍应先用同一 2-rank HF save 场景做最小 counterfactual：若 fixed CI wheel + HF writer 已能直接消费上游 protocol，则删 wrapper；若不能，才保留最小 compatibility shim，并把退出条件绑定到上游 HF-safetensors protocol 支持。 | **需要修正文案，但不是关闭 R1。** 旧行间意见里“`__torch_dispatch__` / write shard 路径从未执行”的事实已经过时，应删除这句；Reducer/上游复用问题仍保留。 |
+| R2 | **维持** | `engram/checkpoint.py:103-183` 的 `EngramHuggingFaceStorageReader` 完整实现未变，仍自己维护 quantized metadata 扫描、`_HFStorageInfo`、weight/scale mapping 和 block-aligned read；`state_dict_adapter.py:146-153` 仍在配置 Engram 时直接选择它。updated head 没有把这些 common HF metadata/sidecar 能力下沉到 `extensions/mx_storage_reader`，也没有把 Engram-specific 层缩薄。 | 维持 Final Cross-Check 后的 R2：**不强制把 32×32 + CPU target 硬塞进现有 MX reader，但必须消除两套 HF metadata/private-API plumbing 的平行实现。** 可以保留薄 Engram strategy/subclass，只承载真正不同的 block alignment / CPU dequant。 | **无需修改**（若已有 R2 评论，结论与修复方向均未被新提交改变）。 |
+| R3 | **已解决** | 临时 patch 已变成纯兼容 shim：`torchtitan_npu/patches/torchtitan/scripts/checkpoint_conversion/convert_to_hf.py:6-24` 只 re-export plugin-owned 实现，docstring 明确只有 shim 可在 caller 迁移后删除。永久实现位于 `torchtitan_npu/scripts/checkpoint_conversion/convert_to_hf.py:7-12`，明确说明 upstream EMA backport 删除后仍需保留；`:152-180` 新增 `load_dcp_model()`，对 missing/incomplete/geometry mismatch 分别 `raise ValueError`，不存在 silent fallback；`:213-217` 标准 exporter 直接调用该函数。quantized exporter `export_quantized_hf.py:384-401` 同样复用 `load_dcp_model`，原 `sd_adapter=None` 参数和两处 `getattr(...prepare_dcp_state_dict...)` 已消失。adapter 中原 `prepare_dcp_state_dict` 方法也已删除。UT 在 `test_state_dict_adapter.py:210-213` 额外保护 incomplete shard fail-loud。 | 原 R3 的三个底层问题都已闭环：**永久模型语义离开待删 patch、两处隐式 private hook 合并成单点显式 helper、unsupported layout fail loud。** 这个 helper 是 offline converter 的实现细节，不再污染 StateDictAdapter protocol。兼容 shim 的存在本身可接受，因为其业务实现已经不在 patch 内，且 shim 有独立退出条件。 | **需要更新并标记已解决。** 原来两条关于 “#3985 patch 生命周期” 和 “`prepare_dcp_state_dict` 私有协议/silent fallback” 的 GitCode 评论均已被新提交实质修复。 |
+| R4 | **部分解决** | 新增 `test_state_dict_adapter.py:357-367::test_engram_hf_distributed_roundtrip`，通过 `torch.distributed.run --nproc-per-node=2` 启动 `engram_hf_worker.py`。worker `:21-32` 建立真实 2-rank Gloo、每 rank 仅持本地 24 行 EP shard；`:36-39` 实际调用 `dcp.save(... HuggingFaceStorageWriter(save_distributed=True, enable_consolidation=True))`；`:40-42` readback 断言最终 HF tensor 只有 41 logical rows；`:44-50` 再按 rank 恢复 native shard，rank0 验证 24 行、rank1 验证 17 行并要求尾部 padding 全零。因此 **distributed writer、rank boundary、logical truncation、padding 不落盘** 这几个原始缺口已经覆盖。 | 仍不能完全关闭 R4，原因有两个，而且第一个比 dtype 更关键：**(1) 新 worker 在 `:29` 用 `DeepSeekV41StateDictAdapter(config, None)`，所以 `fqn_to_index_mapping=None`。固定 TorchTitan v0.3.0 的真实 HF save 在有官方 `model.safetensors.index.json` 时会走另一条分支：`dcp.py:263-279` 把 writer 指向 `sharded/`、传 `fqn_to_index_mapping` 且关闭 writer 内部 consolidation，随后 `:317-323` 调 `consolidate_safetensors_files_on_every_rank`。V4.1 正常传 `hf_assets_path` 时 adapter 会从 index JSON 建 mapping，因此当前测试只覆盖了“无 mapping 的单文件内部 consolidation”，没有覆盖官方资产最接近的 mapped multi-file consolidation。** 最小修复是在同一 2-rank test 里给 adapter 一个 mini `model.safetensors.index.json`，让 Engram key 进入 mapping，并走与上游完全相同的 mapped writer/consolidation 分支。**(2) `:33-34` 注释声称覆盖 export dtype，但测试是在 `adapter.to_hf` **之后**把 wrapper 转成 `float64`；而固定 v0.3.0 的真实 last-save 路径在 `dcp.py:767-776` 先把 native state 转成配置的 export dtype，再于 `:786-791` 进入 `to_hf`，且 CLI 支持的是 fp16/bf16/fp32，不包含 float64。** 若要保留“已覆盖 export_dtype”的声明，请改成 bf16/fp16 并按真实顺序转换，最好与上面的 mapped branch 一次完成。 | **需要更新，但暂不标记 resolved。** 旧评论中“没有 committed 2-rank test / wrapper save 路径从未执行”应改掉；新的剩余意见应聚焦 **official index mapping 对应的 mapped consolidation 分支**，以及可选的真实 export_dtype 顺序。 |
+| R5 | **维持** | NPU runtime 语义未变：`torchtitan_npu/override/deepseek_v4_1/engram/mxfp8.py:106` 仍注册 load-state post-hook，`:158-160` 在 load 后重建 quantized storage。updated head 没有新增/修改 `tests/integration_tests`；当前 `tests/integration_tests/run_tests.py:42-60` 的默认/独立 suite 仍只注册 DeepSeek-V4、V3.2、EMA、Qwen3.5，没有 DeepSeek-V4.1 case；目录中也没有 V4.1 integration testcase。新增的 Gloo worker 是 CPU UT，不是 NPU ST。 | R4 的 CPU distributed save 不能替代 R5。仍需要真实 NPU initial-HF-load → `model.load_state_dict` → MXFP8 Host Engram post-hook/cache rebuild → lookup/forward/backward/optimizer step 的 integration 证据。按 test-review 规则，状态仍是 **补充测试后合入**。 | **无需修改**（若已回写 R5 评论，证据和结论均未变化）。 |
+| R6 | **维持** | updated head 无 `examples/` diff。主入口 `examples/deepseek_v4_1/deepseek_v4_1_flash_cpt_4k_a3.sh:114-125` 仍只有 `--checkpoint.initial-load-in-hf`，没有 `--checkpoint.initial-load-in-hf-quantized`；README `:72` 仍只说明 `CKPT_INIT_LOAD_PATH` 指向 HF checkpoint，没有新增 quantized flag、Engram-only seam 与完整官方量化 package 限制的支持矩阵。 | 文档/CLI 边界仍需按原 R6 同步；不应新增新 env 或 shell 分叉。 | **无需修改**（若已回写 R6 评论，结论未变化）。 |
+
+### 2. R3 重构专项复核
+
+这次 R3 的修改方向符合原 review 要求，**不再保留 R3 blocker**：
+
+1. `patches/torchtitan/.../convert_to_hf.py` 只承担旧 import/CLI 路径兼容，不再拥有 Engram 或 NPU converter 实现。
+2. `torchtitan_npu/scripts/checkpoint_conversion/convert_to_hf.py` 成为 canonical plugin implementation，生命周期不再依赖 #3985 patch 是否删除。
+3. `load_dcp_model(state_dict, reader)` 是 converter-owned helper，不再向上游 `StateDictAdapter` 偷塞新 protocol。
+4. standard 与 quantized exporter 共用该 helper；没有 `getattr`、没有 `sd_adapter=None` 的静默可选路径。
+5. unsupported/missing/incomplete Engram shard layout 会在 load 前 `ValueError`，并已有 incomplete-layout CPU regression。
+
+从 Reducer 角度看，这次反而删掉了一个跨模块隐式 abstraction（adapter hook）和一个可选参数分支，复杂度方向正确。
+
+### 3. R4 新增 distributed UT 的覆盖边界
+
+| 语义 | 新测试状态 | 证据 |
+|---|---|---|
+| 2-rank、每 rank 只持一个 native EP shard | **已覆盖** | `engram_hf_worker.py:21-32` |
+| `adapter.to_hf` 产生 distributed Engram wrapper | **已覆盖** | `:31-34` |
+| `HuggingFaceStorageWriter(save_distributed=True)` + real DCP save | **已覆盖** | `:36-39` |
+| 41 logical rows 跨 24-row rank boundary 正确拼接 | **已覆盖** | `:40-42` |
+| HF 不落 native padding；load 回 rank1 后 7 行 padding 归零 | **已覆盖** | `:44-50` |
+| 官方 HF index mapping 对应的 `fqn_to_index_mapping != None` 分支 | **未覆盖** | worker `:29` 显式传 `hf_assets_path=None`；固定上游会因此走不同 consolidation 分支 |
+| 真实 `export_dtype` 配置顺序与受支持 dtype | **部分覆盖/表述不准确** | worker `:33-34` 在 wrapper 生成后转 `float64`；上游真实路径先转换 native state，且配置只允许 fp16/bf16/fp32 |
+
+所以 R4 从“缺少真实 distributed regression”降为一个**窄得多的部分解决项**：不要再增加新的 testcase，直接扩展现有 `test_engram_hf_distributed_roundtrip` 即可。
+
+### 4. EMA UT 变更检查
+
+`tests/unit_tests/ema/test_ema_initial_load.py:92-101` 只把 `_load_checkpoint_conversion_module()` 从旧的 `torchtitan_npu.patches.torchtitan.scripts.checkpoint_conversion.convert_to_hf` 改为 canonical `torchtitan_npu.scripts.checkpoint_conversion.convert_to_hf`。这与 R3 的 ownership 重构一致：`ParallelFileSystemReader` 的行为测试现在直接保护真正实现，而不是保护一个将来删除的 shim。
+
+**未发现需要新增 review finding。** 唯一需要明确的是：这意味着现有 EMA UT 不再直接证明旧 shim import path；但 shim 当前只是 1:1 re-export。按 Reducer 原则，不建议仅为了 27 行 re-export 再新增一套重复 testcase。若仓内/外确有必须长期兼容旧 Python import path 的独立用户语义，应补一个极薄的 import/identity contract；若没有真实 caller，后续迁移完成后直接删 shim 比增加测试更合适。
+
+### 5. Updated-Head 最终统计
+
+| 状态 | 数量 | IDs |
+|---|---:|---|
+| **已解决** | **1** | R3 |
+| **部分解决** | **1** | R4 |
+| **维持** | **4** | R1、R2、R5、R6 |
+| **新增** | **0** | - |
+
+**Merge Gate 仍为 Request Changes。**
+
+相比上一轮，架构 blocker 已明显收敛：R3 可以关闭，R4 的主体 distributed-save 缺口也已补上。当前仍需处理的是：
+
+- **R1**：用当前 pinned HF writer 做 plain-CheckpointableTensor counterfactual，决定 wrapper 是删除还是保留最小 compatibility shim；
+- **R2**：消除 Engram reader 与通用 MX reader 重复的 HF metadata/private plumbing；
+- **R4**：把现有 2-rank test 扩到 `fqn_to_index_mapping` 的真实 mapped-consolidation 分支，并把 export-dtype 检查改成真实顺序/受支持 dtype；
+- **R5**：真实 NPU initial HF load + MXFP8 cache rebuild + 至少一步训练 ST；
+- **R6**：补标准 quantized-HF CLI flag 与支持边界文档。
+
+本轮不需要新增 Config、env、专用 shell 或新的 testcase 文件；R4 应继续收敛在已经新增的 2-rank UT 上。
+
