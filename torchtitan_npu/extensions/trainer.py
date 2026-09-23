@@ -21,6 +21,12 @@ from torchtitan_npu.config.converters import TrainerConfigConverter
 from torchtitan_npu.distributed.utils import set_allow_hf32
 from torchtitan_npu.extensions.components.checkpoint import CheckpointManager
 from torchtitan_npu.extensions.components.sdc import SDC
+from torchtitan_npu.extensions.experiment.anticipatory_routing.config import AnticipatoryRoutingConfig
+from torchtitan_npu.extensions.experiment.anticipatory_routing.engine import (
+    validate_anticipatory_config,
+)
+from torchtitan_npu.extensions.experiment.anticipatory_routing.router import configure_router_override
+from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import AnticipatorySchedule
 
 from .profiler import CANNProfiler
 
@@ -44,6 +50,7 @@ class TrainerEx(Trainer):
             default_factory=TrainingConfig,
         )
         sdc: SDC.Config = field(default_factory=SDC.Config)
+        anticipatory: AnticipatoryRoutingConfig = field(default_factory=AnticipatoryRoutingConfig)
 
         def __post_init__(self) -> None:
             # ``slots=True`` dataclasses are recreated by the decorator, so a
@@ -58,6 +65,7 @@ class TrainerEx(Trainer):
             if hasattr(self.optimizer, "_cpu_offload"):
                 self.optimizer._cpu_offload = self.training.enable_cpu_offload
             self._post_init_optimizer()
+            validate_anticipatory_config(self)
 
         def _post_init_optimizer(self) -> None:
             self.optimizer.materialize()
@@ -122,6 +130,7 @@ class TrainerEx(Trainer):
                 config = copy(config)
                 # pyrefly: ignore [bad-argument-type, bad-assignment]
                 config.optimizer = derive(config.optimizer, target)
+        configure_router_override(config)
         super().__init__(config)
         self._sdc = config.sdc.build(
             trainer_config=config,
@@ -139,12 +148,31 @@ class TrainerEx(Trainer):
                     "derived for it automatically"
                 )
 
+        self.anticipatory_schedule = AnticipatorySchedule(self) if config.anticipatory.enable else None
+
     def forward_backward_step(self, *args: Any, **kwargs: Any) -> Any:
+        if self.config.anticipatory.enable:  # pyrefly: ignore [missing-attribute]
+            self.anticipatory_schedule.prepare_microbatch()  # pyrefly: ignore [missing-attribute]
         result = super().forward_backward_step(*args, **kwargs)
+        if self.config.anticipatory.enable:  # pyrefly: ignore [missing-attribute]
+            self.anticipatory_schedule.accumulate_microbatch_loss(result)  # pyrefly: ignore [missing-attribute]
         # Advancing SDC state after a failed or partial step would corrupt its
         # accumulation window, so post-processing is intentionally success-only.
         self._sdc.finalize_sdc_step()
         return result
+
+    def train_step(self, data_iterator):
+        if self.config.anticipatory.enable:  # pyrefly: ignore [missing-attribute]
+            with self.anticipatory_schedule.training_step_context(  # pyrefly: ignore [missing-attribute]
+                data_iterator
+            ) as batches:
+                return super().train_step(batches)
+        return super().train_step(data_iterator)
+
+    def batch_generator(self, data_iterable):
+        if self.config.anticipatory.enable:  # pyrefly: ignore [missing-attribute]
+            return self.anticipatory_schedule.data  # pyrefly: ignore [missing-attribute]
+        return super().batch_generator(data_iterable)
 
     def close(self) -> None:
         super().close()
