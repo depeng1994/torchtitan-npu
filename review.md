@@ -54,3 +54,66 @@
 ## 6. Merge Gate
 
 **当前结论：Request Changes。** 至少完成 **R1、R2、R3** 的架构收敛，并补齐 **R4**；针对 PR 已明确承诺的训练初始加载路径，**R5** 需要真实 NPU 证据；**R6** 同步文档后再考虑合入。整个修复过程不需要新增配置类、环境变量或专用 shell，优先复用 PyTorch DCP protocol、仓内 MX extension 和现有 TorchTitan checkpoint CLI。
+
+## Final Cross-Check
+
+本小节是对 R1–R6 的最终交叉复核；若与前文同 ID 的措辞存在差异，**以本节裁决为准**。本轮仍为静态审查，未在仓库 CI 镜像中实际执行 Python import、Gloo 或 NPU 测试。
+
+### 1. 逐条证据复核与最终裁决
+
+| ID | 最终状态 | Final Cross-Check |
+|---|---|---|
+| R1 | **修正，仍保留为阻塞项，但修复方向改为条件式** | 上游源码证据已再次直接核实：PyTorch commit `ff12fa13ad483fa07d47e9a5642b984f4898d8b0`（2026-07-16，`[DCP] Add CheckpointableTensor protocol (#189492)`）确实存在；该 commit 明确新增 `torch.distributed.checkpoint.protocol.CheckpointableTensor`，并在 `torch/distributed/checkpoint/__init__.py` 通过 `from .protocol import CheckpointableTensor` 导出；上游 test 也确实用普通 local Tensor + `global_shape/global_offsets/local_offsets/local_sizes` 做 distributed default-DCP save/load。因此“protocol 存在、导出路径正确”不是推断。**但原 R1 对 HF writer 的适用范围表述过强，需要纠正**：同一 commit/PR #189492 明写 “HF safetensor: see 2nd PR in ghstack”，后续 PR #189945（`[DCP] Support CheckpointableTensor in HF safetensors storage`）截至本次复核仍为 **open / merged=false**。它新增的内容正包括 `HuggingFaceStorageWriter`/reader/consolidation 对 logical FQN、global shape 和 CheckpointableTensor shard 的支持。由此不能仅凭 `ff12fa13` 就断言本 PR 的在线 HF save 场景已经能无条件删除 wrapper。另一方面，本仓虽然固定 `torch==2.14.0.dev20260719`，但本轮没有进入实际 CI wheel 执行 `import torch.distributed.checkpoint.CheckpointableTensor` 或 HF writer 路径，因此 wheel 实际内容也不能当作已运行验证。**最终要求改为**：先在固定 CI wheel 上用 R4 所要求的 2-rank `HuggingFaceStorageWriter(save_distributed=True,...)` 精确路径验证 plain Tensor + CheckpointableTensor metadata 是否足够；若可用，删除 `EngramCheckpointTensor`；若该 wheel 的 HF storage 尚缺能力，则允许保留一个最小 compatibility shim，但必须证明每个 `_make_wrapper_subclass/__torch_dispatch__/DCP dunder` 都是该 pinned HF writer 的真实必要条件，并把退出条件绑定到上游 #189945/后续版本，而不是把这套 wrapper 当成长期模型语义。原 R1 中“上游 protocol 已完整覆盖 HF save，因此 wrapper 必删”的绝对表述不再成立。参考：https://github.com/pytorch/pytorch/commit/ff12fa13ad483fa07d47e9a5642b984f4898d8b0 、https://github.com/pytorch/pytorch/pull/189945 |
+| R2 | **修正，核心结论维持阻塞** | 已再次核对现有 `extensions/mx_storage_reader/MXHuggingFaceStorageReader`。原建议“只需从 scale shape 派生 row_block 即可无 Config 泛化到 1×32/32×32”过于乐观。现有 `_discover_mx_tensors` 计算 `expected_scale_shape = (*qdata.size[:-1], num_blocks)`，因此 Engram table 的 row-MX `[R,K] + [R,K/32]` 与现有模型兼容；但 wkv 的 block-MX `[R,K] + [ceil(R/32),ceil(K/32)]` 会因为第一维不等于 R 被当前校验直接拒绝。并且现有 `read_data -> _read_data_npu` 会对 target 创建 device stream，隐含“每 rank target 位于单一 NPU device”的前提；Host Engram table 的 CPU target 不能直接落进这条 fast path。**因此不再强制要求删除整个 `EngramHuggingFaceStorageReader`。** 更保守、可接受的收敛路径是：优先把两套实现重复的 HF safetensors metadata 扫描、E8M0 dtype 处理、weight/scale sidecar discovery、跨文件 region 读取等通用能力下沉到 `extensions/mx_storage_reader`；然后二选一：(a) 若改动仍小，把 descriptor 泛化为显式 block geometry + CPU/NPU backend，让 Engram 直接复用；(b) 若为支持 32×32 + CPU target 会显著复杂化通用 reader，则保留一个**很薄的 Engram-specific reader/strategy**，只负责 Engram 的 block alignment 与 CPU dequant，公共 metadata/private-API glue 不再复制。仍不建议为此新增用户 Config；官方两种 geometry 可由已知 Engram key + 经严格 shape 校验的 scale metadata 决定。R2 的阻塞点从“必须完全并入现有 reader”修正为“必须消除两套 HF metadata/private dependency 平行实现，并证明剩余 Engram-specific 层是最小差异”。 |
+| R3 | **维持** | #3985 的 merged 状态与 merge commit 已再次通过 GitHub PR 数据直接核实，不是推断：`pytorch/torchtitan#3985` 当前 `state=closed`、`merged=true`，`merge_commit_sha=1b9eef3bd5d1533da05bffcc585fe74280ff8414`。因此“当前 patch 文件宣称等待 #3985、而 #3985 已合入；永久 Engram 语义不应继续绑在未来应删除的 patch 生命周期上”这一依据成立。两处 `getattr(sd_adapter, "prepare_dcp_state_dict", None)` 与 quantized exporter 的 `sd_adapter=None` 可选分支也均已在 diff 中复核。R3 维持。 |
+| R4 | **维持** | 现有 `test_engram_hf_shard_load_and_export` 的 save 部分确为单进程组织两个 native shard / full target，没有 committed 的 rank0/rank1 各持 local shard 后执行真实 `adapter.to_hf -> HuggingFaceStorageWriter(save_distributed=True) -> dcp.save` 路径。R4 维持。**与修正后的 R1 不冲突**：R4 要求测试的是产品语义（distributed online HF save、offset/consolidation/padding）；如果验证后删掉 wrapper，就不需要专门测试 `__torch_dispatch__`；如果因为 pinned HF writer 的能力缺口必须保留 compatibility shim，R4 的真实 2-rank 路径应自然覆盖它，而不是再为每个 dunder 建实现细节测试。 |
+| R5 | **维持** | `mxfp8.py:106` 的 `register_load_state_dict_post_hook` 与 `:158-160` 的 cache refresh 已复核；当前新增 adapter UT 没有进入真实 `CheckpointManager -> model.load_state_dict -> post-hook -> NPU fetch/train` 闭环。R5 维持，且它与 R2 不重复：R2 是 reader 架构/复用问题，R5 是真实 Trainer/NPU runtime 证明问题。 |
+| R6 | **维持** | 主多机脚本仍只有 `--checkpoint.initial-load-in-hf`，没有 `--checkpoint.initial-load-in-hf-quantized`；README 也没有明确“当前只补 Engram MXFP8 seam、非 Engram 官方量化权重仍可能不被完整读取”的支持边界。R6 维持。 |
+
+### 2. 冲突与重复检查
+
+| 组合 | 检查结果 | 最终裁决 |
+|---|---|---|
+| R1 ↔ R4 | 原 R1 的“删除 wrapper”与 R4 提到“当前 `__torch_dispatch__` 未覆盖”表面上容易被读成冲突。 | **已消除。** R4 的 gate 是 distributed HF save 产品行为，不是强制保留并单测 `__torch_dispatch__`。R1 修正后：先用 R4 的真实路径验证上游 protocol/HF writer；可删则删，不能删才保留最小 shim。 |
+| R1 ↔ R2 | 同在 `engram/checkpoint.py`，但一个处理 native EP shard 如何表示给 DCP/HF writer，另一个处理 quantized HF weight/scale 如何读取和反量化。 | **不重复。** 可以分别修。 |
+| R2 ↔ R5 | R2 要求 reader 复用/下沉；R5 要求 NPU Trainer load 后 cache rebuild 和训练闭环。 | **不重复。** CPU reader UT 不能替代 NPU ST。 |
+| R3 ↔ R4 | R3 是 offline native-DCP→HF conversion wiring 与 patch 生命周期；R4 是在线 distributed HF save regression。 | **不重复。** 两条入口不同。 |
+| R4 ↔ R5 | 一个验证 save，一个验证 initial HF load + training。 | **不重复。** 都是 PR 声称能力的独立生产 seam。 |
+| R3 ↔ R6 | R3 处理代码归属/协议，R6 处理用户可见 CLI 文档边界。 | **不重复。** |
+
+未发现 R1–R6 之间需要合并为同一条的重复问题；除 R1/R2 的修复方向需要按上述证据收敛外，严重级别之间也无新的矛盾。
+
+### 3. 第 3 节“现有行间 Review 的归并”一致性复核
+
+镜像 PR 当前共有 **3 个未解决行间 review thread**，与第 3 节三行一一覆盖，无遗漏：
+
+| 行间 thread | 第 3 节归并 | Final Cross-Check |
+|---|---|---|
+| `tests/unit_tests/models/deepseek_v4_1/test_state_dict_adapter.py:159`：真实 distributed HF save / wrapper 路径未 committed | `R1 + R4` | 归并仍成立，但**主归属应理解为 R4**（缺少产品行为 regression）；R1 仅承接“wrapper 是否为最小必要抽象”的 Reducer 维度。 |
+| `patches/.../convert_to_hf.py:184`：#3985 已合入后 patch 的退出生命周期 | `R3` | 精确对应，维持。 |
+| `state_dict_adapter.py:146`：`prepare_dcp_state_dict` 私有协议 + 待删 patch + silent fallback | `R3` | 与上一 thread 指向同一底层生命周期/wiring 问题，合并到 R3 是正确去重，不应拆成两条。 |
+
+因此第 3 节没有“一个行间意见被漏掉”或“同一底层问题被重复计数”的问题；其中两个 patch/hook thread 合并为 R3 是有意去重。
+
+### 4. 最终统计与 Merge Gate
+
+| 类别 | 数量 | IDs |
+|---|---:|---|
+| **维持** | **4** | R3、R4、R5、R6 |
+| **修正** | **2** | R1、R2 |
+| **撤回** | **0** | - |
+| **新增** | **0** | - |
+
+**最终 Merge Gate：Request Changes，结论不变。**
+
+最终阻塞含义按本节修正为：
+
+1. **R1**：不再要求“无条件删除 wrapper”；要求先用 pinned CI wheel + 真实 HF writer 路径证明上游 protocol 是否足够。足够则删；不足则只保留可解释、可退出的最小 compatibility shim。
+2. **R2**：不再要求“无条件把 Engram reader 完全塞进现有 MX reader”；要求至少消除重复的 HF metadata/private-API plumbing，并把剩余 Engram 32×32/CPU dequant 层收敛到最小。
+3. **R3**：永久 Engram conversion 语义不得继续依赖声称随上游升级删除的 patch 生命周期；两处 private hook wiring 必须统一且 fail loud。
+4. **R4**：必须有 committed 的真实 2-rank distributed online HF save regression，它同时也是裁决 R1 最终实现形态的关键证据。
+5. **R5**：补真实 NPU initial-HF-load → post-load cache rebuild → 至少一步训练的 ST。
+6. **R6**：同步量化 HF load 的标准 CLI flag、支持范围与限制文档。
+
+没有新增 Config/env/专用 shell 的必要性；final 方案仍应优先减少抽象和重复代码。
+
