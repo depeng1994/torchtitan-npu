@@ -369,21 +369,9 @@ class DeepSeekV41Model(Decoder):
         def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
             """Estimate V4.1 model FLOPs per token using TorchTitan's MFU convention.
 
-            The pinned TorchTitan helper supplies the standard ``6 * active_params``
-            term and an all-layer dense-attention term. V4.1 needs two corrections:
-
-            * Engram table weights are sparse lookup storage, not dense matmul weights,
-              so their full table size must not enter ``6 * active_params``. The
-              Engram gate/projection parameters remain in the dense term.
-            * CSA2 uses a sliding-window branch plus selected compressed entries.
-              Full indexers score their whole compressed container, Reuse indexers do
-              no scoring, and hierarchical Reindex layers score at most the candidate
-              pool produced by the candidate source.
-
-            As elsewhere in TorchTitan, this is model FLOPs for MFU rather than
-            implementation/HFU accounting: causal sparsity, top-k/elementwise work,
-            backward recomputation, and reference-kernel overcompute are not counted.
-            This V4.1 model has no MTP or DSpark modules, so neither contributes.
+            Engram table weights are sparse lookup storage and do not belong in the
+            dense ``6P`` term. Hierarchical Reindex is charged for logical candidate
+            work rather than eager-reference overcompute.
             """
             from typing import cast
 
@@ -400,19 +388,13 @@ class DeepSeekV41Model(Decoder):
                 seq_len,
             )
 
-            # TorchTitan 0.3.0 treats every non-embedding, non-MoE parameter as a
-            # dense matmul parameter. Engram's enormous table is instead gathered
-            # sparsely by row; keep it in ``nparams`` (storage/model size), but remove
-            # its spurious 6P contribution from the MFU numerator.
             engram_table_nparams = sum(
-                param.numel()
-                for name, param in deepseek_v4_1_model.named_parameters()
-                if ".engram.table." in name
+                layer.engram.table.weight.numel()
+                for layer in deepseek_v4_1_model.layers.values()
+                if layer.engram is not None
             )
             num_flops_per_token -= 6 * engram_table_nparams
 
-            # Replace the helper's all-layer dense-attention estimate with V4.1's
-            # sliding-window + compressed sparse attention topology.
             num_flops_per_token -= 6 * len(self.layers) * first_attention.n_heads * head_dims * seq_len
             for layer in self.layers:
                 attention = layer.attention
@@ -423,8 +405,6 @@ class DeepSeekV41Model(Decoder):
                     * min(seq_len, attention.inner_attention.window_size)
                 )
 
-                # A ratio-1 layer still owns/consumes a compressed container: one
-                # original token maps to one entry. Only ratio 0 is window-only.
                 if attention.compress_ratio > 0:
                     compressed_seq_len = seq_len // attention.compress_ratio
                     num_flops_per_token += (
@@ -441,10 +421,8 @@ class DeepSeekV41Model(Decoder):
                             indexer.mode is IndexerMode.REINDEX
                             and indexer.candidate_topk_blocks > 0
                         ):
-                            # The hierarchical candidate source keeps whole blocks.
-                            # Reindex layers search only that bounded pool. Count the
-                            # logical model work even though the eager reference may
-                            # materialize a wider score tensor before masking it.
+                            # MFU counts the model's bounded candidate search, not
+                            # wider eager-reference scoring that is masked afterwards.
                             candidate_seq_len = (
                                 indexer.candidate_topk_blocks
                                 * indexer.candidate_block_size
