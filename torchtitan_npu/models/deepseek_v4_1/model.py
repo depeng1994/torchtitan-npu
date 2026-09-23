@@ -367,6 +367,12 @@ class DeepSeekV41Model(Decoder):
                 )
 
         def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
+            """Estimate V4.1 model FLOPs per token using TorchTitan's MFU convention.
+
+            Engram table weights are sparse lookup storage and do not belong in the
+            dense ``6P`` term. Hierarchical Reindex is charged for logical candidate
+            work rather than eager-reference overcompute.
+            """
             from typing import cast
 
             from torchtitan.models.utils import get_moe_model_nparams_and_flops
@@ -382,39 +388,54 @@ class DeepSeekV41Model(Decoder):
                 seq_len,
             )
 
-            # Subtract the upstream per-token full-attention estimate and add
-            # the window + compressed-container attention actually performed.
+            engram_table_nparams = sum(
+                layer.engram.table.weight.numel()
+                for layer in deepseek_v4_1_model.layers.values()
+                if layer.engram is not None
+            )
+            num_flops_per_token -= 6 * engram_table_nparams
+
             num_flops_per_token -= 6 * len(self.layers) * first_attention.n_heads * head_dims * seq_len
             for layer in self.layers:
                 attention = layer.attention
-                # Sliding window, always attended.
                 num_flops_per_token += (
                     6
                     * attention.n_heads
                     * (2 * attention.head_dim)
                     * min(seq_len, attention.inner_attention.window_size)
                 )
-                # A ratio-1 layer pools one token per entry instead of skipping the
-                # pool: it still selects from the compressed container it shares with
-                # its source, so ``> 0`` is the boundary, not ``> 1``.
+
                 if attention.compress_ratio > 0:
                     compressed_seq_len = seq_len // attention.compress_ratio
-                    # The selected compressed entries, at most index_topk per query.
                     num_flops_per_token += (
                         6
                         * attention.n_heads
                         * (2 * attention.head_dim)
                         * min(attention.indexer.index_topk, compressed_seq_len)
                     )
-                    # The indexer scores every causally visible compressed entry. A
-                    # Reuse Mode layer is handed the selection its source already
-                    # made, so only Full and Reindex Mode layers pay for scoring.
-                    if attention.indexer.mode is not IndexerMode.REUSE:
+
+                    indexer = attention.indexer
+                    if indexer.mode is not IndexerMode.REUSE:
+                        indexer_seq_len = compressed_seq_len
+                        if (
+                            indexer.mode is IndexerMode.REINDEX
+                            and indexer.candidate_topk_blocks > 0
+                        ):
+                            # MFU counts the model's bounded candidate search, not
+                            # wider eager-reference scoring that is masked afterwards.
+                            candidate_seq_len = (
+                                indexer.candidate_topk_blocks
+                                * indexer.candidate_block_size
+                            )
+                            indexer_seq_len = min(
+                                indexer_seq_len, candidate_seq_len
+                            )
+
                         num_flops_per_token += (
                             6
-                            * attention.indexer.num_index_heads
-                            * attention.indexer.index_head_dim
-                            * compressed_seq_len
+                            * indexer.num_index_heads
+                            * indexer.index_head_dim
+                            * indexer_seq_len
                         )
             return nparams, num_flops_per_token
 
