@@ -100,6 +100,13 @@ class V2Contract(unittest.TestCase):
                 self.assertIn(expected,data)
             self.assertNotIn("runs-on: self-hosted",data)
 
+    def test_a5_workflow_is_validly_disabled_without_nonstandard_concurrency_keys(self):
+        data=(ROOT/".github/workflows/a5-64p-lite-actions.yml").read_text()
+        self.assertIn('CI_CHANNEL_ENABLED: "false"', data)
+        self.assertIn("cancel-in-progress: false", data)
+        self.assertNotIn("queue:", data)
+        self.assertNotIn("runs-on: self-hosted", data)
+
 
 if __name__ == "__main__":
     unittest.main()

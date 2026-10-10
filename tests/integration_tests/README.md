@@ -1,6 +1,6 @@
 # 集成测试基础设施
 
-> **Lite Actions V2 Phase 1（开发分支，尚未生产上线）**：8P/16P Workflow 使用动态 Matrix（每个 Test Case 独立 Job/状态），但真正的 NPU 训练由单实例 Lite Actions Dispatcher **全局串行执行**；Dispatcher 从经过验证的 Pool 拓扑动态选卡。A5 保持禁用。正式切换必须等待两仓部署兼容、真实 8P/16P 回归和 GitCode 主源同步确认。此前 Run 只能证明旧版本通过。
+> **Lite Actions V2 Phase 1（分层发布状态）**：调度侧 depeng1994/lite-actions 已合入 main 并由生产 V2 Dispatcher 运行，V1 协议兼容 Smoke [38061822173](https://github.com/depeng1994/torchtitan-npu/actions/runs/38061822173) PASS；本模型仓的 8P/16P V2 Matrix Workflow 仍位于 refactor/v2-phase1-serial / Draft PR #28，尚未合入 master。特性分支已有 8P/16P 实机验收证据，但不能冒充模型 master 发布证据。A5 Workflow 有定义但通道持续禁用，且无实机验收。
 
 
 本目录遵循 Torchtitan 的 `tests/integration_tests` 布局，负责维护集成测试定义、测试入口以及可选的 loss 精确比较。基础架构代码由

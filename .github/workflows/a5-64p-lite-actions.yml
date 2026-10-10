@@ -18,7 +18,6 @@ permissions:
 concurrency:
   group: a5-64p-ci
   cancel-in-progress: false
-  queue: max
 
 jobs:
   prepare:
