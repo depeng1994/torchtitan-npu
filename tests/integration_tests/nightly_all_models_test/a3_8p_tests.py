@@ -20,6 +20,10 @@ def build_test_list() -> list[OverrideDefinitions]:
             env_vars={
                 "ASCEND_SET_ENV_PATH": "/mnt/share/Ascend/20260805101249091/ascend-toolkit/latest/set_env.sh",
                 "HF_ASSETS_PATH": "/mnt/share/models/DeepSeek-V4-Flash-bf16",
+            # /data hosts the Docker overlay on A3 and can be 100% full.
+            # Put CI-only Hugging Face caches on the writable NFS volume.
+            "HF_HOME": "/mnt/share/ci_tests/.lite-actions-hf-cache",
+            "HF_DATASETS_CACHE": "/mnt/share/ci_tests/.lite-actions-hf-cache/datasets",
                 "CKPT_INIT_LOAD_PATH": "/mnt/share/dsv4_ckpt_8rank",
             },
             **common,
@@ -35,6 +39,10 @@ def build_test_list() -> list[OverrideDefinitions]:
             env_vars={
                 "ASCEND_SET_ENV_PATH": "/mnt/share/Ascend/20260805101249091/ascend-toolkit/latest/set_env.sh",
                 "HF_ASSETS_PATH": "/mnt/share/models/DeepSeek-V4-Flash-bf16",
+            # /data hosts the Docker overlay on A3 and can be 100% full.
+            # Put CI-only Hugging Face caches on the writable NFS volume.
+            "HF_HOME": "/mnt/share/ci_tests/.lite-actions-hf-cache",
+            "HF_DATASETS_CACHE": "/mnt/share/ci_tests/.lite-actions-hf-cache/datasets",
                 "CKPT_INIT_LOAD_PATH": "/mnt/share/dsv4_ckpt_8rank",
                 # AdamW needs swap-backed moments to fit the 8P model.
                 # Replaces swap_optimizer; preserves the shell's NPU ops.
