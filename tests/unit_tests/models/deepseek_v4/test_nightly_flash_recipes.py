@@ -69,6 +69,17 @@ def test_a3_16p_effective_recipe(tmp_path):
     assert 'torchtitan_npu.override.common.rms_norm.asc' in imports(argv)
 
 
+
+def test_a3_hf_cache_does_not_write_to_full_container_overlay():
+    """A3 /data-backed container overlays can be full; use verified shared NFS."""
+    cases = [*a3_8p_tests.build_test_list(), *a3_16p_tests.build_test_list()]
+    assert len(cases) == 3
+    for case in cases:
+        assert case.env_vars["HF_DATASETS_CACHE"] == "/mnt/share/ci_tests/.lite_actions/hf_cache/datasets"
+        assert case.env_vars["HF_HUB_CACHE"] == "/mnt/share/ci_tests/.lite_actions/hf_cache/hub"
+        assert case.env_vars["ASCEND_SET_ENV_PATH"].startswith("/mnt/share/Ascend/")
+
+
 def test_a5_model_recipe_keeps_explicit_initial_checkpoint(tmp_path):
     # The A5 case is still disabled at the dispatcher. Removing the old
     # Deleting the redundant checkpoint preflight flag cannot disable loading.

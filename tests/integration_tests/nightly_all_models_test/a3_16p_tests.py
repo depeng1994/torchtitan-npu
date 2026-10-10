@@ -25,6 +25,8 @@ def build_test_list() -> list[OverrideDefinitions]:
         # `${OPTIMIZER_OVERRIDES-default}`, so explicit empty removes Muon swap.
         env_vars={
             "ASCEND_SET_ENV_PATH": "/mnt/share/Ascend/20260805101249091/ascend-toolkit/latest/set_env.sh",
+            "HF_DATASETS_CACHE": "/mnt/share/ci_tests/.lite_actions/hf_cache/datasets",
+            "HF_HUB_CACHE": "/mnt/share/ci_tests/.lite_actions/hf_cache/hub",
             "HF_ASSETS_PATH": "/mnt/share/models/DeepSeek-V4-Flash-bf16",
             "CKPT_INIT_LOAD_PATH": "/mnt/share/dsv4_ckpt_8rank",
             "MASTER_PORT": "6316",
