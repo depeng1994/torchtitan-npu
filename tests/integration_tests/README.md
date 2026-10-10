@@ -108,8 +108,8 @@ GitHub 的正式 `*-lite-actions.yml` Workflow 配合独立的 [lite-actions](ht
 
 | Suite / 测试用例 | 训练内容 | 当前验收状态 |
 | --- | --- | --- |
-| `a3_8p_tests` / `dsv4_flash_a3_8p_example` | A3 单机 8P、Muon、Eager、5 steps | 当前 [Run 38034002241](https://github.com/depeng1994/torchtitan-npu/actions/runs/38034002241) 5 steps PASS，退出码 0 |
-| `a3_8p_tests` / `dsv4_flash_a3_8p_adamw` | A3 单机 8P、AdamW + Virtual Optimizer、Eager、5 steps | 当前 [Run 38034002241](https://github.com/depeng1994/torchtitan-npu/actions/runs/38034002241) 4K + Virtual Optimizer，5 steps PASS，退出码 0；旧版无 Virtual 曾 OOM |
+| `a3_8p_tests` / `dsv4_flash_a3_8p_example` | A3 单机 8P、Muon、Eager、5 steps | V2 [Run 38054910957](https://github.com/depeng1994/torchtitan-npu/actions/runs/38054910957) 单 Case 5 steps/TB/rc0 PASS；同 Run AdamW 曾外部 SIGKILL，Run 整体失败，未隐去 |
+| `a3_8p_tests` / `dsv4_flash_a3_8p_adamw` | A3 单机 8P、AdamW + Virtual Optimizer、Eager、5 steps | V2 [Run 38059258896](https://github.com/depeng1994/torchtitan-npu/actions/runs/38059258896)，SHA `99cd7e3`，4096 seq、5 steps/TB、rc0，独立 GitHub Job PASS |
 | `a3_16p_tests` / `dsv4_flash_a3_16p_example` | A3 双机 16P、AdamW、EP16、Eager、5 steps | V2 动态选卡在 [Run 38054913344](https://github.com/depeng1994/torchtitan-npu/actions/runs/38054913344) 基于 `99cd7e3` **PASS**：A3-3 0–7 + A3-4 8–15，双节点 rc=0、TensorBoard 5 steps、GitHub Job Success |
 | `a5_64p_tests` / `dsv4_pro_a5_64p` | A5 八机 64P、DeepSeek-V4 Pro | 禁用：真实 CANN/HF/Checkpoint 资产及 HCCL 网络未配置、未实机验收 |
 
