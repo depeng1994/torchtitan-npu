@@ -45,6 +45,8 @@ def test_a3_muon_and_adamw_effective_recipe(tmp_path):
         folder = tmp_path / str(i)
         folder.mkdir()
         argv = expanded_argv(case, folder)
+        assert case.env_vars["HF_HOME"].startswith("/mnt/share/ci_tests/")
+        assert case.env_vars["HF_DATASETS_CACHE"].startswith(case.env_vars["HF_HOME"] + "/")
         assert last(argv, '--training.steps') == '5'
         assert '--compile.no-enable' in argv
         assert npu in imports(argv)
@@ -60,6 +62,8 @@ def test_a3_muon_and_adamw_effective_recipe(tmp_path):
 
 def test_a3_16p_effective_recipe(tmp_path):
     case = a3_16p_tests.build_test_list()[0]
+    assert case.env_vars["HF_HOME"].startswith("/mnt/share/ci_tests/")
+    assert case.env_vars["HF_DATASETS_CACHE"].startswith(case.env_vars["HF_HOME"] + "/")
     argv = expanded_argv(case, tmp_path)
     assert last(argv, '--parallelism.expert-parallel-degree') == '16'
     assert case.env_vars['TORCHINDUCTOR_NPU_BACKEND'] == 'ascendc'
