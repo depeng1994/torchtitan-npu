@@ -35,10 +35,6 @@
       </div>
 
       <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
-              <ul>
-                <li class="toctree-l1"><a class="reference internal" href="../../MTP/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
-                </li>
-              </ul>
               <p class="caption"><span class="caption-text">Community</span></p>
               <ul>
                   <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
@@ -122,6 +118,8 @@
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/graph_trainer_ep_overlap/">GraphTrainer EP overlap 适配</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/mtp/">DeepSeek-V3.2 / DeepSeek-V4 MTP</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">DeepSeek-V4 Muon 优化器</a>
                   </li>
@@ -402,7 +400,7 @@ python3 scripts/parse_profiling_data.py path/to/save_traces_folder
   --profiler.extension.profile-ranks 0 \
   --profiler.extension.profile-with-memory
 </code></pre>
-<p>也可以通过原生周期参数显示拼接出相同的采集窗口：</p>
+<p>也可以通过原生周期参数显式拼接出相同的采集窗口：</p>
 <pre><code class="language-bash">NGPU=2 ./scripts/run_train.sh \
   --profiler.enable-profiling \
   --profiler.profile-freq 4 \
