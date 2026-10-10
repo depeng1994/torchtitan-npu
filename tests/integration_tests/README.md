@@ -110,7 +110,7 @@ GitHub 的正式 `*-lite-actions.yml` Workflow 配合独立的 [lite-actions](ht
 | --- | --- | --- |
 | `a3_8p_tests` / `dsv4_flash_a3_8p_example` | A3 单机 8P、Muon、Eager、5 steps | 当前 [Run 38034002241](https://github.com/depeng1994/torchtitan-npu/actions/runs/38034002241) 5 steps PASS，退出码 0 |
 | `a3_8p_tests` / `dsv4_flash_a3_8p_adamw` | A3 单机 8P、AdamW + Virtual Optimizer、Eager、5 steps | 当前 [Run 38034002241](https://github.com/depeng1994/torchtitan-npu/actions/runs/38034002241) 4K + Virtual Optimizer，5 steps PASS，退出码 0；旧版无 Virtual 曾 OOM |
-| `a3_16p_tests` / `dsv4_flash_a3_16p_example` | A3 双机 16P、AdamW、EP16、Eager、5 steps | 此前版本有成功验收记录；本轮按维护者要求不重复执行 16P。当前 `TORCHINDUCTOR_NPU_BACKEND=ascendc` 的最新提交未单独重新验收 |
+| `a3_16p_tests` / `dsv4_flash_a3_16p_example` | A3 双机 16P、AdamW、EP16、Eager、5 steps | V2 动态选卡在 [Run 38054913344](https://github.com/depeng1994/torchtitan-npu/actions/runs/38054913344) 基于 `99cd7e3` **PASS**：A3-3 0–7 + A3-4 8–15，双节点 rc=0、TensorBoard 5 steps、GitHub Job Success |
 | `a5_64p_tests` / `dsv4_pro_a5_64p` | A5 八机 64P、DeepSeek-V4 Pro | 禁用：真实 CANN/HF/Checkpoint 资产及 HCCL 网络未配置、未实机验收 |
 
 `workflow_dispatch.inputs.test_cases` 只支持真实 test ID 或可信 suite；不接受自定义 Python 路径、CLI、`STEPS` 或 `params`：
@@ -129,9 +129,9 @@ gh workflow run a3-16p-lite-actions.yml -R depeng1994/torchtitan-npu --ref maste
 
 8P AdamW 保持原始 4096 序列长度，并通过 `env_vars["OPTIMIZER_OVERRIDES"]="torchtitan_npu.override.common.optimizer.virtual"` 选择 Virtual Optimizer，替换（而不是叠加）Shell 默认的 `swap_optimizer`，保持全部 NPU 算子 imports，不修改 Muon 用例。Virtual Optimizer 将 AdamW moments 使用 Host-backed swap memory，以降低 HBM 占用；当前 8P Muon/AdamW 双用例已在上述 Run 38034002241 中完整 PASS；该结果覆盖 Eager smoke，不覆盖 Inductor、golden 或长期稳定性。
 
-**历史 V1** 同一个 8P Suite 两个测试在单 Job 中汇总结果；**V2 Phase 1** 拆为两个 GitHub Matrix Jobs，各自获得独立 PASS/FAIL，并由 Dispatcher 全局单训练槽位串行执行。最新 Run 38034002241 的 GitHub Commit Comment 已包含两条 PASS，Exit Code 均为 0；Eager PASS 不等于 Inductor、数值 golden 或 64P 实机通过。
+**历史 V1** 同一个 8P Suite 在单 Job 中汇总结果；**V2 Phase 1** 拆为两个 GitHub Matrix Jobs，每个 Case 独立 PASS/FAIL，Dispatcher 全局最多一个训练 Case。V2 的 [Run 38050639931](https://github.com/depeng1994/torchtitan-npu/actions/runs/38050639931) 两个 8P Case 分别 5 steps、rc=0、GitHub 独立 PASS；新 SHA `99cd7e3` 的回归另见计划台账。Eager PASS 不代表 Inductor、数值 golden 或 A5 64P 实机通过。
 
-**GitCode 同步注意：** GitHub 的 `master` 仍存在每日将 GitCode 同名分支强制镜像的 `Sync Upstream`。务必在 GitCode `master` 收录此次改动，避免后续同步覆盖当前 GitHub CI 工作流。
+**GitCode 同步注意：** `Sync Upstream` 每日镜像 GitCode 同名分支；发布应将包含 GitCode/GitHub 双方历史的相同 Release SHA 以快进方式提交到两侧 `master`，否则可能覆盖 Workflow。正式发布仅允许 `master`，特性分支临时验收白名单必须撤除。
 
 ## 并行调度（单机 Integration Runner）
 

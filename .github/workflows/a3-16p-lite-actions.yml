@@ -41,7 +41,6 @@ jobs:
           test "$CI_REQUEST_REPOSITORY" = "depeng1994/torchtitan-npu" || exit 1
           case "$CI_REQUEST_REF" in
             refs/heads/master) ;;
-            refs/heads/refactor/v2-phase1-serial) ;; # TEMP Phase1 E2E, revert after validation
             *) echo "CI branch not allowed" >&2; exit 1 ;;
           esac
       - name: Validate and expand trusted test plan
