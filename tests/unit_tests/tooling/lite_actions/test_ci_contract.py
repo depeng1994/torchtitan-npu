@@ -137,35 +137,80 @@ class CIContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"untrusted repository"):
             prepare.create_plan(cases=cases,run_id=123,attempt=1,
                                 sha="a"*40,repo="other/repo",pipeline="a3-8p")
-    def test_workflow_is_org_scoped_and_ci_pr_branch_dispatchable(self):
-        for file in ("a3-8p-lite-actions.yml", "a3-16p-lite-actions.yml"):
-            data = (ROOT / ".github/workflows" / file).read_text()
-            for expected in ("workflow_dispatch:",
-                             "fromJSON(needs.prepare.outputs.matrix)",
-                             "fail-fast: false", "--test-id",
-                             "actions/upload-artifact@v4",
-                             "torchtitan-npu/torchtitan-npu",
-                             "pull_request:",
-                             "github.event.pull_request.head.sha"):
-                self.assertIn(expected, data)
-            self.assertNotIn("CI_ALLOWED_ACTOR", data)
-            self.assertNotIn("refs/heads/fix/", data)
-            self.assertNotIn("runs-on: self-hosted", data)
-        a3_8p = (ROOT / ".github/workflows/a3-8p-lite-actions.yml").read_text()
-        self.assertIn("refs/heads/master|refs/heads/ci/*)", a3_8p)
-        a3_16p = (ROOT / ".github/workflows/a3-16p-lite-actions.yml").read_text()
-        for required in ("github.repository == 'torchtitan-npu/torchtitan-npu'",
-                         "github.event_name == 'pull_request'",
-                         "github.base_ref == 'master'",
-                         "github.event_name == 'workflow_dispatch'",
-                         "github.ref == 'refs/heads/master'",
-                         "startsWith(github.ref, 'refs/heads/ci/')",
-                         'CI_MAX_CASES: "2"',
-                         "CI_PLAN_DIGEST", "CI_WAIT_TIMEOUT_SECONDS"):
-            self.assertIn(required, a3_16p)
-        for redundant in ('run-name:', 'max-parallel:', 'CI_MAX_SELECTORS:',
-                          'Validate CI admission', 'concurrency:'):
-            self.assertNotIn(redundant, a3_16p)
+    def test_ci_workflow_reuse_contract(self):
+        import yaml
+        root = ROOT / ".github/workflows"
+        def read(name):
+            return yaml.load((root / name).read_text(), Loader=yaml.BaseLoader)
+        common = read("lite_actions_common.yml")
+        self.assertEqual(list(common["on"]), ["workflow_call"])
+        self.assertEqual(set(common["jobs"]), {"prepare", "case", "smoke"})
+        inputs = common["on"]["workflow_call"]["inputs"]
+        self.assertEqual(inputs["pipeline"]["required"], "true")
+        self.assertEqual(inputs["pipeline"]["type"], "string")
+        self.assertEqual(inputs["max_cases"]["type"], "number")
+        prepare = common["jobs"]["prepare"]
+        matrix = common["jobs"]["case"]
+        smoke = common["jobs"]["smoke"]
+        self.assertIn("torchtitan-npu/torchtitan-npu", prepare["if"])
+        self.assertIn("github.base_ref == 'master'", prepare["if"])
+        self.assertIn("startsWith(github.ref, 'refs/heads/ci/')", prepare["if"])
+        self.assertEqual(matrix["needs"], "prepare")
+        self.assertIn("needs.prepare.result == 'success'",matrix["if"])
+        self.assertEqual(matrix["strategy"]["fail-fast"], "false")
+        self.assertIn("fromJSON(needs.prepare.outputs.matrix)", matrix["strategy"]["matrix"])
+        self.assertEqual(matrix["timeout-minutes"], "300")
+        plan = prepare["steps"][1]
+        self.assertEqual(plan["env"]["CI_MAX_SELECTORS"], "2")
+        self.assertIn("inputs.max_cases", plan["env"]["CI_MAX_CASES"])
+        self.assertIn("inputs.pipeline", plan["env"]["CI_PIPELINE"])
+        self.assertIn("github.event.pull_request.head.sha", plan["env"]["CI_SOURCE_SHA"])
+        self.assertIn("inputs.default_cases", plan["env"]["CI_TEST_CASES"])
+        artifact = prepare["steps"][2]
+        self.assertEqual(artifact["uses"], "actions/upload-artifact@v4")
+        self.assertEqual(artifact["with"]["if-no-files-found"], "error")
+        self.assertEqual(artifact["with"]["retention-days"], "1")
+        waiter = matrix["steps"][1]
+        for env in ("CI_SOURCE_SHA", "CI_RESULT_AUTHOR", "CI_PLAN_DIGEST",
+                    "CI_WAIT_TIMEOUT_SECONDS"):
+            self.assertIn(env, waiter["env"])
+        self.assertIn("--test-id", waiter["run"])
+        self.assertIn("--case a3-smoke", smoke["steps"][1]["run"])
+        self.assertEqual(smoke["timeout-minutes"], "90")
+        self.assertIn("github.base_ref == 'master'", smoke["if"])
+        for filename,pipeline,default,limit in (
+            ("a3-8p-lite-actions.yml", "a3-8p", "a3_8p_tests", "4"),
+            ("a3-16p-lite-actions.yml", "a3-16p", "a3_16p_tests", "2"),
+            ("a5-64p-lite-actions.yml", "a5-64p", "dsv4_pro_a5_64p", "1"),
+        ):
+            with self.subTest(filename=filename):
+                data=read(filename)
+                self.assertEqual(list(data["jobs"]), ["ci"])
+                caller=data["jobs"]["ci"]
+                self.assertEqual(caller["uses"], "./.github/workflows/lite_actions_common.yml")
+                self.assertEqual(caller["with"]["pipeline"], pipeline)
+                self.assertEqual(caller["with"]["max_cases"], limit)
+                self.assertIn(default, caller["with"]["default_cases"])
+                self.assertIn("inputs.test_cases", caller["with"]["test_cases"])
+                self.assertEqual(data["permissions"], common["permissions"])
+                self.assertIn("workflow_dispatch", data["on"])
+                if pipeline=="a5-64p":
+                    self.assertNotIn("pull_request", data["on"])
+                    self.assertEqual(caller["if"], chr(36)+"{{ false }}")
+                else:
+                    self.assertEqual(data["on"]["pull_request"]["branches"], ["master"])
+        smoke_caller=read("lite-actions-dispatcher-smoke.yml")
+        self.assertEqual(
+            smoke_caller["jobs"]["ci"]["uses"],"./.github/workflows/lite_actions_common.yml")
+        self.assertEqual(smoke_caller["jobs"]["ci"]["with"]["pipeline"],"a3-smoke")
+        self.assertEqual(smoke_caller["permissions"],common["permissions"])
+        self.assertEqual(smoke_caller["jobs"]["ci"]["with"]["wait_seconds"],"4800")
+
+    def test_model_owned_plan_is_unchanged_after_reuse(self):
+        selected=prepare.expand_cases([{"suite":"a3_16p_tests"}],2)
+        self.assertEqual([c["test_id"] for c in selected],
+                         ["dsv4_flash_a3_16p_example"])
+        self.assertEqual((selected[0]["nnodes"],selected[0]["ngpu"]),(2,8))
 
     def test_new_ci_files_have_huawei_copyright(self):
         files = [
@@ -173,7 +218,8 @@ class CIContract(unittest.TestCase):
             ".github/scripts/lite_actions/wait_result.py",
             *(".github/workflows/" + name for name in (
                 "a3-16p-lite-actions.yml", "a3-8p-lite-actions.yml",
-                "a5-64p-lite-actions.yml", "lite-actions-dispatcher-smoke.yml")),
+                "a5-64p-lite-actions.yml", "lite-actions-dispatcher-smoke.yml",
+                "lite_actions_common.yml")),
             *("tests/integration_tests/nightly_all_models_test/" + name for name in (
                 "a3_16p_tests.py", "a3_8p_tests.py", "a5_64p_tests.py", "runner.py")),
             "tests/integration_tests/tools/lite_actions/entrypoint.py",
@@ -181,7 +227,7 @@ class CIContract(unittest.TestCase):
             *("tests/unit_tests/tooling/lite_actions/" + name for name in (
                 "test_ci_contract.py", "test_entrypoint.py", "test_request.py")),
         ]
-        self.assertEqual(len(files), 15)
+        self.assertEqual(len(files), 16)
         copyright = "# Copyright (c) 2026 Huawei Technologies Co., Ltd."
         for name in files:
             with self.subTest(path=name):
@@ -191,12 +237,12 @@ class CIContract(unittest.TestCase):
                 self.assertTrue(content.startswith(copyright), name)
                 self.assertIn("BSD-style license", "\n".join(content.splitlines()[:6]))
 
-    def test_a5_workflow_is_validly_disabled_without_nonstandard_concurrency_keys(self):
-        data=(ROOT/".github/workflows/a5-64p-lite-actions.yml").read_text()
-        self.assertIn('CI_CHANNEL_ENABLED: "false"', data)
-        self.assertIn("cancel-in-progress: false", data)
-        self.assertNotIn("queue:", data)
-        self.assertNotIn("runs-on: self-hosted", data)
+    def test_unrelated_workflows_remain_independent(self):
+        for name in ("deploy-docs.yml","sync-upstream.yml"):
+            data=(ROOT/".github/workflows"/name).read_text()
+            self.assertNotIn("lite_actions_common.yml",data)
+            self.assertIn("secrets.DEPLOY_KEY",data)
+
 
 
 if __name__ == "__main__":

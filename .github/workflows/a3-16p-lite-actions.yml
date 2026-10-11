@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       test_cases:
-        description: 'JSON list of registered test_id or suite selectors'
+        description: JSON list of test_id or suite selectors
         type: string
         required: true
         default: '[{"suite":"a3_16p_tests"}]'
@@ -21,53 +21,10 @@ permissions:
   actions: read
 
 jobs:
-  prepare:
-    # Admission happens before any untrusted PR code is checked out.
-    if: >-
-      github.repository == 'torchtitan-npu/torchtitan-npu' &&
-      ((github.event_name == 'pull_request' && github.base_ref == 'master') ||
-       (github.event_name == 'workflow_dispatch' &&
-        (github.ref == 'refs/heads/master' ||
-         startsWith(github.ref, 'refs/heads/ci/'))))
-    name: Prepare trusted CI Matrix
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-      plan_digest: ${{ steps.plan.outputs.plan_digest }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Validate and expand trusted test plan
-        id: plan
-        env:
-          CI_TEST_CASES: ${{ github.event_name == 'pull_request' && '[{"suite":"a3_16p_tests"}]' || inputs.test_cases }}
-          CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          CI_MAX_CASES: "2"
-          CI_PIPELINE: "a3-16p"
-        run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/prepare_request.py
-      - name: Upload immutable CI request
-        uses: actions/upload-artifact@v4
-        with:
-          name: lite-ci-request-${{ github.run_attempt }}
-          path: .ci-request/ci-request.json
-          retention-days: 1
-          if-no-files-found: error
-
-  case:
-    needs: prepare
-    name: ${{ matrix.label }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Wait for internal a3-16p case
-        env:
-          GH_TOKEN: ${{ github.token }}
-          CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          CI_RESULT_AUTHOR: ${{ vars.LITE_CI_RESULT_ACTOR }}
-          CI_PLAN_DIGEST: ${{ needs.prepare.outputs.plan_digest }}
-          CI_WAIT_TIMEOUT_SECONDS: "16800"
-        run: python3 .github/scripts/lite_actions/wait_result.py --case a3-16p --test-id "${{ matrix.test_id }}"
+  ci:
+    uses: ./.github/workflows/lite_actions_common.yml
+    with:
+      pipeline: a3-16p
+      default_cases: '[{"suite":"a3_16p_tests"}]'
+      test_cases: ${{ inputs.test_cases }}
+      max_cases: 2

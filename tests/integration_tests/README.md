@@ -142,6 +142,22 @@ python -m tests.integration_tests.run_tests /tmp/engram-hf-output \
 
 Nightly CI 用例专为真实物理集群设计，由内网 [Lite Actions](https://github.com/depeng1994/lite-actions) 调度机通过 SSH 远程拉起：
 
+### GitHub Actions 入口与公共工作流
+
+.github/workflows/lite_actions_common.yml 为内部共享的 workflow_call 实现，
+统一负责组织仓/目标分支准入、SHA 绑定、Matrix 规划、不可变 Artifact 上传和云端 Waiter。
+各入口只声明触发条件与差异参数：
+
+- a3-8p-lite-actions.yml：自动 PR + 手动选择 Case，a3-8p，最多 4 Cases；
+- a3-16p-lite-actions.yml：自动 PR + 手动选择 Case，a3-16p，最多 2 Cases；
+- a5-64p-lite-actions.yml：预留手动入口，复用同一 Matrix 协议，仍显式禁用；
+- lite-actions-dispatcher-smoke.yml：复用公共 Waiter，但仅等待 npu-smi，不生成训练 Matrix。
+
+调用方式使用 ./.github/workflows/lite_actions_common.yml，共享工作流与 PR
+入口来自同一个提交。A3 资源分配、真实训练和全局串行仍由内网 Dispatcher 负责。
+deploy-docs.yml、sync-upstream.yml 是不同权限/用途的独立工作流，不进入此共用机制。
+
+
 | Suite 名称 | Case ID | 硬件规格 | 优化器与训练配置 | 验证指标 |
 | :--- | :--- | :--- | :--- | :--- |
 | **`a3_8p_tests`** | `dsv4_flash_a3_8p_example` | A3 单机 8P | Muon，Eager，5 steps | Exit Code 0、TensorBoard 步数 |
