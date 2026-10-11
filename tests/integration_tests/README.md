@@ -187,6 +187,16 @@ python3 -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite
 
 ---
 
+### 2.3 从个人 master 向组织 master 提交 CI 代码
+
+Lite Actions 模型侧正式开发入口是 [个人 fork master](https://github.com/depeng1994/torchtitan-npu/tree/master)，通过跨仓 PR 提交至 [组织 master](https://github.com/torchtitan-npu/torchtitan-npu/tree/master)。两个仓库的 Workflow 使用同一份 SHA 绑定与调度协议，`prepare_request.py` 与 `wait_result.py` 只接受这两个明确列入白名单的仓库身份；Workflow 仅允许 `depeng1994` 在 `master` 分支手工发起。不得开放任意仓库或 PR 自动运行外部代码。
+
+组织仓 PR #5 的验证证据已在 [其讨论记录](https://github.com/torchtitan-npu/torchtitan-npu/pull/5) 归档：A3 8P [Run 38107457927](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38107457927)（Muon、AdamW 独立 Job PASS）、A3 16P [Run 38107460233](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38107460233)（双机 5 step PASS）、最终 Smoke [Run 38109967742](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38109967742)（调度机 Lite Actions main `0dbb28f` PASS）。历史成功证据针对当时受 SHA 绑定的源码，不代表本次新增的双仓兼容模式已在组织仓合入后重新执行。A5 64P 仍被显式禁用，拒绝 admission 属预期行为。
+
+从个人 master 触发时需确保 Lite Dispatcher 的 `A3_CI_REPOSITORY` 与 `A3_CI_ALLOWED_BRANCHES` 匹配当前来源（个人仓、master）；组织仓合入后再由运维受控切换为组织仓、master。调度机始终只轮询一个可信仓库，不能把旧 PR 测试分支当正式分支。
+
+---
+
 ## 4. 测试断言与排障说明
 
 ### 4.1 成功判定条件

@@ -13,13 +13,14 @@ concurrency:
 
 jobs:
   ci:
-    if: github.actor == 'depeng1994' && github.repository == 'depeng1994/torchtitan-npu' && github.ref == 'refs/heads/master'
+    if: github.actor == 'depeng1994' && (github.repository == 'depeng1994/torchtitan-npu' || github.repository == 'torchtitan-npu/torchtitan-npu') && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Phase 1 serial queue can place smoke behind long training runs.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Wait for dispatcher-only npu-smi probe
         env:
           GH_TOKEN: ${{ github.token }}
-          CI_WAIT_TIMEOUT_SECONDS: "1000"
+          CI_WAIT_TIMEOUT_SECONDS: "4800"
         run: python3 .github/scripts/lite_actions/wait_result.py --case a3-smoke

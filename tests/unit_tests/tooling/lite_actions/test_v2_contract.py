@@ -90,6 +90,37 @@ class V2Contract(unittest.TestCase):
                               b'"expired":false}]}')):
             waiter.ensure_attempt_artifact("test-token",1234,2)
 
+    def test_both_trusted_repository_modes_and_unknown_rejection(self):
+        from unittest.mock import patch
+        org = "torchtitan-npu/torchtitan-npu"
+        fork = "depeng1994/torchtitan-npu"
+        self.assertEqual(prepare.TRUSTED_REPOS, {org, fork})
+        self.assertEqual(waiter.TRUSTED_REPOS, {org, fork})
+        cases = [{"test_id": "dsv4_flash_a3_8p_example",
+                  "nnodes": 1, "ngpu": 8}]
+        for repo in (fork, org):
+            with patch.object(prepare, "REPO", repo), patch.object(waiter, "REPO", repo):
+                plan = prepare.create_plan(cases=cases, run_id=123,
+                                           attempt=1, sha="a"*40,
+                                           repo=repo, pipeline="a3-8p")
+                self.assertEqual(plan["repo"], repo)
+                result = {"schema": 2, "repo": repo, "run_id": 123,
+                          "attempt": 1, "sha": "a"*40, "pipeline": "a3-8p",
+                          "test_id": cases[0]["test_id"],
+                          "plan_digest": "b"*64, "status": "PASS",
+                          "exit_code": 0, "last_20_lines": []}
+                comment = {"user": {"login": "depeng1994"},
+                           "body": f"Lite-CI-V2-RESULT 123:1:{cases[0]['test_id']}\n" +
+                                   json.dumps(result)}
+                found = waiter.find_case_result(
+                    [comment], sha="a"*40, run_id=123, attempt=1,
+                    pipeline="a3-8p", test_id=cases[0]["test_id"],
+                    plan_digest="b"*64)
+                self.assertEqual(found, result)
+        with self.assertRaisesRegex(ValueError, "untrusted repository"):
+            prepare.create_plan(cases=cases, run_id=123, attempt=1,
+                                sha="a"*40, repo="other/repo", pipeline="a3-8p")
+
     def test_workflow_is_untrusted_pr_closed_and_matrix_native(self):
         for file in ("a3-8p-lite-actions.yml", "a3-16p-lite-actions.yml"):
             data=(ROOT/".github/workflows"/file).read_text()
@@ -98,6 +129,11 @@ class V2Contract(unittest.TestCase):
                              "CI_PROTOCOL_VERSION: \"2\"", "--test-id",
                              "actions/upload-artifact@v4"):
                 self.assertIn(expected,data)
+            for repo in ("depeng1994/torchtitan-npu",
+                         "torchtitan-npu/torchtitan-npu"):
+                self.assertIn(repo, data)
+            self.assertNotIn("refs/heads/fix/", data)
+            self.assertNotIn("pull_request:", data)
             self.assertNotIn("runs-on: self-hosted",data)
 
     def test_a5_workflow_is_validly_disabled_without_nonstandard_concurrency_keys(self):

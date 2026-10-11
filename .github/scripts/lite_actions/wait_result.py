@@ -10,7 +10,12 @@ import time
 import urllib.parse
 import urllib.request
 
-REPO = "depeng1994/torchtitan-npu"
+# Both sides of the personal-master -> organization-master PR are trusted.
+# GitHub binds this to the running repository, never to a PR-supplied input.
+TRUSTED_REPOS = frozenset({"depeng1994/torchtitan-npu", "torchtitan-npu/torchtitan-npu"})
+REPO = os.environ.get("GITHUB_REPOSITORY", "depeng1994/torchtitan-npu")
+if REPO not in TRUSTED_REPOS:
+    raise ValueError("untrusted GitHub CI repository")
 PIPELINES = {
     "a3-smoke": ("Dispatcher-Smoke", "npu-smi"),
     "a3-8p": ("A3-8p-CI-Example", "a3-8p"),
