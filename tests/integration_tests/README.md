@@ -264,17 +264,25 @@ python3 -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite
    - 执行机**完全不持有 GitHub Token**，仅内网调度机单点具有回写 Comment 权限。
 
 ### 3.2 手动调度（Maintainer 冒烟与调试）
-维护者亦可通过 GitHub Actions 网页界面或 GitHub CLI 手动发起调度：
+维护者亦可通过 GitHub Actions 网页界面或 GitHub CLI 手动发起调度。以下命令以**组织仓 `master` 已合并相应 Workflow** 为前提；PR #6 尚未合入组织仓主分支时，应使用 PR 自动触发的检查，不要将本例理解为当前组织仓 `master` 必然已可手动运行：
 
 ```bash
-# 执行 A3 8P 全部用例 (Muon + AdamW 独立 Matrix Job 串行执行)
-gh workflow run a3-8p-lite-actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
+# 执行 A3 8P 全部用例（Muon + AdamW 独立 Matrix Case，资源不重叠即可并发）
+gh workflow run a3_8p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
   -f 'test_cases=[{"suite":"a3_8p_tests"}]'
 
 # 仅执行指定 16P 用例
-gh workflow run a3-16p-lite-actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
+gh workflow run a3_16p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
   -f 'test_cases=[{"test_id":"dsv4_flash_a3_16p_example"}]'
 ```
 
-### 3.3 硬件环境与调度故障排障
+### 3.3 Case 并发与分布式端口契约
+
+每个 GitHub Matrix Test Case 都是独立的调度单位：Lite Actions 仅在物理 NPU 设备组互不重叠且资源池授权的情况下并发运行；两节点 16P 必须一次取得两个 Host 的完整设备组。此处的并发调度不同于本目录 `run_tests.py` 的本机 `GPUPool`，两套机制不应混淆。
+
+模型仓仍通过 `OverrideDefinitions.env_vars` 保存用例的 `MASTER_PORT`、`HCCL_IF_BASE_PORT` 默认值。多机 Lite Actions 运行时，由 Dispatcher 持有 Host 级端口租约，通过 `LITE_CI_MASTER_PORT` / `LITE_CI_HCCL_IF_BASE_PORT` 传入启动器；`nightly_all_models_test/runner.py` 校验端口后将其映射为实际 `MASTER_PORT` / `HCCL_IF_BASE_PORT`，**优先于用例固定默认值**。普通手动运行不提供 `LITE_CI_*` 变量时维持原有行为；不要在模型脚本中硬编码覆盖 Dispatcher 的端口。
+
+**实机验收（2026-10-11）**：模型 SHA `e465e79` / Lite `78015f9`。 [8P Run 38147139071 Attempt 3](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38147139071) 两个 Case 分别在 A3-3、A3-4 并发并 PASS；[16P Run 38147139067 Attempt 2](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38147139067) 双机 PASS；[Smoke 38147139076](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38147139076) PASS。A5 64P 继续禁用；同机容量与并发故障恢复仍需独立验收。
+
+### 3.4 硬件环境与调度故障排障
 若任务长时间卡在排队状态、远端 NPU 报告 Quarantine 或出现 SSH 连接异常，属于物理集群调度机层面的环境状态问题，请参阅 [Lite Actions 调度系统文档](https://github.com/depeng1994/lite-actions) 的日常运维与应急排障小节。
