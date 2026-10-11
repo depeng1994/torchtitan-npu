@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """A3 8P DeepSeek-V4 Flash Eager regression: Muon and AdamW."""
 from tests.integration_tests import OverrideDefinitions
 

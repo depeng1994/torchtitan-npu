@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """CPU-only CI plan, independent Matrix, waiter and workflow admission."""
 from __future__ import annotations
 
@@ -134,19 +139,57 @@ class CIContract(unittest.TestCase):
                                 sha="a"*40,repo="other/repo",pipeline="a3-8p")
     def test_workflow_is_org_scoped_and_ci_pr_branch_dispatchable(self):
         for file in ("a3-8p-lite-actions.yml", "a3-16p-lite-actions.yml"):
-            data=(ROOT/".github/workflows"/file).read_text()
-            for expected in ("workflow_dispatch:", "refs/heads/master|refs/heads/ci/*)",
-                             "fromJSON(needs.prepare.outputs.matrix)", "fail-fast: false",
-                             "--test-id",
-                             "actions/upload-artifact@v4"):
-                self.assertIn(expected,data)
-            self.assertIn("torchtitan-npu/torchtitan-npu",data)
-            self.assertIn("refs/heads/ci/*",data)
-            self.assertNotIn("CI_ALLOWED_ACTOR",data)
-            self.assertNotIn("refs/heads/fix/",data)
-            self.assertIn("pull_request:", data)
-            self.assertIn("github.event.pull_request.head.sha", data)
-            self.assertNotIn("runs-on: self-hosted",data)
+            data = (ROOT / ".github/workflows" / file).read_text()
+            for expected in ("workflow_dispatch:",
+                             "fromJSON(needs.prepare.outputs.matrix)",
+                             "fail-fast: false", "--test-id",
+                             "actions/upload-artifact@v4",
+                             "torchtitan-npu/torchtitan-npu",
+                             "pull_request:",
+                             "github.event.pull_request.head.sha"):
+                self.assertIn(expected, data)
+            self.assertNotIn("CI_ALLOWED_ACTOR", data)
+            self.assertNotIn("refs/heads/fix/", data)
+            self.assertNotIn("runs-on: self-hosted", data)
+        a3_8p = (ROOT / ".github/workflows/a3-8p-lite-actions.yml").read_text()
+        self.assertIn("refs/heads/master|refs/heads/ci/*)", a3_8p)
+        a3_16p = (ROOT / ".github/workflows/a3-16p-lite-actions.yml").read_text()
+        for required in ("github.repository == 'torchtitan-npu/torchtitan-npu'",
+                         "github.event_name == 'pull_request'",
+                         "github.base_ref == 'master'",
+                         "github.event_name == 'workflow_dispatch'",
+                         "github.ref == 'refs/heads/master'",
+                         "startsWith(github.ref, 'refs/heads/ci/')",
+                         'CI_MAX_CASES: "2"',
+                         "CI_PLAN_DIGEST", "CI_WAIT_TIMEOUT_SECONDS"):
+            self.assertIn(required, a3_16p)
+        for redundant in ('run-name:', 'max-parallel:', 'CI_MAX_SELECTORS:',
+                          'Validate CI admission', 'concurrency:'):
+            self.assertNotIn(redundant, a3_16p)
+
+    def test_new_ci_files_have_huawei_copyright(self):
+        files = [
+            ".github/scripts/lite_actions/prepare_request.py",
+            ".github/scripts/lite_actions/wait_result.py",
+            *(".github/workflows/" + name for name in (
+                "a3-16p-lite-actions.yml", "a3-8p-lite-actions.yml",
+                "a5-64p-lite-actions.yml", "lite-actions-dispatcher-smoke.yml")),
+            *("tests/integration_tests/nightly_all_models_test/" + name for name in (
+                "a3_16p_tests.py", "a3_8p_tests.py", "a5_64p_tests.py", "runner.py")),
+            "tests/integration_tests/tools/lite_actions/entrypoint.py",
+            "tests/unit_tests/models/deepseek_v4/test_nightly_flash_recipes.py",
+            *("tests/unit_tests/tooling/lite_actions/" + name for name in (
+                "test_ci_contract.py", "test_entrypoint.py", "test_request.py")),
+        ]
+        self.assertEqual(len(files), 15)
+        copyright = "# Copyright (c) 2026 Huawei Technologies Co., Ltd."
+        for name in files:
+            with self.subTest(path=name):
+                content = (ROOT / name).read_text()
+                if content.startswith("#!"):
+                    content = content.split("\n", 1)[1]
+                self.assertTrue(content.startswith(copyright), name)
+                self.assertIn("BSD-style license", "\n".join(content.splitlines()[:6]))
 
     def test_a5_workflow_is_validly_disabled_without_nonstandard_concurrency_keys(self):
         data=(ROOT/".github/workflows/a5-64p-lite-actions.yml").read_text()

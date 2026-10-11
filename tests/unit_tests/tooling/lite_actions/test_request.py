@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """CPU-only GitHub Actions Inputs -> bound JSON Artifact contract."""
 from __future__ import annotations
 import importlib.util

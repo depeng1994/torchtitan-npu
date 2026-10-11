@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Shared execution adapter for OverrideDefinitions-based 8P/16P/64P cases.
 
 TorchTitan's run_tests()/GPUPool remains the 1-node 8P test runner.

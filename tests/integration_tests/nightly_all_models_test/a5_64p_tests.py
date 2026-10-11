@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """A5 64P DeepSeek-V4 Pro case (eight nodes, currently disabled in scheduler)."""
 from tests.integration_tests import OverrideDefinitions
 

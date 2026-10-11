@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Trusted CPU-only workflow -> Matrix and source-SHA-bound Artifact.
 
 GitHub prepares one immutable, SHA-bound case plan. The dispatcher owns training.
