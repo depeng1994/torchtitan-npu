@@ -70,6 +70,17 @@ class CIContract(unittest.TestCase):
             expanded = prepare.expand_cases([{'suite': 'synthetic_tests'}])
         self.assertEqual(len(expanded), 15)
 
+    def test_ci_host_and_npu_hccl_ranges_validate_and_map(self):
+        from tests.integration_tests.nightly_all_models_test.runner import dispatcher_port_env
+        with patch.dict(os.environ, {"LITE_CI_HCCL_HOST_PORT_RANGE":"24000-24063",
+                                  "LITE_CI_HCCL_NPU_PORT_RANGE":"28000-28063"}):
+            x=dispatcher_port_env()
+            self.assertEqual(x['HCCL_HOST_SOCKET_PORT_RANGE'],'24000-24063')
+            self.assertEqual(x['HCCL_NPU_SOCKET_PORT_RANGE'],'28000-28063')
+        for invalid in ('auto','16666','1-23','99999-100000','32000-31999'):
+            with patch.dict(os.environ,{'LITE_CI_HCCL_NPU_PORT_RANGE':invalid}):
+                with self.assertRaises(ValueError): dispatcher_port_env()
+
     def test_ci_port_override_wins_over_multinode_recipe_defaults(self):
         from unittest.mock import patch
         from tests.integration_tests.nightly_all_models_test.runner import dispatcher_port_env

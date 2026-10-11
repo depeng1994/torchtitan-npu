@@ -282,6 +282,10 @@ gh workflow run a3_16p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref m
 
 模型仓仍通过 `OverrideDefinitions.env_vars` 保存用例的 `MASTER_PORT`、`HCCL_IF_BASE_PORT` 默认值。多机 Lite Actions 运行时，由 Dispatcher 持有 Host 级端口租约，通过 `LITE_CI_MASTER_PORT` / `LITE_CI_HCCL_IF_BASE_PORT` 传入启动器；`nightly_all_models_test/runner.py` 校验端口后将其映射为实际 `MASTER_PORT` / `HCCL_IF_BASE_PORT`，**优先于用例固定默认值**。普通手动运行不提供 `LITE_CI_*` 变量时维持原有行为；不要在模型脚本中硬编码覆盖 Dispatcher 的端口。
 
+**P2.5 端口隔离适配**：受信任的 Lite Dispatcher 除 `LITE_CI_MASTER_PORT` 和 `LITE_CI_HCCL_IF_BASE_PORT` 外，还提供 `LITE_CI_HCCL_HOST_PORT_RANGE` / `LITE_CI_HCCL_NPU_PORT_RANGE`。测试入口在单机 8P 与双机 16P 均强制将其映射到 `HCCL_HOST_SOCKET_PORT_RANGE` / `HCCL_NPU_SOCKET_PORT_RANGE`，并在每个 Rank 实际启动前覆盖用例默认环境变量。同机多训练**必须实测 CANN 的 Host/NPU 端口支持与绑定效果**，不得单凭不同 `MASTER_PORT` 判定安全。
+
+**新增 N14 实机 Gate**：同时触发两条独立 A3-8P Actions（两个 Run ID，各含 Muon、AdamW），共四条 Matrix Case 必须在两机四个独立 8P 设备组上存在共同训练运行区间，并均通过 5 steps/TB/Exit Code/释放检查。单个 Workflow 中两个 Matrix Case PASS 不算 N14。A5 64P 继续禁用。
+
 **实机验收（2026-10-11）**：模型 SHA `e465e79` / Lite `78015f9`。 [8P Run 38147139071 Attempt 3](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38147139071) 两个 Case 分别在 A3-3、A3-4 并发并 PASS；[16P Run 38147139067 Attempt 2](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38147139067) 双机 PASS；[Smoke 38147139076](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38147139076) PASS。A5 64P 继续禁用；同机容量与并发故障恢复仍需独立验收。
 
 ### 3.4 硬件环境与调度故障排障

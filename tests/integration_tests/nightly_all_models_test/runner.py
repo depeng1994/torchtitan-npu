@@ -28,6 +28,14 @@ def dispatcher_port_env() -> dict[str, str]:
             if not raw.isascii() or not raw.isdecimal() or not 1024 <= int(raw) <= 65535:
                 raise ValueError(f"invalid dispatcher-issued {key}")
             overrides[target] = raw
+    for key, target in (("LITE_CI_HCCL_HOST_PORT_RANGE", "HCCL_HOST_SOCKET_PORT_RANGE"),
+                        ("LITE_CI_HCCL_NPU_PORT_RANGE", "HCCL_NPU_SOCKET_PORT_RANGE")):
+        raw = os.environ.get(key)
+        if raw is not None:
+            match = __import__("re").fullmatch(r"([1-9][0-9]{3,4})-([1-9][0-9]{3,4})", raw)
+            if not match or not 1024 <= int(match[1]) <= int(match[2]) <= 65535:
+                raise ValueError(f"invalid dispatcher-issued {key}")
+            overrides[target] = raw
     return overrides
 
 
@@ -42,6 +50,11 @@ def run_single(test: OverrideDefinitions, *, output_dir: Path | None = None) -> 
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         parser.error("output_dir must be empty")
+    # run_tests.run_single_test merges OverrideDefinitions.env_vars after
+    # os.environ, so trusted dispatcher ports must also override the test's
+    # per-Case defaults (not just the shell environment).
+    from dataclasses import replace
+    test = replace(test, env_vars={**(test.env_vars or {}), **dispatcher_port_env()})
     run_tests(argparse.Namespace(output_dir=str(output), ngpu=test.ngpu,
                                  test_name=test.test_name, exclude=None),
               [test], parallel=True)
