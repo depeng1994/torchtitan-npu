@@ -148,10 +148,10 @@ Nightly CI 用例专为真实物理集群设计，由内网 [Lite Actions](https
 统一负责组织仓/目标分支准入、SHA 绑定、Matrix 规划、不可变 Artifact 上传和云端 Waiter。
 各入口只声明触发条件与差异参数：
 
-- a3-8p-lite-actions.yml：自动 PR + 手动选择 Case，a3-8p，最多 4 Cases；
-- a3-16p-lite-actions.yml：自动 PR + 手动选择 Case，a3-16p，最多 2 Cases；
-- a5-64p-lite-actions.yml：预留手动入口，复用同一 Matrix 协议，仍显式禁用；
-- lite-actions-dispatcher-smoke.yml：复用公共 Waiter，但仅等待 npu-smi，不生成训练 Matrix。
+- a3_8p_lite_actions.yml：自动 PR + 手动选择 Case，a3-8p，自动执行 Suite 中全部 Case；
+- a3_16p_lite_actions.yml：自动 PR + 手动选择 Case，a3-16p，自动执行 Suite 中全部 Case；
+- a5_64p_lite_actions.yml：预留手动入口，复用同一 Matrix 协议，仍显式禁用；
+- lite_actions_dispatcher_smoke.yml：复用公共 Waiter，但仅等待 npu-smi，不生成训练 Matrix。
 
 调用方式使用 ./.github/workflows/lite_actions_common.yml，共享工作流与 PR
 入口来自同一个提交。A3 资源分配、真实训练和全局串行仍由内网 Dispatcher 负责。
@@ -260,11 +260,11 @@ python3 -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite
 
 ```bash
 # 执行 A3 8P 全部用例 (Muon + AdamW 独立 Matrix Job 串行执行)
-gh workflow run a3-8p-lite-actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
+gh workflow run a3_8p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
   -f 'test_cases=[{"suite":"a3_8p_tests"}]'
 
 # 仅执行指定 16P 用例
-gh workflow run a3-16p-lite-actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
+gh workflow run a3_16p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
   -f 'test_cases=[{"test_id":"dsv4_flash_a3_16p_example"}]'
 ```
 

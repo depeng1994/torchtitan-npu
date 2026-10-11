@@ -189,9 +189,9 @@ class CIContract(unittest.TestCase):
         self.assertEqual(smoke["timeout-minutes"], "90")
         self.assertIn("github.base_ref == 'master'", smoke["if"])
         for filename,pipeline,default in (
-            ("a3-8p-lite-actions.yml", "a3-8p", "a3_8p_tests"),
-            ("a3-16p-lite-actions.yml", "a3-16p", "a3_16p_tests"),
-            ("a5-64p-lite-actions.yml", "a5-64p", "a5_64p_tests"),
+            ("a3_8p_lite_actions.yml", "a3-8p", "a3_8p_tests"),
+            ("a3_16p_lite_actions.yml", "a3-16p", "a3_16p_tests"),
+            ("a5_64p_lite_actions.yml", "a5-64p", "a5_64p_tests"),
         ):
             with self.subTest(filename=filename):
                 data=read(filename)
@@ -209,7 +209,7 @@ class CIContract(unittest.TestCase):
                     self.assertEqual(caller["if"], chr(36)+"{{ false }}")
                 else:
                     self.assertEqual(data["on"]["pull_request"]["branches"], ["master"])
-        smoke_caller=read("lite-actions-dispatcher-smoke.yml")
+        smoke_caller=read("lite_actions_dispatcher_smoke.yml")
         self.assertEqual(
             smoke_caller["jobs"]["ci"]["uses"],"./.github/workflows/lite_actions_common.yml")
         self.assertEqual(smoke_caller["jobs"]["ci"]["with"]["pipeline"],"dispatcher-smoke")
@@ -227,8 +227,8 @@ class CIContract(unittest.TestCase):
             ".github/scripts/lite_actions/prepare_request.py",
             ".github/scripts/lite_actions/wait_result.py",
             *(".github/workflows/" + name for name in (
-                "a3-16p-lite-actions.yml", "a3-8p-lite-actions.yml",
-                "a5-64p-lite-actions.yml", "lite-actions-dispatcher-smoke.yml",
+                "a3_16p_lite_actions.yml", "a3_8p_lite_actions.yml",
+                "a5_64p_lite_actions.yml", "lite_actions_dispatcher_smoke.yml",
                 "lite_actions_common.yml")),
             *("tests/integration_tests/nightly_all_models_test/" + name for name in (
                 "a3_16p_tests.py", "a3_8p_tests.py", "a5_64p_tests.py", "runner.py")),
