@@ -22,6 +22,7 @@ permissions:
 
 jobs:
   ci:
+    if: ${{ false }}  # N14 temporary validation PR: do not launch unrelated training
     uses: ./.github/workflows/lite_actions_common.yml
     with:
       pipeline: a3-16p
