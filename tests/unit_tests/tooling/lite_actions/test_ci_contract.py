@@ -126,7 +126,8 @@ class CIContract(unittest.TestCase):
             self.assertIn("refs/heads/ci/*",data)
             self.assertNotIn("CI_ALLOWED_ACTOR",data)
             self.assertNotIn("refs/heads/fix/",data)
-            self.assertNotIn("pull_request:", data)
+            self.assertIn("pull_request:", data)
+            self.assertIn("github.event.pull_request.head.sha", data)
             self.assertNotIn("runs-on: self-hosted",data)
 
     def test_a5_workflow_is_validly_disabled_without_nonstandard_concurrency_keys(self):

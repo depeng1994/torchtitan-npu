@@ -3,6 +3,9 @@ name: A3-16p-CI-Example
 run-name: "${{ github.workflow }}"
 
 on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
     inputs:
       test_cases:
@@ -34,20 +37,28 @@ jobs:
         env:
           CI_REQUEST_REPOSITORY: ${{ github.repository }}
           CI_REQUEST_REF: ${{ github.ref }}
+          CI_REQUEST_EVENT: ${{ github.event_name }}
+          CI_TARGET_BRANCH: ${{ github.event.pull_request.base.ref }}
         run: |
-          test "$CI_REQUEST_REPOSITORY" = "torchtitan-npu/torchtitan-npu" || {
-            echo "CI repository not allowed" >&2; exit 1;
-          }
-          # workflow_dispatch is authorized by GitHub's repository write
-          # permissions; PR debugging uses an organization-owned ci/* branch.
-          case "$CI_REQUEST_REF" in
-            refs/heads/master|refs/heads/ci/*) ;;
-            *) echo "CI branch not allowed" >&2; exit 1 ;;
-          esac
+          test "$CI_REQUEST_REPOSITORY" = "torchtitan-npu/torchtitan-npu" || exit 1
+          if test "$CI_REQUEST_EVENT" = "pull_request"; then
+            test "$CI_TARGET_BRANCH" = "master" || exit 1
+            case "$CI_REQUEST_REF" in
+              refs/pull/*/merge) ;;
+              *) echo "Expected PR merge ref" >&2; exit 1 ;;
+            esac
+          else
+            test "$CI_REQUEST_EVENT" = "workflow_dispatch" || exit 1
+            case "$CI_REQUEST_REF" in
+              refs/heads/master|refs/heads/ci/*) ;;
+              *) echo "CI branch not allowed" >&2; exit 1 ;;
+            esac
+          fi
       - name: Validate and expand trusted test plan
         id: plan
         env:
-          CI_TEST_CASES: ${{ inputs.test_cases }}
+          CI_TEST_CASES: ${{ github.event_name == 'pull_request' && '[{"suite":"a3_16p_tests"}]' || inputs.test_cases }}
+          CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           CI_MAX_SELECTORS: "2"
           CI_MAX_CASES: "2"
           CI_PIPELINE: "a3-16p"
@@ -74,6 +85,8 @@ jobs:
       - name: Wait for internal a3-16p case
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          CI_RESULT_AUTHOR: ${{ vars.LITE_CI_RESULT_ACTOR }}
           CI_PLAN_DIGEST: ${{ needs.prepare.outputs.plan_digest }}
           CI_WAIT_TIMEOUT_SECONDS: "16800"
         run: |

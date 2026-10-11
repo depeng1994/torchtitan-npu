@@ -1,6 +1,9 @@
 name: Dispatcher-Smoke
 
 on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -13,7 +16,7 @@ concurrency:
 
 jobs:
   ci:
-    if: github.event_name == 'workflow_dispatch' && github.repository == 'torchtitan-npu/torchtitan-npu' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/ci/'))
+    if: github.repository == 'torchtitan-npu/torchtitan-npu' && ((github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'master') || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/ci/'))))
     runs-on: ubuntu-latest
     # Phase 1 serial queue can place smoke behind long training runs.
     timeout-minutes: 90
@@ -22,5 +25,7 @@ jobs:
       - name: Wait for dispatcher-only npu-smi probe
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          CI_RESULT_AUTHOR: ${{ vars.LITE_CI_RESULT_ACTOR }}
           CI_WAIT_TIMEOUT_SECONDS: "4800"
         run: python3 .github/scripts/lite_actions/wait_result.py --case a3-smoke

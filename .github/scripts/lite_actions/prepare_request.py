@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trusted CPU-only workflow_dispatch -> Matrix and SHA-bound Artifact.
+"""Trusted CPU-only workflow -> Matrix and source-SHA-bound Artifact.
 
 GitHub prepares one immutable, SHA-bound case plan. The dispatcher owns training.
 """
@@ -86,7 +86,7 @@ def main() -> None:
     result = create_plan(
         cases=cases, run_id=int(os.environ["GITHUB_RUN_ID"]),
         attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),
-        sha=os.environ["GITHUB_SHA"],
+        sha=os.environ.get("CI_SOURCE_SHA") or os.environ["GITHUB_SHA"],
         repo=os.environ["GITHUB_REPOSITORY"],
         pipeline=os.environ["CI_PIPELINE"],
     )

@@ -73,7 +73,9 @@ python -m tests.integration_tests.run_tests ./test_reports/checkpoint \
 
 ### 2.2 触发云端 Nightly CI 测试
 
-可以通过两种方式触发在真实集群上的 CI 测试：
+面向组织仓 master 的 PR（包括外部 fork）自动触发 Smoke、8P、16P Workflow；每次提交都会产生新 Run。外部 PR 仍受 GitHub 原生 Workflow 审批策略约束，A5 64P 仍然禁用。
+
+合入后还支持以下两种手动触发方式：
 
 #### 方式一：GitHub Actions 网页触发
 1. 打开仓库的 [Actions 页面](https://github.com/torchtitan-npu/torchtitan-npu/actions)；
@@ -84,11 +86,11 @@ python -m tests.integration_tests.run_tests ./test_reports/checkpoint \
 
 ```bash
 # 执行 A3 8P Suite 下的全部用例（自动拆分为独立 Matrix Job）
-gh workflow run a3-8p-lite-actions.yml -R torchtitan-npu/torchtitan-npu --ref ci/lite-actions-validation \
+gh workflow run a3-8p-lite-actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
   -f 'test_cases=[{"suite":"a3_8p_tests"}]'
 
 # 仅执行特定的 16P 用例
-gh workflow run a3-16p-lite-actions.yml -R torchtitan-npu/torchtitan-npu --ref ci/lite-actions-validation \
+gh workflow run a3-16p-lite-actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
   -f 'test_cases=[{"test_id":"dsv4_flash_a3_16p_example"}]'
 ```
 
@@ -183,7 +185,7 @@ python3 -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite
 
 ### 步骤五：提交 PR 并在 GitHub 触发运行
 
-将代码推送到组织仓的 `ci/*` 验证分支，创建目标为 `master` 的 PR；在 PR 阶段使用 `gh workflow run --ref ci/<分支名>` 手动验证，完成回归后再合并。不要以个人仓 Actions 作为验收入口。
+从个人 fork 或组织仓分支创建目标为组织仓 master 的 PR，GitHub 自动运行 CI；在 PR Checks 中检查完整结果后再合并。不要依赖个人 fork 的 Actions。
 
 ---
 
@@ -191,7 +193,7 @@ python3 -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite
 
 正式 Actions 仅部署于 [TorchTitan-NPU 组织仓](https://github.com/torchtitan-npu/torchtitan-npu)。个人 fork 的 Actions 已禁用，模型侧的 `prepare_request.py` 和 `wait_result.py` 对仓库身份实施组织仓白名单校验，其他仓库无法产生受信任的训练请求。
 
-调试时在组织仓建立 `ci/*` 分支并创建到 `master` 的 PR，在该分支使用 `workflow_dispatch` 触发。触发身份由 GitHub 的组织仓写入权限控制；调度机必须独立配置精确分支白名单（例如 `A3_CI_ALLOWED_BRANCHES=ci/lite-actions-validation`）。GitHub Waiter 还要求结果评论的作者与本次 Workflow 触发者一致，以防伪造 PASS。
+面向组织仓 master 的 PR 自动触发 pull_request Workflow，不需要额外的 validation 分支。手动 workflow_dispatch 保留维护者分支和操作者白名单；Dispatcher 在 PR 模式下将 GitHub 合并提交 SHA 转换为 PR head SHA，并在准备、Artifact、源码下载和结果回传中保持一致。组织仓 Repository Variable LITE_CI_RESULT_ACTOR 配置为 Dispatcher 的 GitHub 结果发布者身份，以避免误认为结果评论必须由 PR 作者发布。
 
 **验收原则：** PR 合并前分别确认 Matrix Prepare、Dispatcher 派单、NPU 真实训练、退出码、TensorBoard、资源释放与 GitHub 结果；A5 64P 在正式开放前只验证预期的禁用准入行为。不要用历史 Run 代替当前 PR SHA 的训练通过证明。
 

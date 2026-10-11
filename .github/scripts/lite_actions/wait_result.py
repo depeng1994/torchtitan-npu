@@ -14,9 +14,9 @@ import urllib.request
 REPO = "torchtitan-npu/torchtitan-npu"
 if (source := os.environ.get("GITHUB_REPOSITORY", REPO)) != REPO:
     raise ValueError("untrusted GitHub CI repository")
-# GitHub sets this trusted value for workflow_dispatch. Checking the
-# authenticated result comment author prevents forged PASS reports.
-RESULT_AUTHOR = os.environ.get("GITHUB_ACTOR", "")
+# The dispatcher posts under its own identity, not necessarily the PR author.
+# Organization repository variable is configured by the maintainer.
+RESULT_AUTHOR = os.environ.get("CI_RESULT_AUTHOR") or os.environ.get("GITHUB_ACTOR", "")
 
 PIPELINES = {
     "a3-smoke": ("Dispatcher-Smoke", "npu-smi"),
@@ -136,7 +136,7 @@ def main():
         parser.error("Matrix CI requires --test-id")
     run_id = int(os.environ["GITHUB_RUN_ID"])
     attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
-    sha = os.environ["GITHUB_SHA"]
+    sha = os.environ.get("CI_SOURCE_SHA") or os.environ["GITHUB_SHA"]
     token = os.environ["GH_TOKEN"]
     digest = os.environ.get("CI_PLAN_DIGEST", "")
     if args.test_id:
