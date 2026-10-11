@@ -1,4 +1,4 @@
-"""CPU-only V2 plan, independent Matrix, waiter and workflow admission."""
+"""CPU-only CI plan, independent Matrix, waiter and workflow admission."""
 from __future__ import annotations
 
 import importlib.util
@@ -21,18 +21,18 @@ def load(name, file):
     return module
 
 
-prepare = load("v2_prepare", PREP)
-waiter = load("v2_waiter", WAIT)
+prepare = load("ci_prepare", PREP)
+waiter = load("ci_waiter", WAIT)
 
 
-class V2Contract(unittest.TestCase):
-    def test_v2_matrix_and_artifact_identical(self):
+class CIContract(unittest.TestCase):
+    def test_matrix_and_artifact_identical(self):
         with tempfile.TemporaryDirectory() as td:
             cwd = Path.cwd()
             try:
                 os.chdir(td)
                 env = {"CI_TEST_CASES": '[{"suite":"a3_8p_tests"}]',
-                       "CI_PROTOCOL_VERSION": "2", "CI_MAX_SELECTORS": "2",
+                       "CI_MAX_SELECTORS": "2",
                        "CI_MAX_CASES": "4", "CI_PIPELINE": "a3-8p",
                        "GITHUB_REPOSITORY": "depeng1994/torchtitan-npu",
                        "GITHUB_RUN_ID": "12345", "GITHUB_RUN_ATTEMPT": "1",
@@ -66,7 +66,7 @@ class V2Contract(unittest.TestCase):
              "test_id":"dsv4_flash_a3_8p_adamw","plan_digest":"b"*64,
              "status":"FAIL","exit_code":42,"last_20_lines":["OOM"]}
         comment={"user":{"login":"depeng1994"},
-                 "body":"Lite-CI-V2-RESULT 91:1:dsv4_flash_a3_8p_adamw\n"+json.dumps(ref)}
+                 "body":"Lite-CI-RESULT 91:1:dsv4_flash_a3_8p_adamw\n"+json.dumps(ref)}
         q=dict(sha="a"*40,run_id=91,attempt=1,pipeline="a3-8p",
                test_id="dsv4_flash_a3_8p_adamw",plan_digest="b"*64)
         self.assertEqual(waiter.find_case_result([comment],**q),ref)
@@ -110,7 +110,7 @@ class V2Contract(unittest.TestCase):
                           "plan_digest": "b"*64, "status": "PASS",
                           "exit_code": 0, "last_20_lines": []}
                 comment = {"user": {"login": "depeng1994"},
-                           "body": f"Lite-CI-V2-RESULT 123:1:{cases[0]['test_id']}\n" +
+                           "body": f"Lite-CI-RESULT 123:1:{cases[0]['test_id']}\n" +
                                    json.dumps(result)}
                 found = waiter.find_case_result(
                     [comment], sha="a"*40, run_id=123, attempt=1,
@@ -126,7 +126,7 @@ class V2Contract(unittest.TestCase):
             data=(ROOT/".github/workflows"/file).read_text()
             for expected in ("workflow_dispatch:", "refs/heads/master)",
                              "fromJSON(needs.prepare.outputs.matrix)", "fail-fast: false",
-                             "CI_PROTOCOL_VERSION: \"2\"", "--test-id",
+                             "--test-id",
                              "actions/upload-artifact@v4"):
                 self.assertIn(expected,data)
             for repo in ("depeng1994/torchtitan-npu",

@@ -35,20 +35,27 @@ class InputsArtifactTests(unittest.TestCase):
 
     def test_artifact_identity_is_git_run_metadata(self):
         with tempfile.TemporaryDirectory() as td:
-            env={'CI_TEST_CASES':json.dumps([CASE]),'GITHUB_RUN_ID':'101',
-                 'GITHUB_RUN_ATTEMPT':'2','GITHUB_SHA':'a'*40}
-            with patch.dict(os.environ,env):
-                old=Path.cwd()
+            env = {'CI_TEST_CASES': json.dumps([CASE]), 'GITHUB_RUN_ID': '101',
+                   'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_SHA': 'a'*40,
+                   'GITHUB_REPOSITORY': 'depeng1994/torchtitan-npu',
+                   'CI_PIPELINE': 'a3-8p', 'CI_MAX_CASES': '4',
+                   'GITHUB_OUTPUT': str(Path(td) / 'gh-output.txt')}
+            with patch.dict(os.environ, env):
+                old = Path.cwd()
                 try:
                     os.chdir(td)
                     prepare.main()
                     value=json.loads(Path('.ci-request/ci-request.json').read_text())
-                    self.assertEqual(value['cases'],[CASE])
-                    self.assertEqual(value['run_id'],101)
-                    self.assertEqual(value['attempt'],2)
+                    self.assertEqual([r['test_id'] for r in value['cases']],
+                                     [CASE['test_id']])
+                    self.assertEqual(value['schema'], 2)
+                    self.assertEqual(value['run_id'], 101)
+                    self.assertEqual(value['attempt'], 2)
+                    self.assertEqual(value['repo'], env['GITHUB_REPOSITORY'])
                 finally:
                     os.chdir(old)
-            self.assertEqual(Path.cwd(),old)
+            self.assertEqual(Path.cwd(), old)
             self.assertTrue(Path('tests/unit_tests/tooling/lite_actions/test_request.py').exists())
+
 
 if __name__=='__main__':unittest.main()

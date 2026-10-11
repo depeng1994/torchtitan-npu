@@ -52,7 +52,6 @@ jobs:
           CI_TEST_CASES: ${{ inputs.test_cases }}
           CI_MAX_SELECTORS: "2"
           CI_MAX_CASES: "2"
-          CI_PROTOCOL_VERSION: "2"
           CI_PIPELINE: "a3-16p"
         run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/prepare_request.py
       - name: Upload immutable CI request

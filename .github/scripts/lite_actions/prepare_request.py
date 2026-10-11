@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Trusted CPU-only workflow_dispatch -> V2 Matrix and bound Artifact.
+"""Trusted CPU-only workflow_dispatch -> Matrix and SHA-bound Artifact.
 
 GitHub prepares one immutable, SHA-bound case plan. The dispatcher owns training.
 """
@@ -82,38 +82,26 @@ def create_plan(*, cases: list[dict], run_id: int, attempt: int, sha: str,
 
 def main() -> None:
     selectors = parse_cases(os.environ["CI_TEST_CASES"])
-    version = os.environ.get("CI_PROTOCOL_VERSION", "1")
     request_dir = Path(".ci-request")
     request_dir.mkdir(exist_ok=True)
-    if version == "1":
-        # Old workflow stays functional during the dispatcher-first rollout.
-        if len(selectors) > int(os.environ.get("CI_MAX_CASES", "2")):
-            raise ValueError("v1 case budget exceeded")
-        result = {"schema": 1, "run_id": int(os.environ["GITHUB_RUN_ID"]),
-                  "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
-                  "sha": os.environ["GITHUB_SHA"], "cases": selectors}
-        print("Prepared legacy request:", len(selectors), "selectors")
-    elif version == "2":
-        cases = expand_cases(selectors, int(os.environ.get("CI_MAX_CASES", "2")))
-        result = create_plan(
-            cases=cases, run_id=int(os.environ["GITHUB_RUN_ID"]),
-            attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),
-            sha=os.environ["GITHUB_SHA"],
-            repo=os.environ["GITHUB_REPOSITORY"],
-            pipeline=os.environ["CI_PIPELINE"],
-        )
-        matrix = {"include": [{"test_id": case["test_id"], "label": case["label"]}
-                              for case in cases]}
-        output = os.environ.get("GITHUB_OUTPUT")
-        if not output:
-            raise ValueError("GITHUB_OUTPUT required for Matrix")
-        with open(output, "a", encoding="utf-8") as handle:
-            handle.write("matrix=" + json.dumps(matrix, ensure_ascii=False,
-                                               separators=(",", ":")) + "\n")
-            handle.write("plan_digest=" + result["plan_digest"] + "\n")
-        print("Prepared V2 Matrix:", [case["test_id"] for case in cases])
-    else:
-        raise ValueError("unsupported CI protocol version")
+    cases = expand_cases(selectors, int(os.environ.get("CI_MAX_CASES", "2")))
+    result = create_plan(
+        cases=cases, run_id=int(os.environ["GITHUB_RUN_ID"]),
+        attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),
+        sha=os.environ["GITHUB_SHA"],
+        repo=os.environ["GITHUB_REPOSITORY"],
+        pipeline=os.environ["CI_PIPELINE"],
+    )
+    matrix = {"include": [{"test_id": case["test_id"], "label": case["label"]}
+                          for case in cases]}
+    output = os.environ.get("GITHUB_OUTPUT")
+    if not output:
+        raise ValueError("GITHUB_OUTPUT required for Matrix")
+    with open(output, "a", encoding="utf-8") as handle:
+        handle.write("matrix=" + json.dumps(matrix, ensure_ascii=False,
+                                           separators=(",", ":")) + "\n")
+        handle.write("plan_digest=" + result["plan_digest"] + "\n")
+    print("Prepared CI Matrix:", [case["test_id"] for case in cases])
     (request_dir / "ci-request.json").write_text(
         json.dumps(result, separators=(",", ":"), ensure_ascii=False) + "\n",
         encoding="utf-8",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GitHub-hosted Waiter: V1 aggregate or V2 independent Matrix Case checks."""
+"""GitHub-hosted Waiter for local smoke and independent Matrix Case results."""
 from __future__ import annotations
 import argparse
 import datetime as dt
@@ -26,8 +26,8 @@ TEST = re.compile(r"[a-z][a-z0-9_]{0,79}\Z")
 STATUS = {"PASS", "FAIL", "NOT_RUN", "CANCELLED", "TIMED_OUT", "INFRA_ERROR", "RESOURCE_TIMEOUT"}
 
 
-def find_result(comments, marker, sha, run_id, attempt, pipeline):
-    """Legacy V1: retained until all in-flight V1 workflows drain."""
+def find_smoke_result(comments, marker, sha, run_id, attempt, pipeline):
+    """Validate the local smoke result keyed by run, attempt and SHA."""
     for item in reversed(comments):
         if item.get("user", {}).get("login") != "depeng1994":
             continue
@@ -48,7 +48,7 @@ def find_result(comments, marker, sha, run_id, attempt, pipeline):
 
 def find_case_result(comments, *, sha: str, run_id: int, attempt: int,
                      pipeline: str, test_id: str, plan_digest: str) -> dict | None:
-    marker = f"Lite-CI-V2-RESULT {run_id}:{attempt}:{test_id}"
+    marker = f"Lite-CI-RESULT {run_id}:{attempt}:{test_id}"
     for item in reversed(comments):
         if item.get("user", {}).get("login") != "depeng1994":
             continue
@@ -110,7 +110,7 @@ def ensure_attempt_artifact(token: str, run_id: int, attempt: int) -> None:
                        if a.get("name") == name and not a.get("expired")]
             if len(matches) != 1:
                 raise ValueError(
-                    "No V2 plan Artifact for this attempt. Partial Matrix reruns "
+                    "No CI plan Artifact for this attempt. Partial Matrix reruns "
                     "are not supported; launch a NEW full workflow_dispatch run."
                 )
             return
@@ -125,9 +125,13 @@ def ensure_attempt_artifact(token: str, run_id: int, attempt: int) -> None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--case", choices=PIPELINES, required=True)
-    parser.add_argument("--test-id", help="V2 Matrix Test ID, omit for V1/smoke")
+    parser.add_argument("--test-id", help="Matrix Test ID (not used by dispatcher smoke)")
     args = parser.parse_args()
     display, pipeline = PIPELINES[args.case]
+    if args.case == "a3-smoke" and args.test_id:
+        parser.error("dispatcher smoke must not specify --test-id")
+    if args.case != "a3-smoke" and not args.test_id:
+        parser.error("Matrix CI requires --test-id")
     run_id = int(os.environ["GITHUB_RUN_ID"])
     attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
     sha = os.environ["GITHUB_SHA"]
@@ -135,7 +139,7 @@ def main():
     digest = os.environ.get("CI_PLAN_DIGEST", "")
     if args.test_id:
         if not TEST.fullmatch(args.test_id) or not re.fullmatch(r"[0-9a-f]{64}", digest):
-            parser.error("invalid V2 Matrix case/digest")
+            parser.error("invalid Matrix case/digest")
     if args.test_id:
         ensure_attempt_artifact(token, run_id, attempt)
     since = (dt.datetime.now(dt.timezone.utc) -
@@ -158,7 +162,7 @@ def main():
                     return 0 if status == "PASS" and code == 0 else 1
             else:
                 marker = f"{display}-RESULT {run_id}:{attempt}"
-                result = find_result(comments, marker, sha, run_id, attempt, pipeline)
+                result = find_smoke_result(comments, marker, sha, run_id, attempt, pipeline)
                 if result is not None:
                     print(f"RESULT {result['status']} exit_code={result['exit_code']}")
                     for entry in result.get("cases", []):
