@@ -70,6 +70,18 @@ class CIContract(unittest.TestCase):
             expanded = prepare.expand_cases([{'suite': 'synthetic_tests'}])
         self.assertEqual(len(expanded), 15)
 
+    def test_ci_port_override_wins_over_multinode_recipe_defaults(self):
+        from unittest.mock import patch
+        from tests.integration_tests.nightly_all_models_test.runner import dispatcher_port_env
+        with patch.dict("os.environ", {"LITE_CI_MASTER_PORT": "16007",
+                                    "LITE_CI_HCCL_IF_BASE_PORT": "20448"}):
+            self.assertEqual(dispatcher_port_env(),
+                             {"MASTER_PORT": "16007", "HCCL_IF_BASE_PORT": "20448"})
+        for invalid in ("-1", "0", "65536", "not-a-port"):
+            with patch.dict("os.environ", {"LITE_CI_MASTER_PORT": invalid}):
+                with self.assertRaises(ValueError):
+                    dispatcher_port_env()
+
     def test_selector_overlap_fails(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             prepare.expand_cases([{"suite": "a3_8p_tests"},

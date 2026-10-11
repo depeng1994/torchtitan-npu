@@ -18,6 +18,19 @@ import subprocess
 from tests.integration_tests import OverrideDefinitions
 
 
+def dispatcher_port_env() -> dict[str, str]:
+    """Apply dispatcher-issued rendezvous ports after model recipe defaults."""
+    overrides = {}
+    for key, target in (("LITE_CI_MASTER_PORT", "MASTER_PORT"),
+                        ("LITE_CI_HCCL_IF_BASE_PORT", "HCCL_IF_BASE_PORT")):
+        raw = os.environ.get(key)
+        if raw is not None:
+            if not raw.isascii() or not raw.isdecimal() or not 1024 <= int(raw) <= 65535:
+                raise ValueError(f"invalid dispatcher-issued {key}")
+            overrides[target] = raw
+    return overrides
+
+
 def run_single(test: OverrideDefinitions, *, output_dir: Path | None = None) -> None:
     from tests.integration_tests.run_tests import run_tests
 
@@ -64,4 +77,5 @@ def run_distributed(test: OverrideDefinitions, *, phase: str,
                *(test.train_args or ()), *test.override_args[0],
                "--metrics.save_tb_folder=tb_phase_0"]
     print("[MULTINODE_LAUNCH] " + " ".join(command), flush=True)
-    raise SystemExit(subprocess.call(command, env={**os.environ, **(test.env_vars or {})}))
+    env = {**os.environ, **(test.env_vars or {}), **dispatcher_port_env()}
+    raise SystemExit(subprocess.call(command, env=env))
