@@ -22,7 +22,8 @@ def load(name, file):
 
 
 prepare = load("ci_prepare", PREP)
-waiter = load("ci_waiter", WAIT)
+with patch.dict(os.environ, {"GITHUB_ACTOR": "ci-maintainer"}):
+    waiter = load("ci_waiter", WAIT)
 
 
 class CIContract(unittest.TestCase):
@@ -34,7 +35,7 @@ class CIContract(unittest.TestCase):
                 env = {"CI_TEST_CASES": '[{"suite":"a3_8p_tests"}]',
                        "CI_MAX_SELECTORS": "2",
                        "CI_MAX_CASES": "4", "CI_PIPELINE": "a3-8p",
-                       "GITHUB_REPOSITORY": "depeng1994/torchtitan-npu",
+                       "GITHUB_REPOSITORY": "torchtitan-npu/torchtitan-npu",
                        "GITHUB_RUN_ID": "12345", "GITHUB_RUN_ATTEMPT": "1",
                        "GITHUB_SHA": "a"*40,
                        "GITHUB_OUTPUT": str(Path(td) / "gh-output.txt")}
@@ -61,11 +62,11 @@ class CIContract(unittest.TestCase):
                                   {"test_id": "dsv4_flash_a3_8p_adamw"}], 4)
 
     def test_matrix_result_identity_and_failed_case_isolated(self):
-        ref={"schema":2,"repo":"depeng1994/torchtitan-npu",
+        ref={"schema":2,"repo":"torchtitan-npu/torchtitan-npu",
              "sha":"a"*40,"run_id":91,"attempt":1,"pipeline":"a3-8p",
              "test_id":"dsv4_flash_a3_8p_adamw","plan_digest":"b"*64,
              "status":"FAIL","exit_code":42,"last_20_lines":["OOM"]}
-        comment={"user":{"login":"depeng1994"},
+        comment={"user":{"login":"ci-maintainer"},
                  "body":"Lite-CI-RESULT 91:1:dsv4_flash_a3_8p_adamw\n"+json.dumps(ref)}
         q=dict(sha="a"*40,run_id=91,attempt=1,pipeline="a3-8p",
                test_id="dsv4_flash_a3_8p_adamw",plan_digest="b"*64)
@@ -90,49 +91,41 @@ class CIContract(unittest.TestCase):
                               b'"expired":false}]}')):
             waiter.ensure_attempt_artifact("test-token",1234,2)
 
-    def test_both_trusted_repository_modes_and_unknown_rejection(self):
-        from unittest.mock import patch
+    def test_org_only_repository_and_comment_author_binding(self):
         org = "torchtitan-npu/torchtitan-npu"
-        fork = "depeng1994/torchtitan-npu"
-        self.assertEqual(prepare.TRUSTED_REPOS, {org, fork})
-        self.assertEqual(waiter.TRUSTED_REPOS, {org, fork})
-        cases = [{"test_id": "dsv4_flash_a3_8p_example",
-                  "nnodes": 1, "ngpu": 8}]
-        for repo in (fork, org):
-            with patch.object(prepare, "REPO", repo), patch.object(waiter, "REPO", repo):
-                plan = prepare.create_plan(cases=cases, run_id=123,
-                                           attempt=1, sha="a"*40,
-                                           repo=repo, pipeline="a3-8p")
-                self.assertEqual(plan["repo"], repo)
-                result = {"schema": 2, "repo": repo, "run_id": 123,
-                          "attempt": 1, "sha": "a"*40, "pipeline": "a3-8p",
-                          "test_id": cases[0]["test_id"],
-                          "plan_digest": "b"*64, "status": "PASS",
-                          "exit_code": 0, "last_20_lines": []}
-                comment = {"user": {"login": "depeng1994"},
-                           "body": f"Lite-CI-RESULT 123:1:{cases[0]['test_id']}\n" +
-                                   json.dumps(result)}
-                found = waiter.find_case_result(
-                    [comment], sha="a"*40, run_id=123, attempt=1,
-                    pipeline="a3-8p", test_id=cases[0]["test_id"],
-                    plan_digest="b"*64)
-                self.assertEqual(found, result)
-        with self.assertRaisesRegex(ValueError, "untrusted repository"):
-            prepare.create_plan(cases=cases, run_id=123, attempt=1,
-                                sha="a"*40, repo="other/repo", pipeline="a3-8p")
-
-    def test_workflow_is_untrusted_pr_closed_and_matrix_native(self):
+        self.assertEqual(prepare.REPO, org)
+        self.assertEqual(waiter.REPO, org)
+        cases = [{"test_id":"dsv4_flash_a3_8p_example","nnodes":1,"ngpu":8}]
+        plan = prepare.create_plan(cases=cases,run_id=123,attempt=1,
+                                   sha="a"*40,repo=org,pipeline="a3-8p")
+        self.assertEqual(plan["repo"],org)
+        report = {"schema":2,"repo":org,"run_id":123,"attempt":1,
+                  "sha":"a"*40,"pipeline":"a3-8p","test_id":cases[0]["test_id"],
+                  "plan_digest":"b"*64,"status":"PASS","exit_code":0,
+                  "last_20_lines":[]}
+        comment = {"user":{"login":"ci-maintainer"},
+                   "body":f"Lite-CI-RESULT 123:1:{cases[0]['test_id']}\n"+
+                          json.dumps(report)}
+        args = dict(sha="a"*40,run_id=123,attempt=1,pipeline="a3-8p",
+                    test_id=cases[0]["test_id"],plan_digest="b"*64)
+        self.assertEqual(waiter.find_case_result([comment],**args),report)
+        comment["user"]["login"]="forged-user"
+        self.assertIsNone(waiter.find_case_result([comment],**args))
+        with self.assertRaisesRegex(ValueError,"untrusted repository"):
+            prepare.create_plan(cases=cases,run_id=123,attempt=1,
+                                sha="a"*40,repo="other/repo",pipeline="a3-8p")
+    def test_workflow_is_org_scoped_and_ci_pr_branch_dispatchable(self):
         for file in ("a3-8p-lite-actions.yml", "a3-16p-lite-actions.yml"):
             data=(ROOT/".github/workflows"/file).read_text()
-            for expected in ("workflow_dispatch:", "refs/heads/master)",
+            for expected in ("workflow_dispatch:", "refs/heads/master|refs/heads/ci/*)",
                              "fromJSON(needs.prepare.outputs.matrix)", "fail-fast: false",
                              "--test-id",
                              "actions/upload-artifact@v4"):
                 self.assertIn(expected,data)
-            for repo in ("depeng1994/torchtitan-npu",
-                         "torchtitan-npu/torchtitan-npu"):
-                self.assertIn(repo, data)
-            self.assertNotIn("refs/heads/fix/", data)
+            self.assertIn("torchtitan-npu/torchtitan-npu",data)
+            self.assertIn("refs/heads/ci/*",data)
+            self.assertNotIn("CI_ALLOWED_ACTOR",data)
+            self.assertNotIn("refs/heads/fix/",data)
             self.assertNotIn("pull_request:", data)
             self.assertNotIn("runs-on: self-hosted",data)
 

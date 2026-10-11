@@ -37,7 +37,7 @@ class InputsArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             env = {'CI_TEST_CASES': json.dumps([CASE]), 'GITHUB_RUN_ID': '101',
                    'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_SHA': 'a'*40,
-                   'GITHUB_REPOSITORY': 'depeng1994/torchtitan-npu',
+                   'GITHUB_REPOSITORY': 'torchtitan-npu/torchtitan-npu',
                    'CI_PIPELINE': 'a3-8p', 'CI_MAX_CASES': '4',
                    'GITHUB_OUTPUT': str(Path(td) / 'gh-output.txt')}
             with patch.dict(os.environ, env):

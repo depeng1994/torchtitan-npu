@@ -4,7 +4,7 @@
 
 集成测试分为两种运行模式：
 * **本地单机集成测试**：在本地开发或测试机上直接运行，使用本仓内置的集成测试 Runner；
-* **云端 Nightly CI 集群测试**：通过 GitHub Actions 触发，由内网 [Lite Actions](https://github.com/depeng1994/lite-actions) 调度机在 A3 / A5 真实集群上排队执行。
+* **云端 Nightly CI 集群测试**：通过 GitHub Actions 触发，由内网 Lite Actions 调度机在 A3 / A5 真实集群上排队执行。
 
 ---
 
@@ -76,7 +76,7 @@ python -m tests.integration_tests.run_tests ./test_reports/checkpoint \
 可以通过两种方式触发在真实集群上的 CI 测试：
 
 #### 方式一：GitHub Actions 网页触发
-1. 打开仓库的 [Actions 页面](https://github.com/depeng1994/torchtitan-npu/actions)；
+1. 打开仓库的 [Actions 页面](https://github.com/torchtitan-npu/torchtitan-npu/actions)；
 2. 在左侧列表中选择目标 Workflow（如 `A3-8p-CI-Example` 或 `A3-16p-CI-Example`）；
 3. 点击右侧 **Run workflow** 下拉框，选择分支并点击运行。
 
@@ -84,11 +84,11 @@ python -m tests.integration_tests.run_tests ./test_reports/checkpoint \
 
 ```bash
 # 执行 A3 8P Suite 下的全部用例（自动拆分为独立 Matrix Job）
-gh workflow run a3-8p-lite-actions.yml -R depeng1994/torchtitan-npu --ref master \
+gh workflow run a3-8p-lite-actions.yml -R torchtitan-npu/torchtitan-npu --ref ci/lite-actions-validation \
   -f 'test_cases=[{"suite":"a3_8p_tests"}]'
 
 # 仅执行特定的 16P 用例
-gh workflow run a3-16p-lite-actions.yml -R depeng1994/torchtitan-npu --ref master \
+gh workflow run a3-16p-lite-actions.yml -R torchtitan-npu/torchtitan-npu --ref ci/lite-actions-validation \
   -f 'test_cases=[{"test_id":"dsv4_flash_a3_16p_example"}]'
 ```
 
@@ -103,7 +103,7 @@ gh workflow run a3-16p-lite-actions.yml -R depeng1994/torchtitan-npu --ref maste
 Nightly 用例统一存放于：
 `tests/integration_tests/nightly_all_models_test/`
 
-根据用例的卡数规格，选择对应文件编辑（或新建文件并在 `__init__.py` 中暴露）：
+根据用例的卡数规格，选择对应文件编辑（或新建 `*_tests.py` 文件，由动态发现机制加载）：
 - 单机 8P 用例：`a3_8p_tests.py`
 - 双机 16P 用例：`a3_16p_tests.py`
 - 八机 64P 用例：`a5_64p_tests.py`
@@ -183,19 +183,20 @@ python3 -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite
 
 ### 步骤五：提交 PR 并在 GitHub 触发运行
 
-将代码推送到分支并创建 PR。合入后，即可通过 GitHub Actions 或 `gh workflow run` 触发刚刚新增的用例。
+将代码推送到组织仓的 `ci/*` 验证分支，创建目标为 `master` 的 PR；在 PR 阶段使用 `gh workflow run --ref ci/<分支名>` 手动验证，完成回归后再合并。不要以个人仓 Actions 作为验收入口。
 
 ---
 
-### 2.3 从个人 master 向组织 master 提交 CI 代码
+### 2.3 在组织仓 PR 中调试 CI
 
-Lite Actions 模型侧正式开发入口是 [个人 fork master](https://github.com/depeng1994/torchtitan-npu/tree/master)，通过跨仓 PR 提交至 [组织 master](https://github.com/torchtitan-npu/torchtitan-npu/tree/master)。两个仓库的 Workflow 使用同一份 SHA 绑定与调度协议，`prepare_request.py` 与 `wait_result.py` 只接受这两个明确列入白名单的仓库身份；Workflow 仅允许 `depeng1994` 在 `master` 分支手工发起。不得开放任意仓库或 PR 自动运行外部代码。
+正式 Actions 仅部署于 [TorchTitan-NPU 组织仓](https://github.com/torchtitan-npu/torchtitan-npu)。个人 fork 的 Actions 已禁用，模型侧的 `prepare_request.py` 和 `wait_result.py` 对仓库身份实施组织仓白名单校验，其他仓库无法产生受信任的训练请求。
 
-组织仓 PR #5 的验证证据已在 [其讨论记录](https://github.com/torchtitan-npu/torchtitan-npu/pull/5) 归档：A3 8P [Run 38107457927](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38107457927)（Muon、AdamW 独立 Job PASS）、A3 16P [Run 38107460233](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38107460233)（双机 5 step PASS）、最终 Smoke [Run 38109967742](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38109967742)（调度机 Lite Actions main `0dbb28f` PASS）。历史成功证据针对当时受 SHA 绑定的源码，不代表本次新增的双仓兼容模式已在组织仓合入后重新执行。A5 64P 仍被显式禁用，拒绝 admission 属预期行为。
+调试时在组织仓建立 `ci/*` 分支并创建到 `master` 的 PR，在该分支使用 `workflow_dispatch` 触发。触发身份由 GitHub 的组织仓写入权限控制；调度机必须独立配置精确分支白名单（例如 `A3_CI_ALLOWED_BRANCHES=ci/lite-actions-validation`）。GitHub Waiter 还要求结果评论的作者与本次 Workflow 触发者一致，以防伪造 PASS。
 
-从个人 master 触发时需确保 Lite Dispatcher 的 `A3_CI_REPOSITORY` 与 `A3_CI_ALLOWED_BRANCHES` 匹配当前来源（个人仓、master）；组织仓合入后再由运维受控切换为组织仓、master。调度机始终只轮询一个可信仓库，不能把旧 PR 测试分支当正式分支。
+**验收原则：** PR 合并前分别确认 Matrix Prepare、Dispatcher 派单、NPU 真实训练、退出码、TensorBoard、资源释放与 GitHub 结果；A5 64P 在正式开放前只验证预期的禁用准入行为。不要用历史 Run 代替当前 PR SHA 的训练通过证明。
 
 ---
+
 
 ## 4. 测试断言与排障说明
 
@@ -214,4 +215,4 @@ CI 判定用例 PASS 必须同时满足：
 * **多机通信超时 (HCCL Timeout)**：
   确认两台机器的通信小网 IP 是否连通，以及 CANN 环境变量是否完整。
 * **物理机器或调度故障**：
-  若任务一直排队未执行或出现网络异常，请联系集群运维或查阅 [Lite Actions 调度系统文档](https://github.com/depeng1994/lite-actions)。
+  若任务一直排队未执行或出现网络异常，请联系集群运维或查阅 Lite Actions 调度系统运维文档。

@@ -32,18 +32,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate CI admission
         env:
-          CI_ALLOWED_ACTOR: depeng1994
-          CI_REQUEST_ACTOR: ${{ github.actor }}
           CI_REQUEST_REPOSITORY: ${{ github.repository }}
           CI_REQUEST_REF: ${{ github.ref }}
         run: |
-          test "$CI_REQUEST_ACTOR" = "$CI_ALLOWED_ACTOR" || exit 1
-          case "$CI_REQUEST_REPOSITORY" in
-            depeng1994/torchtitan-npu|torchtitan-npu/torchtitan-npu) ;;
-            *) echo "CI repository not allowed" >&2; exit 1 ;;
-          esac
+          test "$CI_REQUEST_REPOSITORY" = "torchtitan-npu/torchtitan-npu" || {
+            echo "CI repository not allowed" >&2; exit 1;
+          }
+          # workflow_dispatch is authorized by GitHub's repository write
+          # permissions; PR debugging uses an organization-owned ci/* branch.
           case "$CI_REQUEST_REF" in
-            refs/heads/master) ;;
+            refs/heads/master|refs/heads/ci/*) ;;
             *) echo "CI branch not allowed" >&2; exit 1 ;;
           esac
       - name: Validate and expand trusted test plan

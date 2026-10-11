@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   ci:
-    if: github.actor == 'depeng1994' && (github.repository == 'depeng1994/torchtitan-npu' || github.repository == 'torchtitan-npu/torchtitan-npu') && github.ref == 'refs/heads/master'
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'torchtitan-npu/torchtitan-npu' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/ci/'))
     runs-on: ubuntu-latest
     # Phase 1 serial queue can place smoke behind long training runs.
     timeout-minutes: 90

@@ -10,12 +10,14 @@ import time
 import urllib.parse
 import urllib.request
 
-# Both sides of the personal-master -> organization-master PR are trusted.
-# GitHub binds this to the running repository, never to a PR-supplied input.
-TRUSTED_REPOS = frozenset({"depeng1994/torchtitan-npu", "torchtitan-npu/torchtitan-npu"})
-REPO = os.environ.get("GITHUB_REPOSITORY", "depeng1994/torchtitan-npu")
-if REPO not in TRUSTED_REPOS:
+# Only the upstream organization may publish CI plans or consume results.
+REPO = "torchtitan-npu/torchtitan-npu"
+if (source := os.environ.get("GITHUB_REPOSITORY", REPO)) != REPO:
     raise ValueError("untrusted GitHub CI repository")
+# GitHub sets this trusted value for workflow_dispatch. Checking the
+# authenticated result comment author prevents forged PASS reports.
+RESULT_AUTHOR = os.environ.get("GITHUB_ACTOR", "")
+
 PIPELINES = {
     "a3-smoke": ("Dispatcher-Smoke", "npu-smi"),
     "a3-8p": ("A3-8p-CI-Example", "a3-8p"),
@@ -29,7 +31,7 @@ STATUS = {"PASS", "FAIL", "NOT_RUN", "CANCELLED", "TIMED_OUT", "INFRA_ERROR", "R
 def find_smoke_result(comments, marker, sha, run_id, attempt, pipeline):
     """Validate the local smoke result keyed by run, attempt and SHA."""
     for item in reversed(comments):
-        if item.get("user", {}).get("login") != "depeng1994":
+        if not RESULT_AUTHOR or item.get("user", {}).get("login") != RESULT_AUTHOR:
             continue
         body = item.get("body", "")
         if not body.startswith(marker + "\n"):
@@ -50,7 +52,7 @@ def find_case_result(comments, *, sha: str, run_id: int, attempt: int,
                      pipeline: str, test_id: str, plan_digest: str) -> dict | None:
     marker = f"Lite-CI-RESULT {run_id}:{attempt}:{test_id}"
     for item in reversed(comments):
-        if item.get("user", {}).get("login") != "depeng1994":
+        if not RESULT_AUTHOR or item.get("user", {}).get("login") != RESULT_AUTHOR:
             continue
         body = item.get("body", "")
         if not body.startswith(marker + "\n"):

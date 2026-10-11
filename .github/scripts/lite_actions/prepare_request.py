@@ -13,11 +13,9 @@ import re
 
 TEST = re.compile(r"[a-z][a-z0-9_]{0,79}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
-# Both sides of the personal-master -> organization-master PR are trusted.
-# GitHub binds this to the running repository, never to a PR-supplied input.
-TRUSTED_REPOS = frozenset({"depeng1994/torchtitan-npu", "torchtitan-npu/torchtitan-npu"})
-REPO = os.environ.get("GITHUB_REPOSITORY", "depeng1994/torchtitan-npu")
-if REPO not in TRUSTED_REPOS:
+# Only the upstream organization may publish CI plans or consume results.
+REPO = "torchtitan-npu/torchtitan-npu"
+if (source := os.environ.get("GITHUB_REPOSITORY", REPO)) != REPO:
     raise ValueError("untrusted GitHub CI repository")
 PIPELINES = {"a3-8p", "a3-16p", "a5-64p"}
 
