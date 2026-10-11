@@ -36,6 +36,26 @@ python -m tests.integration_tests.run_tests \
 > - `--test_name`：（可选）仅执行该套件内的单条特定用例；
 > - `--no-parallel`：（可选）强制串行执行，默认会开启多用例并行。
 
+### 1.3 Nightly 用例本地极简调试入口
+若直接在配备 NPU 的物理机上手动调试 `nightly_all_models_test` 目录下的用例，无需通过 GitHub Actions，使用单行命令即可拉起：
+
+* **单机 8P（单节点自测）**：
+  单机用例无需指定跨机 IP，内部自动通过 `run_tests` 执行：
+  ```bash
+  python3 -m tests.integration_tests.tools.lite_actions.entrypoint launch \
+    --test-id dsv4_flash_a3_8p_adamw \
+    --output-dir /tmp/test_8p
+  ```
+
+* **双机 16P（跨节点分布式自测）**：
+  两台机器分别执行同一行命令，通过前置 `NODE_IPS` 指定两节点的通信 IP 即可：
+  ```bash
+  NODE_IPS="192.168.1.3,192.168.1.4" python3 -m tests.integration_tests.tools.lite_actions.entrypoint launch \
+    --test-id dsv4_flash_a3_16p_example \
+    --output-dir /tmp/test_16p
+  ```
+  > **提示**：脚本会自动根据本机 IP 匹配并确定 Master（Rank 0）与 Worker（Rank 1）角色；环境中的单节点卡数等参数已在用例定义内配好，无需额外 export。
+
 ---
 
 ## 2. 本地集成测试全景矩阵与核心机制
@@ -175,7 +195,7 @@ deploy-docs.yml、sync-upstream.yml 是不同权限/用途的独立工作流，�
 Nightly 用例统一存放于：
 `tests/integration_tests/nightly_all_models_test/`
 
-根据用例的卡数规格，选择对应文件编辑（或新建 `*_tests.py` 文件，系统会自动动态发现并加载）：
+根据用例的卡数规格，编辑对应文件（或新建文件并在 `__init__.py` 中暴露）：
 - 单机 8P 用例：`a3_8p_tests.py`
 - 双机 16P 用例：`a3_16p_tests.py`
 - 八机 64P 用例：`a5_64p_tests.py`
@@ -242,17 +262,16 @@ python3 -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite
 
 ---
 
-## 5. 组织仓 PR 自动 CI 与白名单准入
+## 5. 代码提交流程与 CI 白名单准入
 
-正式 Actions 部署于 [TorchTitan-NPU 组织仓](https://github.com/torchtitan-npu/torchtitan-npu)。为了保证内网物理 NPU 集群的执行安全，防止恶意 PR 注入未经审查的代码，CI 调度实行严格的受控准入机制：
+为了保证内网物理 NPU 集群的执行安全，防止恶意 PR 注入未经审查的代码，CI 调度实行**受控安全准入**机制：
 
 ### 5.1 组织仓 PR 自动 CI 触发
 1. **自动触发**：所有面向 `torchtitan-npu/torchtitan-npu:master` 提交的 PR（含来自外部 Fork 仓库的 PR）会自动触发组织仓的 GitHub Actions 工作流；
-2. **安全防护机制**：
+2. **安全防护**：
    - 外部 Fork 的首次 PR 受 GitHub 官方的 Workflow 审批策略保护（需要 Maintainer 批准运行）；
    - 调度机根据 PR API 严格比对 PR 编号、目标分支以及精确的 Head Commit SHA，坚决拒绝过期或关联异常的 Run；
    - 调度机在拉取代码时，仅下载该特定 PR Head SHA 对应的代码，杜绝中间人篡改；
-   - 组织仓 Repository Variable `LITE_CI_RESULT_ACTOR` 配置为 Dispatcher 的结果发布者身份，避免误认为结果评论必须由 PR 作者发布；
    - 执行机**完全不持有 GitHub Token**，仅内网调度机单点具有回写 Comment 权限。
 
 ### 5.2 手动触发（Maintainer 冒烟）
@@ -268,23 +287,5 @@ gh workflow run a3_16p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref m
   -f 'test_cases=[{"test_id":"dsv4_flash_a3_16p_example"}]'
 ```
 
----
-
-## 6. 测试断言与排障说明
-
-### 6.1 成功判定条件
-CI 判定用例 PASS 必须同时满足：
-1. 训练主进程 Exit Code 为 0；
-2. 实际完成步数达到 `expected_steps`；
-3. TensorBoard 正确记录且无 NaN / Inf 异常；
-4. 训练结束后 NPU 物理资源成功释放。
-
-### 6.2 常见错误与排查建议
-* **`ASCEND_SET_ENV_PATH` 或权重路径找不到**：
-  检查 `env_vars` 中的路径是否在所有执行机（如 `/mnt/share/...` 挂载点）均真实存在。
-* **显存 OOM**：
-  若在反向传播或优化器更新时 OOM，确认是否需要开启 `OPTIMIZER_OVERRIDES`（如 `virtual` 模式）。
-* **多机通信超时 (HCCL Timeout)**：
-  确认两台机器的通信小网 IP 是否连通，以及 CANN 环境变量是否完整。
-* **物理机器或调度故障**：
-  若任务一直排队未执行或出现网络异常，属于调度机与物理机状态问题，请参阅 [Lite Actions 调度系统文档](https://github.com/depeng1994/lite-actions) 的日常运维与应急排障小节。
+### 5.3 硬件故障排查指引
+若任务长时间卡在排队状态、远端 NPU 报告 Quarantine 或出现 SSH 连接异常，属于物理集群调度机层面的环境状态问题，请参阅 [Lite Actions 调度系统文档](https://github.com/depeng1994/lite-actions) 的日常运维与应急排障小节。
