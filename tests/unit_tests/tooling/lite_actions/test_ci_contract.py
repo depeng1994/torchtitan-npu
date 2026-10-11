@@ -77,6 +77,24 @@ class CIContract(unittest.TestCase):
         comment["user"]["login"]="attacker"
         self.assertIsNone(waiter.find_case_result([comment],**q))
 
+    def test_waiter_progress_heartbeat_checks_author_and_identity(self):
+        args = dict(sha="a"*40,run_id=123,attempt=2,pipeline="a3-8p",
+                    test_id="dsv4_flash_a3_8p_example",plan_digest="b"*64)
+        self.assertEqual(waiter.find_progress([],**args), "QUEUED")
+        marker = "LCI-R 123:2:dsv4_flash_a3_8p_example"
+        comment = {"user":{"login":"ci-maintainer"}, "body":marker}
+        self.assertEqual(waiter.find_progress([comment],**args),"RUNNING")
+        for change in ({"attempt":3},{"test_id":"other_case"}):
+            with self.subTest(change=change):
+                self.assertEqual(waiter.find_progress([comment],**{**args,**change}),
+                                 "QUEUED")
+        comment["user"]["login"]="forged-author"
+        self.assertEqual(waiter.find_progress([comment],**args),"QUEUED")
+        self.assertEqual(
+            waiter.heartbeat_line(status="QUEUED",current_case=args["test_id"],
+                                  waited=60,run_id=123,attempt=2),
+            "CI QUEUED dsv4_flash_a3_8p_example 60s")
+
     def test_partial_matrix_rerun_without_artifact_fails_fast(self):
         import io
         with patch.object(waiter.urllib.request, "urlopen",

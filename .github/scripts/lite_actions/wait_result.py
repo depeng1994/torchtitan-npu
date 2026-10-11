@@ -72,6 +72,29 @@ def find_case_result(comments, *, sha: str, run_id: int, attempt: int,
     return None
 
 
+
+def find_progress(comments, *, sha: str, run_id: int, attempt: int,
+                  pipeline: str, test_id: str, plan_digest: str = "") -> str:
+    """Only the authenticated dispatcher can declare this Case RUNNING.
+
+    Comments were fetched from the exact SHA endpoint; no JSON upload needed.
+    """
+    marker = f"LCI-R {run_id}:{attempt}:{test_id}"
+    for item in comments:
+        if (RESULT_AUTHOR and item.get("user", {}).get("login") == RESULT_AUTHOR
+                and item.get("body") == marker):
+            return "RUNNING"
+    return "QUEUED"
+
+
+
+def heartbeat_line(*, status: str, current_case: str, waited: int,
+                   run_id: int, attempt: int) -> str:
+    """Minimal cloud-runner-only log line; never sent by the internal agent."""
+    return f"CI {status} {current_case} {waited}s"
+
+
+
 def get_comments(token: str, sha: str, since: str):
     # Fail closed on unexpected pagination; bounded API usage.
     items = []
@@ -146,12 +169,21 @@ def main():
         ensure_attempt_artifact(token, run_id, attempt)
     since = (dt.datetime.now(dt.timezone.utc) -
              dt.timedelta(days=2)).isoformat().replace("+00:00", "Z")
-    deadline = time.monotonic() + int(os.environ.get("CI_WAIT_TIMEOUT_SECONDS", "7400"))
+    started = time.monotonic()
+    deadline = started + int(os.environ.get("CI_WAIT_TIMEOUT_SECONDS", "7400"))
+    heartbeat_seconds = 60
+    next_heartbeat = started
+    progress = "QUEUED"
+    current_case = args.test_id or "npu-smi"
     print(f"Waiting for {display} run={run_id} attempt={attempt} SHA={sha[:12]}"
-          + (f" test={args.test_id}" if args.test_id else ""), flush=True)
+          + f" current_case={current_case}", flush=True)
     while time.monotonic() < deadline:
         try:
             comments = get_comments(token, sha, since)
+            progress = find_progress(
+                comments, sha=sha, run_id=run_id, attempt=attempt,
+                pipeline=pipeline, test_id=current_case,
+                plan_digest=digest if args.test_id else "")
             if args.test_id:
                 result = find_case_result(
                     comments, sha=sha, run_id=run_id, attempt=attempt,
@@ -174,7 +206,15 @@ def main():
                     return 0 if result["status"] == "PASS" and result["exit_code"] == 0 else 1
         except Exception as exc:
             print(f"GitHub read retry: {type(exc).__name__}", flush=True)
-        time.sleep(12)
+        now = time.monotonic()
+        if now >= next_heartbeat:
+            elapsed = int(now - started)
+            print(heartbeat_line(status=progress, current_case=current_case,
+                                 waited=elapsed, run_id=run_id, attempt=attempt),
+                  flush=True)
+            next_heartbeat = now + heartbeat_seconds
+        time.sleep(min(12, max(0.1, next_heartbeat - time.monotonic()),
+                       max(0.1, deadline - time.monotonic())))
     print("ERROR: timed out waiting for internal CI", flush=True)
     return 124
 
