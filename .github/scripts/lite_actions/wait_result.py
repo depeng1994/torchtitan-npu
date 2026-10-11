@@ -24,7 +24,7 @@ if (source := os.environ.get("GITHUB_REPOSITORY", REPO)) != REPO:
 RESULT_AUTHOR = os.environ.get("CI_RESULT_AUTHOR") or os.environ.get("GITHUB_ACTOR", "")
 
 PIPELINES = {
-    "a3-smoke": ("Dispatcher-Smoke", "npu-smi"),
+    "dispatcher-smoke": ("Dispatcher-Smoke", "npu-smi"),
     "a3-8p": ("A3-8p-CI-Example", "a3-8p"),
     "a3-16p": ("A3-16p-CI-Example", "a3-16p"),
     "a5-64p": ("A5-64p-CI", "a5-64p"),
@@ -93,17 +93,21 @@ def find_progress(comments, *, sha: str, run_id: int, attempt: int,
 
 
 
-def heartbeat_line(*, status: str, current_case: str, waited: int,
-                   run_id: int, attempt: int) -> str:
-    """Minimal cloud-runner-only log line; never sent by the internal agent."""
-    return f"CI {status} {current_case} {waited}s"
+BEIJING = dt.timezone(dt.timedelta(hours=8))
+
+
+def heartbeat_line(*, status: str, current_case: str,
+                   when: dt.datetime | None = None) -> str:
+    """Human-readable Beijing-time progress; never sent by the dispatcher."""
+    timestamp = (when or dt.datetime.now(dt.timezone.utc)).astimezone(BEIJING)
+    return f"{timestamp:%Y/%m/%d %H:%M:%S} {current_case} CI {status.lower()}."
 
 
 
 def get_comments(token: str, sha: str, since: str):
     # Fail closed on unexpected pagination; bounded API usage.
     items = []
-    for page in range(1, 5):
+    for page in range(1, 21):
         query = urllib.parse.urlencode({"per_page": 100, "since": since, "page": page})
         url = f"https://api.github.com/repos/{REPO}/commits/{sha}/comments?{query}"
         req = urllib.request.Request(url, headers={
@@ -158,9 +162,9 @@ def main():
     parser.add_argument("--test-id", help="Matrix Test ID (not used by dispatcher smoke)")
     args = parser.parse_args()
     display, pipeline = PIPELINES[args.case]
-    if args.case == "a3-smoke" and args.test_id:
+    if args.case == "dispatcher-smoke" and args.test_id:
         parser.error("dispatcher smoke must not specify --test-id")
-    if args.case != "a3-smoke" and not args.test_id:
+    if args.case != "dispatcher-smoke" and not args.test_id:
         parser.error("Matrix CI requires --test-id")
     run_id = int(os.environ["GITHUB_RUN_ID"])
     attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
@@ -195,6 +199,7 @@ def main():
                     pipeline=pipeline, test_id=args.test_id, plan_digest=digest)
                 if result is not None:
                     status, code = result["status"], result.get("exit_code")
+                    print(heartbeat_line(status=status, current_case=args.test_id))
                     print(f"CASE {args.test_id}: {status} rc={code}")
                     for line in result.get("last_20_lines", [])[-20:]:
                         print(line)
@@ -203,6 +208,7 @@ def main():
                 marker = f"{display}-RESULT {run_id}:{attempt}"
                 result = find_smoke_result(comments, marker, sha, run_id, attempt, pipeline)
                 if result is not None:
+                    print(heartbeat_line(status=result["status"], current_case=current_case))
                     print(f"RESULT {result['status']} exit_code={result['exit_code']}")
                     for entry in result.get("cases", []):
                         print(f"  {entry['test_name']}: {entry['status']} rc={entry['exit_code']}")
@@ -213,9 +219,7 @@ def main():
             print(f"GitHub read retry: {type(exc).__name__}", flush=True)
         now = time.monotonic()
         if now >= next_heartbeat:
-            elapsed = int(now - started)
-            print(heartbeat_line(status=progress, current_case=current_case,
-                                 waited=elapsed, run_id=run_id, attempt=attempt),
+            print(heartbeat_line(status=progress, current_case=current_case),
                   flush=True)
             next_heartbeat = now + heartbeat_seconds
         time.sleep(min(12, max(0.1, next_heartbeat - time.monotonic()),

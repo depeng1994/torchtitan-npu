@@ -30,20 +30,18 @@ class InputsArtifactTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prepare.parse_cases(json.dumps([{**CASE,'params':{}}]))
 
-    def test_workflow_budget_blocks_too_many_cases(self):
-        with patch.dict(os.environ, {'CI_MAX_CASES':'2'}):
-            with self.assertRaises(ValueError):
-                prepare.parse_cases(json.dumps([CASE]*3))
-        with patch.dict(os.environ, {'CI_MAX_CASES':'1'}):
-            with self.assertRaises(ValueError):
-                prepare.parse_cases(json.dumps([CASE,CASE]))
+    def test_selectors_are_not_arbitrarily_capped(self):
+        many = [{'test_id': f'case_{i:03d}'} for i in range(40)]
+        self.assertEqual(prepare.parse_cases(json.dumps(many)), many)
+        with self.assertRaises(ValueError):
+            prepare.parse_cases('[]')
 
     def test_artifact_identity_is_git_run_metadata(self):
         with tempfile.TemporaryDirectory() as td:
             env = {'CI_TEST_CASES': json.dumps([CASE]), 'GITHUB_RUN_ID': '101',
                    'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_SHA': 'a'*40,
                    'GITHUB_REPOSITORY': 'torchtitan-npu/torchtitan-npu',
-                   'CI_PIPELINE': 'a3-8p', 'CI_MAX_CASES': '4',
+                   'CI_PIPELINE': 'a3-8p',
                    'GITHUB_OUTPUT': str(Path(td) / 'gh-output.txt')}
             with patch.dict(os.environ, env):
                 old = Path.cwd()

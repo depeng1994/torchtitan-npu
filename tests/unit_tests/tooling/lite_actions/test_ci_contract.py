@@ -38,8 +38,7 @@ class CIContract(unittest.TestCase):
             try:
                 os.chdir(td)
                 env = {"CI_TEST_CASES": '[{"suite":"a3_8p_tests"}]',
-                       "CI_MAX_SELECTORS": "2",
-                       "CI_MAX_CASES": "4", "CI_PIPELINE": "a3-8p",
+                       "CI_PIPELINE": "a3-8p",
                        "GITHUB_REPOSITORY": "torchtitan-npu/torchtitan-npu",
                        "GITHUB_RUN_ID": "12345", "GITHUB_RUN_ATTEMPT": "1",
                        "GITHUB_SHA": "a"*40,
@@ -61,10 +60,20 @@ class CIContract(unittest.TestCase):
             finally:
                 os.chdir(cwd)
 
+    def test_expanded_suite_has_no_configured_budget(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        module = 'tests.integration_tests.tools.lite_actions.entrypoint'
+        cases = [SimpleNamespace(test_name=f'case_{i:03d}', nnodes=1, ngpu=8,
+                   test_descr=f'Test case {i}') for i in range(15)]
+        with patch(f'{module}.catalog', return_value={'synthetic_tests': cases}):
+            expanded = prepare.expand_cases([{'suite': 'synthetic_tests'}])
+        self.assertEqual(len(expanded), 15)
+
     def test_selector_overlap_fails(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             prepare.expand_cases([{"suite": "a3_8p_tests"},
-                                  {"test_id": "dsv4_flash_a3_8p_adamw"}], 4)
+                                  {"test_id": "dsv4_flash_a3_8p_adamw"}])
 
     def test_matrix_result_identity_and_failed_case_isolated(self):
         ref={"schema":2,"repo":"torchtitan-npu/torchtitan-npu",
@@ -96,9 +105,10 @@ class CIContract(unittest.TestCase):
         comment["user"]["login"]="forged-author"
         self.assertEqual(waiter.find_progress([comment],**args),"QUEUED")
         self.assertEqual(
-            waiter.heartbeat_line(status="QUEUED",current_case=args["test_id"],
-                                  waited=60,run_id=123,attempt=2),
-            "CI QUEUED dsv4_flash_a3_8p_example 60s")
+            waiter.heartbeat_line(status="QUEUED", current_case=args["test_id"],
+                                  when=waiter.dt.datetime(2026,10,11,13,7,10,
+                                                          tzinfo=waiter.dt.timezone.utc)),
+            "2026/10/11 21:07:10 dsv4_flash_a3_8p_example CI queued.")
 
     def test_partial_matrix_rerun_without_artifact_fails_fast(self):
         import io
@@ -148,7 +158,7 @@ class CIContract(unittest.TestCase):
         inputs = common["on"]["workflow_call"]["inputs"]
         self.assertEqual(inputs["pipeline"]["required"], "true")
         self.assertEqual(inputs["pipeline"]["type"], "string")
-        self.assertEqual(inputs["max_cases"]["type"], "number")
+        self.assertNotIn("max_cases", inputs)
         prepare = common["jobs"]["prepare"]
         matrix = common["jobs"]["case"]
         smoke = common["jobs"]["smoke"]
@@ -161,8 +171,8 @@ class CIContract(unittest.TestCase):
         self.assertIn("fromJSON(needs.prepare.outputs.matrix)", matrix["strategy"]["matrix"])
         self.assertEqual(matrix["timeout-minutes"], "300")
         plan = prepare["steps"][1]
-        self.assertEqual(plan["env"]["CI_MAX_SELECTORS"], "2")
-        self.assertIn("inputs.max_cases", plan["env"]["CI_MAX_CASES"])
+        self.assertNotIn("CI_MAX_SELECTORS", plan["env"])
+        self.assertNotIn("CI_MAX_CASES", plan["env"])
         self.assertIn("inputs.pipeline", plan["env"]["CI_PIPELINE"])
         self.assertIn("github.event.pull_request.head.sha", plan["env"]["CI_SOURCE_SHA"])
         self.assertIn("inputs.default_cases", plan["env"]["CI_TEST_CASES"])
@@ -175,13 +185,13 @@ class CIContract(unittest.TestCase):
                     "CI_WAIT_TIMEOUT_SECONDS"):
             self.assertIn(env, waiter["env"])
         self.assertIn("--test-id", waiter["run"])
-        self.assertIn("--case a3-smoke", smoke["steps"][1]["run"])
+        self.assertIn("--case dispatcher-smoke", smoke["steps"][1]["run"])
         self.assertEqual(smoke["timeout-minutes"], "90")
         self.assertIn("github.base_ref == 'master'", smoke["if"])
-        for filename,pipeline,default,limit in (
-            ("a3-8p-lite-actions.yml", "a3-8p", "a3_8p_tests", "4"),
-            ("a3-16p-lite-actions.yml", "a3-16p", "a3_16p_tests", "2"),
-            ("a5-64p-lite-actions.yml", "a5-64p", "dsv4_pro_a5_64p", "1"),
+        for filename,pipeline,default in (
+            ("a3-8p-lite-actions.yml", "a3-8p", "a3_8p_tests"),
+            ("a3-16p-lite-actions.yml", "a3-16p", "a3_16p_tests"),
+            ("a5-64p-lite-actions.yml", "a5-64p", "a5_64p_tests"),
         ):
             with self.subTest(filename=filename):
                 data=read(filename)
@@ -189,7 +199,7 @@ class CIContract(unittest.TestCase):
                 caller=data["jobs"]["ci"]
                 self.assertEqual(caller["uses"], "./.github/workflows/lite_actions_common.yml")
                 self.assertEqual(caller["with"]["pipeline"], pipeline)
-                self.assertEqual(caller["with"]["max_cases"], limit)
+                self.assertNotIn("max_cases", caller["with"])
                 self.assertIn(default, caller["with"]["default_cases"])
                 self.assertIn("inputs.test_cases", caller["with"]["test_cases"])
                 self.assertEqual(data["permissions"], common["permissions"])
@@ -202,12 +212,12 @@ class CIContract(unittest.TestCase):
         smoke_caller=read("lite-actions-dispatcher-smoke.yml")
         self.assertEqual(
             smoke_caller["jobs"]["ci"]["uses"],"./.github/workflows/lite_actions_common.yml")
-        self.assertEqual(smoke_caller["jobs"]["ci"]["with"]["pipeline"],"a3-smoke")
+        self.assertEqual(smoke_caller["jobs"]["ci"]["with"]["pipeline"],"dispatcher-smoke")
         self.assertEqual(smoke_caller["permissions"],common["permissions"])
         self.assertEqual(smoke_caller["jobs"]["ci"]["with"]["wait_seconds"],"4800")
 
     def test_model_owned_plan_is_unchanged_after_reuse(self):
-        selected=prepare.expand_cases([{"suite":"a3_16p_tests"}],2)
+        selected=prepare.expand_cases([{"suite":"a3_16p_tests"}])
         self.assertEqual([c["test_id"] for c in selected],
                          ["dsv4_flash_a3_16p_example"])
         self.assertEqual((selected[0]["nnodes"],selected[0]["ngpu"]),(2,8))

@@ -17,9 +17,6 @@ on:
       test_cases:
         type: string
         default: ""
-      max_cases:
-        type: number
-        default: 2
       wait_seconds:
         type: number
         default: 16800
@@ -32,7 +29,7 @@ jobs:
   prepare:
     # Only the organization may dispatch real training. PRs target master.
     if: >-
-      inputs.pipeline != 'a3-smoke' &&
+      inputs.pipeline != 'dispatcher-smoke' &&
       github.repository == 'torchtitan-npu/torchtitan-npu' &&
       ((github.event_name == 'pull_request' && github.base_ref == 'master') ||
        (github.event_name == 'workflow_dispatch' &&
@@ -51,8 +48,6 @@ jobs:
         env:
           CI_TEST_CASES: ${{ github.event_name == 'pull_request' && inputs.default_cases || inputs.test_cases }}
           CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          CI_MAX_SELECTORS: "2"
-          CI_MAX_CASES: ${{ inputs.max_cases }}
           CI_PIPELINE: ${{ inputs.pipeline }}
         run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/prepare_request.py
       - name: Upload immutable CI request
@@ -87,7 +82,7 @@ jobs:
 
   smoke:
     if: >-
-      inputs.pipeline == 'a3-smoke' &&
+      inputs.pipeline == 'dispatcher-smoke' &&
       github.repository == 'torchtitan-npu/torchtitan-npu' &&
       ((github.event_name == 'pull_request' && github.base_ref == 'master') ||
        (github.event_name == 'workflow_dispatch' &&
@@ -104,4 +99,4 @@ jobs:
           CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           CI_RESULT_AUTHOR: ${{ vars.LITE_CI_RESULT_ACTOR }}
           CI_WAIT_TIMEOUT_SECONDS: ${{ inputs.wait_seconds }}
-        run: python3 .github/scripts/lite_actions/wait_result.py --case a3-smoke
+        run: python3 .github/scripts/lite_actions/wait_result.py --case dispatcher-smoke

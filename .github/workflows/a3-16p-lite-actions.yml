@@ -27,4 +27,3 @@ jobs:
       pipeline: a3-16p
       default_cases: '[{"suite":"a3_16p_tests"}]'
       test_cases: ${{ inputs.test_cases }}
-      max_cases: 2

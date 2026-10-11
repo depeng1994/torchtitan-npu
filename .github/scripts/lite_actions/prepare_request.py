@@ -26,10 +26,10 @@ PIPELINES = {"a3-8p", "a3-16p", "a5-64p"}
 
 
 def parse_cases(value: str) -> list[dict]:
-    if len(value.encode()) > 8192:
+    if len(value.encode()) > 65535:
         raise ValueError("test_cases input too long")
     cases = json.loads(value)
-    if not isinstance(cases, list) or not 1 <= len(cases) <= 12:
+    if not isinstance(cases, list) or not cases:
         raise ValueError("test_cases selector count invalid")
     for case in cases:
         if (not isinstance(case, dict) or len(case) != 1
@@ -38,12 +38,10 @@ def parse_cases(value: str) -> list[dict]:
         name = case.get("test_id", case.get("suite"))
         if not isinstance(name, str) or not TEST.fullmatch(name):
             raise ValueError("invalid registered test/suite")
-    if len(cases) > int(os.environ.get("CI_MAX_SELECTORS", os.environ.get("CI_MAX_CASES", "2"))):
-        raise ValueError("too many selectors")
     return cases
 
 
-def expand_cases(selectors: list[dict], limit: int) -> list[dict]:
+def expand_cases(selectors: list[dict]) -> list[dict]:
     """Use model-owned definitions; imports are trusted from validated master."""
     from tests.integration_tests.tools.lite_actions.entrypoint import catalog, select
     catalogue = catalog()
@@ -52,8 +50,6 @@ def expand_cases(selectors: list[dict], limit: int) -> list[dict]:
         for test in select(catalogue, **selector):
             if test.test_name in seen:
                 raise ValueError("duplicate expanded Test Case")
-            if len(expanded) >= limit:
-                raise ValueError("expanded Test Case count exceeds budget")
             if not isinstance(test.ngpu, int) or not isinstance(test.nnodes, int):
                 raise ValueError("invalid resource requirements")
             if test.ngpu < 1 or test.nnodes < 1:
@@ -87,7 +83,10 @@ def main() -> None:
     selectors = parse_cases(os.environ["CI_TEST_CASES"])
     request_dir = Path(".ci-request")
     request_dir.mkdir(exist_ok=True)
-    cases = expand_cases(selectors, int(os.environ.get("CI_MAX_CASES", "2")))
+    cases = expand_cases(selectors)
+    # GitHub Actions supports up to 256 Matrix combinations; never truncate.
+    if not cases or len(cases) > 256:
+        raise ValueError("GitHub Matrix supports 1..256 test cases per workflow run")
     result = create_plan(
         cases=cases, run_id=int(os.environ["GITHUB_RUN_ID"]),
         attempt=int(os.environ["GITHUB_RUN_ATTEMPT"]),

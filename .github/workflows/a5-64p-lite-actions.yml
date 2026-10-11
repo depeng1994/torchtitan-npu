@@ -12,7 +12,7 @@ on:
         description: JSON list of test_id or suite selectors
         type: string
         required: true
-        default: '[{"test_id":"dsv4_pro_a5_64p"}]'
+        default: '[{"suite":"a5_64p_tests"}]'
 
 permissions:
   contents: read
@@ -25,6 +25,5 @@ jobs:
     uses: ./.github/workflows/lite_actions_common.yml
     with:
       pipeline: a5-64p
-      default_cases: '[{"test_id":"dsv4_pro_a5_64p"}]'
+      default_cases: '[{"suite":"a5_64p_tests"}]'
       test_cases: ${{ inputs.test_cases }}
-      max_cases: 1
