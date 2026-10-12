@@ -264,7 +264,7 @@ python3 -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite
    - 执行机**完全不持有 GitHub Token**，仅内网调度机单点具有回写 Comment 权限。
 
 ### 3.2 手动调度（Maintainer 冒烟与调试）
-维护者亦可通过 GitHub Actions 网页界面或 GitHub CLI 手动发起调度。以下命令以**组织仓 `master` 已合并相应 Workflow** 为前提；PR #6 尚未合入组织仓主分支时，应使用 PR 自动触发的检查，不要将本例理解为当前组织仓 `master` 必然已可手动运行：
+维护者亦可通过 GitHub Actions 网页界面或 GitHub CLI 手动发起调度：
 
 ```bash
 # 执行 A3 8P 全部用例（Muon + AdamW 独立 Matrix Case，资源不重叠即可并发）
@@ -276,21 +276,11 @@ gh workflow run a3_16p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref m
   -f 'test_cases=[{"test_id":"dsv4_flash_a3_16p_example"}]'
 ```
 
-### 3.3 Case 并发与分布式端口契约
+### 3.3 CI 矩阵并发与动态端口分配
 
-每个 GitHub Matrix Test Case 都是独立的调度单位：Lite Actions 仅在物理 NPU 设备组互不重叠且资源池授权的情况下并发运行；两节点 16P 必须一次取得两个 Host 的完整设备组。此处的并发调度不同于本目录 `run_tests.py` 的本机 `GPUPool`，两套机制不应混淆。
-
-模型仓仍通过 `OverrideDefinitions.env_vars` 保存用例的 `MASTER_PORT`、`HCCL_IF_BASE_PORT` 默认值。多机 Lite Actions 运行时，由 Dispatcher 持有 Host 级端口租约，通过 `LITE_CI_MASTER_PORT` / `LITE_CI_HCCL_IF_BASE_PORT` 传入启动器；`nightly_all_models_test/runner.py` 校验端口后将其映射为实际 `MASTER_PORT` / `HCCL_IF_BASE_PORT`，**优先于用例固定默认值**。普通手动运行不提供 `LITE_CI_*` 变量时维持原有行为；不要在模型脚本中硬编码覆盖 Dispatcher 的端口。
-
-**P2.5 端口隔离适配**：受信任的 Lite Dispatcher 除 `LITE_CI_MASTER_PORT` 和 `LITE_CI_HCCL_IF_BASE_PORT` 外，还提供 `LITE_CI_HCCL_HOST_PORT_RANGE` / `LITE_CI_HCCL_NPU_PORT_RANGE`。测试入口在单机 8P 与双机 16P 均强制将其映射到 `HCCL_HOST_SOCKET_PORT_RANGE` / `HCCL_NPU_SOCKET_PORT_RANGE`，并在每个 Rank 实际启动前覆盖用例默认环境变量。同机多训练**必须实测 CANN 的 Host/NPU 端口支持与绑定效果**，不得单凭不同 `MASTER_PORT` 判定安全。
-
-**新增 N14 实机 Gate**：同时触发两条独立 A3-8P Actions（两个 Run ID，各含 Muon、AdamW），共四条 Matrix Case 必须在两机四个独立 8P 设备组上存在共同训练运行区间，并均通过 5 steps/TB/Exit Code/释放检查。单个 Workflow 中两个 Matrix Case PASS 不算 N14。A5 64P 继续禁用。
-
-**P2.5 新端口验证（2026-10-12，独立设备探针）**：模型验证分支 SHA `f88d50b` 的新对角 16P 与既有对角 16P 已在 A3-3 / A3-4 **同时**训练通过，两个 Case 分别持有独立的 `MASTER_PORT`、`HCCL_HOST_SOCKET_PORT_RANGE`、`HCCL_NPU_SOCKET_PORT_RANGE`，实际 Rank 环境中观察到一致的 Profile。单机 A3-3 8–15 Muon / AdamW 也分别通过。保留在调度机 `/tmp/p25_*` 的日志是人工硬件资格验证，**不能替代完整的 GitHub Actions 回归**；之后已由两条真实 Actions 的四个 Matrix Case 同时训练并全部 PASS，见下方 2026-10-12 正式验收。
-
-**P2.5 正式实机 Actions 验收（2026-10-12）**：训练代码 `f88d50b`，生产 Lite `c54c0de`。 [Smoke Run 38176153060](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38176153060) SUCCESS；[8P Run 38176153053](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38176153053) Attempt 1/2 Muon、AdamW 均 PASS；[16P Run 38176153109](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38176153109) Attempt 1/2 PASS；[另一 8P Run 38176477643](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38176477643) 与 8P Attempt 2 共同构成四路 8P N14（真实 Rank 同时存在，Port Slot 0/1，无重叠 NPU 设备组），四 Case PASS；[另一 16P Run 38177027448](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38177027448) 与 16P Attempt 2 构成双机双 16P 并发，两条均 PASS。所有 Case `phase=reported`，无 `quarantined`。详细验收/安全边界见 [Lite Actions P2.5 台账](https://github.com/depeng1994/lite-actions/blob/main/REFACTOR_PLAN.md)。以上不等于 N10–N13 故障注入/压力/回滚演练已通过；A5 64P 仍禁用。
-
-**实机验收（2026-10-11）**：模型 SHA `e465e79` / Lite `78015f9`。 [8P Run 38147139071 Attempt 3](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38147139071) 两个 Case 分别在 A3-3、A3-4 并发并 PASS；[16P Run 38147139067 Attempt 2](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38147139067) 双机 PASS；[Smoke 38147139076](https://github.com/torchtitan-npu/torchtitan-npu/actions/runs/38147139076) PASS。A5 64P 继续禁用；同机容量与并发故障恢复仍需独立验收。
+在 GitHub Actions CI 流水线中，每个 Matrix Case 是独立的调度与执行单元：
+* **并发调度**：Lite Actions 调度机会根据物理集群的空闲 NPU 资源池，将互不冲突的 Case 并发拉起执行（如单机 8P 各用例并发执行，或双机 16P 跨节点独立分配）。
+* **动态端口防冲突**：当同机或跨机并发拉起多个任务时，调度机会为每个任务动态分配互不冲突的通信端口（通过注入环境变量 `LITE_CI_MASTER_PORT`、`LITE_CI_HCCL_IF_BASE_PORT`、`LITE_CI_HCCL_HOST_PORT_RANGE` 与 `LITE_CI_HCCL_NPU_PORT_RANGE`）。仓内的 `nightly_all_models_test/runner.py` 会自动读取并映射这些变量，覆盖用例的默认端口。开发者编写用例时无需硬编码特殊端口，使用默认值即可。
 
 ### 3.4 硬件环境与调度故障排障
 若任务长时间卡在排队状态、远端 NPU 报告 Quarantine 或出现 SSH 连接异常，属于物理集群调度机层面的环境状态问题，请参阅 [Lite Actions 调度系统文档](https://github.com/depeng1994/lite-actions) 的日常运维与应急排障小节。
