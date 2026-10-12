@@ -14,27 +14,32 @@ import unittest
 from unittest.mock import patch
 
 SCRIPT=Path(__file__).resolve().parents[4]/'.github/scripts/lite_actions/prepare_request.py'
-spec=importlib.util.spec_from_file_location('prepare_ci_request',SCRIPT)
-prepare=importlib.util.module_from_spec(spec)
-spec.loader.exec_module(prepare)
 CASE={'test_id':'dsv4_flash_a3_8p_example'}
 
 class InputsArtifactTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        spec = importlib.util.spec_from_file_location('prepare_ci_request', SCRIPT)
+        cls.prepare = importlib.util.module_from_spec(spec)
+        with patch.dict(os.environ, {'GITHUB_REPOSITORY':'torchtitan-npu/torchtitan-npu'}):
+            spec.loader.exec_module(cls.prepare)
+
     def test_valid_multiple_cases(self):
-        self.assertEqual(prepare.parse_cases(json.dumps([CASE,CASE])),[CASE,CASE])
+        self.assertEqual(self.prepare.parse_cases(json.dumps([CASE,CASE])),[CASE,CASE])
 
     def test_reject_unsafe_ids_and_removed_parameter_fields(self):
         for test_id in ('../bin/sh','test;curl', 'Invalid-ID'):
             with self.subTest(test_id=test_id),self.assertRaises(ValueError):
-                prepare.parse_cases(json.dumps([{**CASE,'test_id':test_id}]))
+                self.prepare.parse_cases(json.dumps([{**CASE,'test_id':test_id}]))
         with self.assertRaises(ValueError):
-            prepare.parse_cases(json.dumps([{**CASE,'params':{}}]))
+            self.prepare.parse_cases(json.dumps([{**CASE,'params':{}}]))
 
     def test_selectors_are_not_arbitrarily_capped(self):
         many = [{'test_id': f'case_{i:03d}'} for i in range(40)]
-        self.assertEqual(prepare.parse_cases(json.dumps(many)), many)
+        self.assertEqual(self.prepare.parse_cases(json.dumps(many)), many)
         with self.assertRaises(ValueError):
-            prepare.parse_cases('[]')
+            self.prepare.parse_cases('[]')
 
     def test_artifact_identity_is_git_run_metadata(self):
         with tempfile.TemporaryDirectory() as td:
@@ -47,7 +52,7 @@ class InputsArtifactTests(unittest.TestCase):
                 old = Path.cwd()
                 try:
                     os.chdir(td)
-                    prepare.main()
+                    self.prepare.main()
                     value=json.loads(Path('.ci-request/ci-request.json').read_text())
                     self.assertEqual([r['test_id'] for r in value['cases']],
                                      [CASE['test_id']])

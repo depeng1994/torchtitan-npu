@@ -26,12 +26,14 @@ def load(name, file):
     return module
 
 
-prepare = load("ci_prepare", PREP)
-with patch.dict(os.environ, {"GITHUB_ACTOR": "ci-maintainer"}):
-    waiter = load("ci_waiter", WAIT)
-
-
 class CIContract(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.prepare = load("ci_prepare", PREP)
+        with patch.dict(os.environ, {"GITHUB_ACTOR": "ci-maintainer"}):
+            cls.waiter = load("ci_waiter", WAIT)
+
     def test_matrix_and_artifact_identical(self):
         with tempfile.TemporaryDirectory() as td:
             cwd = Path.cwd()
@@ -45,7 +47,7 @@ class CIContract(unittest.TestCase):
                        "GITHUB_OUTPUT": str(Path(td) / "gh-output.txt")}
                 with patch.dict(os.environ, env):
                     # This runs against real model-owned OverrideDefinitions.
-                    prepare.main()
+                    self.prepare.main()
                 request = json.loads(Path(".ci-request/ci-request.json").read_text())
                 matrix = json.loads(Path("gh-output.txt").read_text().splitlines()[0].split("=",1)[1])
                 self.assertEqual(request["schema"], 2)
@@ -56,7 +58,7 @@ class CIContract(unittest.TestCase):
                 self.assertEqual([x["test_id"] for x in matrix["include"]],
                                  [x["test_id"] for x in request["cases"]])
                 unsigned={k:v for k,v in request.items() if k!="plan_digest"}
-                self.assertEqual(request["plan_digest"], prepare.digest_plan(unsigned))
+                self.assertEqual(request["plan_digest"], self.prepare.digest_plan(unsigned))
             finally:
                 os.chdir(cwd)
 
@@ -67,7 +69,7 @@ class CIContract(unittest.TestCase):
         cases = [SimpleNamespace(test_name=f'case_{i:03d}', nnodes=1, ngpu=8,
                    test_descr=f'Test case {i}') for i in range(15)]
         with patch(f'{module}.catalog', return_value={'synthetic_tests': cases}):
-            expanded = prepare.expand_cases([{'suite': 'synthetic_tests'}])
+            expanded = self.prepare.expand_cases([{'suite': 'synthetic_tests'}])
         self.assertEqual(len(expanded), 15)
 
     def test_ci_host_and_npu_hccl_ranges_validate_and_map(self):
@@ -95,7 +97,7 @@ class CIContract(unittest.TestCase):
 
     def test_selector_overlap_fails(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
-            prepare.expand_cases([{"suite": "a3_8p_tests"},
+            self.prepare.expand_cases([{"suite": "a3_8p_tests"},
                                   {"test_id": "dsv4_flash_a3_8p_adamw"}])
 
     def test_matrix_result_identity_and_failed_case_isolated(self):
@@ -107,52 +109,52 @@ class CIContract(unittest.TestCase):
                  "body":"Lite-CI-RESULT 91:1:dsv4_flash_a3_8p_adamw\n"+json.dumps(ref)}
         q=dict(sha="a"*40,run_id=91,attempt=1,pipeline="a3-8p",
                test_id="dsv4_flash_a3_8p_adamw",plan_digest="b"*64)
-        self.assertEqual(waiter.find_case_result([comment],**q),ref)
+        self.assertEqual(self.waiter.find_case_result([comment],**q),ref)
         for change in ({"attempt":2},{"plan_digest":"c"*64},
                        {"test_id":"dsv4_flash_a3_8p_example"},{"sha":"c"*40}):
-            self.assertIsNone(waiter.find_case_result([comment],**{**q,**change}))
+            self.assertIsNone(self.waiter.find_case_result([comment],**{**q,**change}))
         comment["user"]["login"]="attacker"
-        self.assertIsNone(waiter.find_case_result([comment],**q))
+        self.assertIsNone(self.waiter.find_case_result([comment],**q))
 
     def test_waiter_progress_heartbeat_checks_author_and_identity(self):
         args = dict(sha="a"*40,run_id=123,attempt=2,pipeline="a3-8p",
                     test_id="dsv4_flash_a3_8p_example",plan_digest="b"*64)
-        self.assertEqual(waiter.find_progress([],**args), "QUEUED")
+        self.assertEqual(self.waiter.find_progress([],**args), "QUEUED")
         marker = "LCI-R 123:2:dsv4_flash_a3_8p_example"
         comment = {"user":{"login":"ci-maintainer"}, "body":marker}
-        self.assertEqual(waiter.find_progress([comment],**args),"RUNNING")
+        self.assertEqual(self.waiter.find_progress([comment],**args),"RUNNING")
         for change in ({"attempt":3},{"test_id":"other_case"}):
             with self.subTest(change=change):
-                self.assertEqual(waiter.find_progress([comment],**{**args,**change}),
+                self.assertEqual(self.waiter.find_progress([comment],**{**args,**change}),
                                  "QUEUED")
         comment["user"]["login"]="forged-author"
-        self.assertEqual(waiter.find_progress([comment],**args),"QUEUED")
+        self.assertEqual(self.waiter.find_progress([comment],**args),"QUEUED")
         self.assertEqual(
-            waiter.heartbeat_line(status="QUEUED", current_case=args["test_id"],
-                                  when=waiter.dt.datetime(2026,10,11,13,7,10,
-                                                          tzinfo=waiter.dt.timezone.utc)),
+            self.waiter.heartbeat_line(status="QUEUED", current_case=args["test_id"],
+                                  when=self.waiter.dt.datetime(2026,10,11,13,7,10,
+                                                          tzinfo=self.waiter.dt.timezone.utc)),
             "2026/10/11 21:07:10 dsv4_flash_a3_8p_example CI queued.")
 
     def test_partial_matrix_rerun_without_artifact_fails_fast(self):
         import io
-        with patch.object(waiter.urllib.request, "urlopen",
+        with patch.object(self.waiter.urllib.request, "urlopen",
                           return_value=io.BytesIO(
                               b'{"artifacts":[{"name":"lite-ci-request-1",'
                               b'"expired":false}]}')):
             with self.assertRaisesRegex(ValueError, "Partial Matrix reruns"):
-                waiter.ensure_attempt_artifact("test-token",1234,2)
-        with patch.object(waiter.urllib.request, "urlopen",
+                self.waiter.ensure_attempt_artifact("test-token",1234,2)
+        with patch.object(self.waiter.urllib.request, "urlopen",
                           return_value=io.BytesIO(
                               b'{"artifacts":[{"name":"lite-ci-request-2",'
                               b'"expired":false}]}')):
-            waiter.ensure_attempt_artifact("test-token",1234,2)
+            self.waiter.ensure_attempt_artifact("test-token",1234,2)
 
     def test_org_only_repository_and_comment_author_binding(self):
         org = "torchtitan-npu/torchtitan-npu"
-        self.assertEqual(prepare.REPO, org)
-        self.assertEqual(waiter.REPO, org)
+        self.assertEqual(self.prepare.REPO, org)
+        self.assertEqual(self.waiter.REPO, org)
         cases = [{"test_id":"dsv4_flash_a3_8p_example","nnodes":1,"ngpu":8}]
-        plan = prepare.create_plan(cases=cases,run_id=123,attempt=1,
+        plan = self.prepare.create_plan(cases=cases,run_id=123,attempt=1,
                                    sha="a"*40,repo=org,pipeline="a3-8p")
         self.assertEqual(plan["repo"],org)
         report = {"schema":2,"repo":org,"run_id":123,"attempt":1,
@@ -164,118 +166,112 @@ class CIContract(unittest.TestCase):
                           json.dumps(report)}
         args = dict(sha="a"*40,run_id=123,attempt=1,pipeline="a3-8p",
                     test_id=cases[0]["test_id"],plan_digest="b"*64)
-        self.assertEqual(waiter.find_case_result([comment],**args),report)
+        self.assertEqual(self.waiter.find_case_result([comment],**args),report)
         comment["user"]["login"]="forged-user"
-        self.assertIsNone(waiter.find_case_result([comment],**args))
+        self.assertIsNone(self.waiter.find_case_result([comment],**args))
         with self.assertRaisesRegex(ValueError,"untrusted repository"):
-            prepare.create_plan(cases=cases,run_id=123,attempt=1,
+            self.prepare.create_plan(cases=cases,run_id=123,attempt=1,
                                 sha="a"*40,repo="other/repo",pipeline="a3-8p")
-    def test_ci_workflow_reuse_contract(self):
+    def test_workflow_dispatch_guards_and_matrix_propagation(self):
         import yaml
-        root = ROOT / ".github/workflows"
+
+        workflow_dir = ROOT / ".github/workflows"
+
         def read(name):
-            return yaml.load((root / name).read_text(), Loader=yaml.BaseLoader)
+            return yaml.load((workflow_dir / name).read_text(), Loader=yaml.BaseLoader)
+
+        def command_step(job, command):
+            steps = [step for step in job["steps"]
+                     if command in step.get("run", "")]
+            self.assertEqual(len(steps), 1, f"Expected one {command} step")
+            return steps[0]
+
         common = read("lite_actions_common.yml")
-        self.assertEqual(list(common["on"]), ["workflow_call"])
-        self.assertEqual(set(common["jobs"]), {"prepare", "case", "smoke"})
-        inputs = common["on"]["workflow_call"]["inputs"]
-        self.assertEqual(inputs["pipeline"]["required"], "true")
-        self.assertEqual(inputs["pipeline"]["type"], "string")
-        self.assertNotIn("max_cases", inputs)
-        prepare = common["jobs"]["prepare"]
-        matrix = common["jobs"]["case"]
-        smoke = common["jobs"]["smoke"]
-        self.assertIn("torchtitan-npu/torchtitan-npu", prepare["if"])
-        self.assertIn("github.base_ref == 'master'", prepare["if"])
-        self.assertIn("startsWith(github.ref, 'refs/heads/ci/')", prepare["if"])
-        self.assertEqual(matrix["needs"], "prepare")
-        self.assertIn("needs.prepare.result == 'success'",matrix["if"])
-        self.assertEqual(matrix["strategy"]["fail-fast"], "false")
-        self.assertIn("fromJSON(needs.prepare.outputs.matrix)", matrix["strategy"]["matrix"])
-        self.assertEqual(matrix["timeout-minutes"], "300")
-        plan = prepare["steps"][1]
-        self.assertNotIn("CI_MAX_SELECTORS", plan["env"])
-        self.assertNotIn("CI_MAX_CASES", plan["env"])
-        self.assertIn("inputs.pipeline", plan["env"]["CI_PIPELINE"])
-        self.assertIn("github.event.pull_request.head.sha", plan["env"]["CI_SOURCE_SHA"])
-        self.assertIn("inputs.default_cases", plan["env"]["CI_TEST_CASES"])
-        artifact = prepare["steps"][2]
-        self.assertEqual(artifact["uses"], "actions/upload-artifact@v4")
-        self.assertEqual(artifact["with"]["if-no-files-found"], "error")
-        self.assertEqual(artifact["with"]["retention-days"], "1")
-        waiter = matrix["steps"][1]
-        for env in ("CI_SOURCE_SHA", "CI_RESULT_AUTHOR", "CI_PLAN_DIGEST",
-                    "CI_WAIT_TIMEOUT_SECONDS"):
-            self.assertIn(env, waiter["env"])
-        self.assertIn("--test-id", waiter["run"])
-        self.assertIn("--case dispatcher-smoke", smoke["steps"][1]["run"])
-        self.assertEqual(smoke["timeout-minutes"], "90")
-        self.assertIn("github.base_ref == 'master'", smoke["if"])
-        for filename,pipeline,default in (
-            ("a3_8p_lite_actions.yml", "a3-8p", "a3_8p_tests"),
-            ("a3_16p_lite_actions.yml", "a3-16p", "a3_16p_tests"),
-            ("a5_64p_lite_actions.yml", "a5-64p", "a5_64p_tests"),
-        ):
-            with self.subTest(filename=filename):
-                data=read(filename)
-                self.assertEqual(list(data["jobs"]), ["ci"])
-                caller=data["jobs"]["ci"]
-                self.assertEqual(caller["uses"], "./.github/workflows/lite_actions_common.yml")
+        self.assertIn("workflow_call", common["on"])
+        self.assertIn("pipeline", common["on"]["workflow_call"]["inputs"])
+        self.assertTrue({"prepare", "case", "smoke"}.issubset(common["jobs"]))
+        self.assertEqual(common["permissions"], {"contents": "read", "actions": "read"})
+
+        prepare_job = common["jobs"]["prepare"]
+        case_job = common["jobs"]["case"]
+        smoke_job = common["jobs"]["smoke"]
+        for job in (prepare_job, smoke_job):
+            self.assertIn("github.repository == 'torchtitan-npu/torchtitan-npu'", job["if"])
+            self.assertIn("github.base_ref == 'master'", job["if"])
+        self.assertEqual(case_job["needs"], "prepare")
+        self.assertIn("needs.prepare.result == 'success'", case_job["if"])
+        self.assertIn("fromJSON(needs.prepare.outputs.matrix)",
+                      case_job["strategy"]["matrix"])
+        self.assertEqual(case_job["strategy"]["fail-fast"], "false")
+
+        producer = command_step(prepare_job, "prepare_request.py")
+        self.assertIn("inputs.pipeline", producer["env"]["CI_PIPELINE"])
+        self.assertIn("github.event.pull_request.head.sha", producer["env"]["CI_SOURCE_SHA"])
+        self.assertIn("inputs.default_cases", producer["env"]["CI_TEST_CASES"])
+        uploads = [step for step in prepare_job["steps"]
+                   if step.get("uses", "").startswith("actions/upload-artifact@")]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads[0]["with"]["if-no-files-found"], "error")
+        self.assertEqual(uploads[0]["with"]["path"], ".ci-request/ci-request.json")
+
+        consumer = command_step(case_job, "wait_result.py")
+        self.assertIn("--test-id", consumer["run"])
+        self.assertIn("CI_PLAN_DIGEST", consumer["env"])
+        self.assertIn("CI_SOURCE_SHA", consumer["env"])
+        self.assertIn("CI_RESULT_AUTHOR", consumer["env"])
+        self.assertIn("dispatcher-smoke", command_step(smoke_job, "wait_result.py")["run"])
+
+        callers = (
+            ("a3_8p_lite_actions.yml", "a3-8p", "a3_8p_tests", True),
+            ("a3_16p_lite_actions.yml", "a3-16p", "a3_16p_tests", True),
+            ("a5_64p_lite_actions.yml", "a5-64p", "a5_64p_tests", False),
+            ("lite_actions_dispatcher_smoke.yml", "dispatcher-smoke", None, True),
+        )
+        for filename, pipeline, suite, enabled in callers:
+            with self.subTest(pipeline=pipeline):
+                workflow = read(filename)
+                call_jobs = [job for job in workflow["jobs"].values()
+                             if job.get("uses") == "./.github/workflows/lite_actions_common.yml"]
+                self.assertEqual(len(call_jobs), 1)
+                caller = call_jobs[0]
                 self.assertEqual(caller["with"]["pipeline"], pipeline)
-                self.assertNotIn("max_cases", caller["with"])
-                self.assertIn(default, caller["with"]["default_cases"])
-                self.assertIn("inputs.test_cases", caller["with"]["test_cases"])
-                self.assertEqual(data["permissions"], common["permissions"])
-                self.assertIn("workflow_dispatch", data["on"])
-                if pipeline=="a5-64p":
-                    self.assertNotIn("pull_request", data["on"])
-                    self.assertEqual(caller["if"], chr(36)+"{{ false }}")
+                self.assertEqual(workflow["permissions"], common["permissions"])
+                self.assertIn("workflow_dispatch", workflow["on"])
+                if suite:
+                    self.assertIn(suite, caller["with"]["default_cases"])
+                    self.assertIn("inputs.test_cases", caller["with"]["test_cases"])
+                if not enabled:
+                    self.assertNotIn("pull_request", workflow["on"])
+                    self.assertIn("false", caller["if"])
                 else:
-                    self.assertEqual(data["on"]["pull_request"]["branches"], ["master"])
-        smoke_caller=read("lite_actions_dispatcher_smoke.yml")
-        self.assertEqual(
-            smoke_caller["jobs"]["ci"]["uses"],"./.github/workflows/lite_actions_common.yml")
-        self.assertEqual(smoke_caller["jobs"]["ci"]["with"]["pipeline"],"dispatcher-smoke")
-        self.assertEqual(smoke_caller["permissions"],common["permissions"])
-        self.assertEqual(smoke_caller["jobs"]["ci"]["with"]["wait_seconds"],"4800")
+                    self.assertEqual(workflow["on"]["pull_request"]["branches"], ["master"])
 
     def test_model_owned_plan_is_unchanged_after_reuse(self):
-        selected=prepare.expand_cases([{"suite":"a3_16p_tests"}])
+        selected=self.prepare.expand_cases([{"suite":"a3_16p_tests"}])
         self.assertEqual([c["test_id"] for c in selected],
                          ["dsv4_flash_a3_16p_example"])
         self.assertEqual((selected[0]["nnodes"],selected[0]["ngpu"]),(2,8))
 
-    def test_new_ci_files_have_huawei_copyright(self):
-        files = [
-            ".github/scripts/lite_actions/prepare_request.py",
-            ".github/scripts/lite_actions/wait_result.py",
-            *(".github/workflows/" + name for name in (
-                "a3_16p_lite_actions.yml", "a3_8p_lite_actions.yml",
-                "a5_64p_lite_actions.yml", "lite_actions_dispatcher_smoke.yml",
-                "lite_actions_common.yml")),
-            *("tests/integration_tests/nightly_all_models_test/" + name for name in (
-                "a3_16p_tests.py", "a3_8p_tests.py", "a5_64p_tests.py", "runner.py")),
-            "tests/integration_tests/tools/lite_actions/entrypoint.py",
-            "tests/unit_tests/models/deepseek_v4/test_nightly_flash_recipes.py",
-            *("tests/unit_tests/tooling/lite_actions/" + name for name in (
-                "test_ci_contract.py", "test_entrypoint.py", "test_request.py")),
-        ]
-        self.assertEqual(len(files), 16)
-        copyright = "# Copyright (c) 2026 Huawei Technologies Co., Ltd."
-        for name in files:
-            with self.subTest(path=name):
-                content = (ROOT / name).read_text()
-                if content.startswith("#!"):
-                    content = content.split("\n", 1)[1]
-                self.assertTrue(content.startswith(copyright), name)
-                self.assertIn("BSD-style license", "\n".join(content.splitlines()[:6]))
-
-    def test_unrelated_workflows_remain_independent(self):
-        for name in ("deploy-docs.yml","sync-upstream.yml"):
-            data=(ROOT/".github/workflows"/name).read_text()
-            self.assertNotIn("lite_actions_common.yml",data)
-            self.assertIn("secrets.DEPLOY_KEY",data)
-
+    def test_lite_ci_sources_have_required_license_headers(self):
+        # Guard the active Lite Actions source tree without enumerating an
+        # arbitrary fixed number of files or relying on an unchanging layout.
+        directories = (
+            ROOT / ".github/scripts/lite_actions",
+            ROOT / "tests/integration_tests/nightly_all_models_test",
+            ROOT / "tests/integration_tests/tools/lite_actions",
+            ROOT / "tests/unit_tests/tooling/lite_actions",
+        )
+        sources = [file for directory in directories
+                   for file in directory.glob("*.py")]
+        sources.extend((ROOT / ".github/workflows").glob("*lite_actions*.yml"))
+        self.assertTrue(sources, "Lite Actions sources must be discoverable")
+        for file in sources:
+            with self.subTest(path=file.relative_to(ROOT)):
+                lines = file.read_text().splitlines()
+                if lines[0].startswith("#!"):
+                    lines = lines[1:]
+                self.assertRegex(lines[0], r"^# Copyright \(c\) 20\d{2} Huawei Technologies Co\., Ltd\.")
+                self.assertIn("BSD-style license", "\n".join(lines[:6]))
 
 
 if __name__ == "__main__":

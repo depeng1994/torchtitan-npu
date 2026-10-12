@@ -7,6 +7,9 @@
 import os
 from pathlib import Path
 import subprocess
+from dataclasses import replace
+
+import pytest
 
 from tests.integration_tests.nightly_all_models_test import a3_8p_tests, a3_16p_tests, a5_64p_tests
 
@@ -41,28 +44,36 @@ def imports(argv):
     return result
 
 
-def test_a3_muon_and_adamw_effective_recipe(tmp_path):
-    muon, adamw = a3_8p_tests.build_test_list()
-    swap = 'torchtitan_npu.override.common.optimizer.swap_optimizer'
-    virtual = 'torchtitan_npu.override.common.optimizer.virtual'
-    npu = 'torchtitan_npu.override.common.rms_norm.asc'
-    for i, case in enumerate((muon, adamw)):
-        folder = tmp_path / str(i)
-        folder.mkdir()
-        argv = expanded_argv(case, folder)
-        assert case.env_vars["HF_HOME"].startswith("/mnt/share/ci_tests/")
-        assert case.env_vars["HF_DATASETS_CACHE"].startswith(case.env_vars["HF_HOME"] + "/")
-        assert last(argv, '--training.steps') == '5'
-        assert '--compile.no-enable' in argv
-        assert npu in imports(argv)
-        assert last(argv, '--optimizer.name') == ('Muon' if i == 0 else 'AdamW')
-        assert last(argv, '--training.seq-len') == '4096'
-        effective = imports(argv)
-        assert (swap in effective) == (i == 0)
-        assert (virtual in effective) == (i == 1)
-        assert effective.count(virtual) == (1 if i == 1 else 0)
-        # Both replace the same config node and must never co-exist.
-        assert not ({virtual, swap} <= set(effective))
+@pytest.mark.parametrize(
+    'case_id,optimizer,enabled_override,disabled_override',
+    [
+        ('dsv4_flash_a3_8p_example', 'Muon',
+         'torchtitan_npu.override.common.optimizer.swap_optimizer',
+         'torchtitan_npu.override.common.optimizer.virtual'),
+        ('dsv4_flash_a3_8p_adamw', 'AdamW',
+         'torchtitan_npu.override.common.optimizer.virtual',
+         'torchtitan_npu.override.common.optimizer.swap_optimizer'),
+    ],
+    ids=['muon', 'adamw'],
+)
+def test_a3_8p_optimizer_recipe_uses_selected_override(
+    tmp_path, case_id, optimizer, enabled_override, disabled_override,
+):
+    matches = [case for case in a3_8p_tests.build_test_list()
+               if case.test_name == case_id]
+    assert len(matches) == 1, f'{case_id} must be registered exactly once'
+    case = matches[0]
+
+    argv = expanded_argv(case, tmp_path)
+    selected_imports = imports(argv)
+
+    assert last(argv, '--training.steps') == '5'
+    assert last(argv, '--optimizer.name') == optimizer
+    assert last(argv, '--training.seq-len') == '4096'
+    assert '--compile.no-enable' in argv
+    assert 'torchtitan_npu.override.common.rms_norm.asc' in selected_imports
+    assert selected_imports.count(enabled_override) == 1
+    assert disabled_override not in selected_imports
 
 
 def test_a3_16p_effective_recipe(tmp_path):
@@ -78,13 +89,21 @@ def test_a3_16p_effective_recipe(tmp_path):
     assert 'torchtitan_npu.override.common.rms_norm.asc' in imports(argv)
 
 
-def test_a5_model_recipe_keeps_explicit_initial_checkpoint(tmp_path):
-    # The A5 case is still disabled at the dispatcher. Removing the old
-    # Deleting the redundant checkpoint preflight flag cannot disable loading.
-    case = a5_64p_tests.build_test_list()[0]
-    assert case.env_vars['CKPT_INIT_LOAD_PATH'] == ''
-    script = (ROOT / case.train_script).read_text()
-    assert '--checkpoint.enable' in script
-    assert '--checkpoint.load-only' in script
-    assert '--checkpoint.initial-load-path ${CKPT_INIT_LOAD_PATH}' in script
-    assert '--checkpoint.initial-load-in-hf' in script
+def test_a5_model_recipe_passes_initial_checkpoint_options_to_launcher(tmp_path):
+    # CPU contract only: the A5 hardware pool remains disabled.
+    case = next(test for test in a5_64p_tests.build_test_list()
+                if test.test_name == 'dsv4_pro_a5_64p')
+    # The disabled A5 pool has an unconfigured checkpoint path. Provide a
+    # sentinel without mutating the registered recipe, then capture the real
+    # shell-expanded argument forwarded to the training launcher.
+    checkpoint = str(tmp_path / 'expected_initial_checkpoint')
+    configured = replace(case, env_vars={**case.env_vars,
+                                         'CKPT_INIT_LOAD_PATH': checkpoint})
+
+    argv = expanded_argv(configured, tmp_path)
+
+    assert '--checkpoint.enable' in argv
+    assert '--checkpoint.load-only' in argv
+    assert '--checkpoint.initial-load-in-hf' in argv
+    assert last(argv, '--checkpoint.initial-load-path') == checkpoint
+    assert case.env_vars['CKPT_INIT_LOAD_PATH'] == ''  # A5 still not deployable
