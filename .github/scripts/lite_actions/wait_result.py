@@ -24,7 +24,7 @@ if (source := os.environ.get("GITHUB_REPOSITORY", REPO)) != REPO:
 RESULT_AUTHOR = os.environ.get("CI_RESULT_AUTHOR") or os.environ.get("GITHUB_ACTOR", "")
 
 PIPELINES = {
-    "dispatcher-smoke": ("Dispatcher-Smoke", "npu-smi"),
+    "dispatcher-smoke": ("Dispatcher-Smoke", "os-info"),
     "a3-8p": ("A3-8p-CI-Example", "a3-8p"),
     "a3-16p": ("A3-16p-CI-Example", "a3-16p"),
     "a5-64p": ("A5-64p-CI", "a5-64p"),
@@ -48,6 +48,7 @@ def find_smoke_result(comments, marker, sha, run_id, attempt, pipeline):
         if (report.get("sha") == sha and report.get("run_id") == run_id
                 and report.get("attempt") == attempt
                 and report.get("pipeline") == pipeline
+                and report.get("worker_id") == "depeng"
                 and report.get("status") in ("PASS", "FAIL")):
             return report
     return None
@@ -183,7 +184,7 @@ def main():
     heartbeat_seconds = 60
     next_heartbeat = started
     progress = "QUEUED"
-    current_case = args.test_id or "npu-smi"
+    current_case = args.test_id or "os-info"
     print(f"Waiting for {display} run={run_id} attempt={attempt} SHA={sha[:12]}"
           + f" current_case={current_case}", flush=True)
     while time.monotonic() < deadline:
