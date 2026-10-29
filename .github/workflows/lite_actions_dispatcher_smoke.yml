@@ -18,5 +18,6 @@ jobs:
   ci:
     uses: ./.github/workflows/lite_actions_common.yml
     with:
+      # The dispatcher-smoke pipeline pins worker_id=depeng in Lite Actions config.
       pipeline: dispatcher-smoke
       wait_seconds: 600
