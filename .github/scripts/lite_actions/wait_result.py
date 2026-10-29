@@ -48,6 +48,7 @@ def find_smoke_result(comments, marker, sha, run_id, attempt, pipeline):
         if (report.get("sha") == sha and report.get("run_id") == run_id
                 and report.get("attempt") == attempt
                 and report.get("pipeline") == pipeline
+                and report.get("worker_id") == "depeng"
                 and report.get("status") in ("PASS", "FAIL")):
             return report
     return None
