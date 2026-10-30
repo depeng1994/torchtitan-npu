@@ -268,11 +268,11 @@ python3 -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite
 
 ```bash
 # 执行 A3 8P 全部用例（Muon + AdamW 独立 Matrix Case，资源不重叠即可并发）
-gh workflow run a3_8p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
+gh workflow run nightly_fulltests.yml -R torchtitan-npu/torchtitan-npu --ref master \
   -f 'test_cases=[{"suite":"a3_8p_tests"}]'
 
 # 仅执行指定 16P 用例
-gh workflow run a3_16p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref master \
+gh workflow run nightly_fulltests.yml -R torchtitan-npu/torchtitan-npu --ref master \
   -f 'test_cases=[{"test_id":"dsv4_flash_a3_16p_example"}]'
 ```
 
@@ -284,3 +284,20 @@ gh workflow run a3_16p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref m
 
 ### 3.4 硬件环境与调度故障排障
 若任务长时间卡在排队状态、远端 NPU 报告 Quarantine 或出现 SSH 连接异常，属于物理集群调度机层面的环境状态问题，请参阅 [Lite Actions 调度系统文档](https://github.com/depeng1994/lite-actions) 的日常运维与应急排障小节。
+
+
+## Lite Actions 2.0 调度配置
+
+只保留 `nightly_fulltests.yml` 与 `lite_actions_dispatcher_smoke.yml` 两个 Lite Actions 业务入口，均支持手动与面向 master 的 PR 触发。默认不增加定时任务。
+
+Workflow 提供 `default_worker`、`default_target_pool`、`default_docker`。Python 的 `ci_overrides` 按字段覆盖，缺省继承；测试拓扑仍由 `nnodes` 和 `ngpu` 定义。
+
+```python
+ci_overrides={"worker": "yellow", "target_pool": "a3_shared_yellow", "docker": "已登记的镜像引用"}
+```
+
+`ci_kind` 默认为 `train`；NPU 冒烟为 `npu_smoke`；`worker_probe` 仅使用 worker 身份，不继承训练资源。完整执行计划使用 schema 3，与源码 SHA、run、attempt 和逐 case 身份绑定。
+
+现有 A3 只由 blue (`ssh ycy`) 管理：`113.46.17.205:153`、`113.46.17.205:154`。默认环境为 `dsv4.1_train_torchtitan_a3:cann_master_newest_0916`，由部署配置绑定已有容器。yellow (`ssh hwy`) 首版只验收系统探测，`a3_shared_yellow` 和 `a5_shared_yellow` 保持禁用。
+
+每个 case 回传日志最多 20 行、每行最多 180 字符；继续限制 Comment 正文和序列化请求体大小。Summary 只显示配置与状态，不追加训练日志、TensorBoard 或训练产物。

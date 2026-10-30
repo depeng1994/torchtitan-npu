@@ -7,6 +7,7 @@ from tests.integration_tests import OverrideDefinitions
 
 def build_test_list() -> list[OverrideDefinitions]:
     return [OverrideDefinitions(
+        ci_kind="npu_smoke",
         test_name="dispatch_smoke_16p",
         test_descr="Lite Actions dispatch smoke: two-node 16P HCCL/DP handshake",
         ngpu=8,

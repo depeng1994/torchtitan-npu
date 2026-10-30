@@ -46,7 +46,11 @@ class InputsArtifactTests(unittest.TestCase):
             env = {'CI_TEST_CASES': json.dumps([CASE]), 'GITHUB_RUN_ID': '101',
                    'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_SHA': 'a'*40,
                    'GITHUB_REPOSITORY': 'torchtitan-npu/torchtitan-npu',
-                   'CI_PIPELINE': 'a3-8p',
+                   'CI_WORKFLOW': 'nightly_fulltests.yml',
+                   'CI_SOURCE_SHA': 'a'*40,
+                   'CI_DEFAULT_WORKER': 'blue',
+                   'CI_DEFAULT_TARGET_POOL': 'a3_shared_blue',
+                   'CI_DEFAULT_DOCKER': 'image:tag',
                    'GITHUB_OUTPUT': str(Path(td) / 'gh-output.txt')}
             with patch.dict(os.environ, env):
                 old = Path.cwd()
@@ -56,7 +60,7 @@ class InputsArtifactTests(unittest.TestCase):
                     value=json.loads(Path('.ci-request/ci-request.json').read_text())
                     self.assertEqual([r['test_id'] for r in value['cases']],
                                      [CASE['test_id']])
-                    self.assertEqual(value['schema'], 2)
+                    self.assertEqual(value['schema'], 3)
                     self.assertEqual(value['run_id'], 101)
                     self.assertEqual(value['attempt'], 2)
                     self.assertEqual(value['repo'], env['GITHUB_REPOSITORY'])

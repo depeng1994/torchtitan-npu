@@ -52,7 +52,7 @@ def test_catalog_select_and_inspect_are_generic(monkeypatch, capsys):
     monkeypatch.setattr(sys, 'argv', ['entrypoint', 'inspect', '--suite', 'synthetic_tests'])
     entrypoint.main()
     data = json.loads(capsys.readouterr().out)
-    assert data == [
+    assert [{k: row[k] for k in ("test_id", "ngpu", "nnodes", "env_vars")} for row in data] == [
         {'test_id':'case_alpha','ngpu':8,'nnodes':1,'env_vars':{'TEST_MODE':'case_alpha'}},
         {'test_id':'case_beta','ngpu':8,'nnodes':1,'env_vars':{'TEST_MODE':'case_beta'}},
     ]

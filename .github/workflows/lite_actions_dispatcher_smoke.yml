@@ -1,23 +1,35 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Licensed under the BSD-style license found in the LICENSE file.
 
 name: Dispatcher-Smoke
-
 on:
   pull_request:
     branches: [master]
   workflow_dispatch:
-
+    inputs:
+      test_cases:
+        description: JSON test_id/suite selectors; empty uses defaults
+        type: string
+        required: false
 permissions:
   contents: read
   actions: read
-
 jobs:
   ci:
     uses: ./.github/workflows/lite_actions_common.yml
     with:
-      # The dispatcher-smoke pipeline pins worker_id=depeng in Lite Actions config.
-      pipeline: dispatcher-smoke
-      wait_seconds: 600
+      workflow: lite_actions_dispatcher_smoke.yml
+      default_cases: '[{"suite":"worker_probe_tests"},{"suite":"a3_8p_smoke_tests"},{"suite":"a3_16p_smoke_tests"}]'
+      test_cases: ${{ inputs.test_cases }}
+      default_worker: blue
+      default_target_pool: a3_shared_blue
+      default_docker: dsv4.1_train_torchtitan_a3:cann_master_newest_0916
+  result:
+    name: Lite-Actions-Smoke
+    if: always()
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          CI_RESULT: ${{ needs.ci.result }}
+        run: test "$CI_RESULT" = success
