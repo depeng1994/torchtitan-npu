@@ -46,6 +46,7 @@ jobs:
       - name: Validate and expand trusted test plan
         id: plan
         env:
+          # Manual input takes precedence; an empty input falls back to the caller's default_cases.
           CI_TEST_CASES: ${{ inputs.test_cases != '' && inputs.test_cases || inputs.default_cases }}
           CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           CI_PIPELINE: ${{ inputs.pipeline }}
