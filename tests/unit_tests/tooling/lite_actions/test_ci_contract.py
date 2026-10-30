@@ -62,6 +62,11 @@ class CIContract(unittest.TestCase):
             finally:
                 os.chdir(cwd)
 
+    def test_8p_smoke_is_selectable_as_single_matrix_case(self):
+        cases = self.prepare.expand_cases([{"test_id": "dispatch_smoke_8p"}])
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0]["test_id"], "dispatch_smoke_8p")
+        self.assertEqual((cases[0]["nnodes"], cases[0]["ngpu"]), (1, 8))
     def test_expanded_suite_has_no_configured_budget(self):
         from types import SimpleNamespace
         from unittest.mock import patch
@@ -207,7 +212,10 @@ class CIContract(unittest.TestCase):
         producer = command_step(prepare_job, "prepare_request.py")
         self.assertIn("inputs.pipeline", producer["env"]["CI_PIPELINE"])
         self.assertIn("github.event.pull_request.head.sha", producer["env"]["CI_SOURCE_SHA"])
-        self.assertIn("inputs.default_cases", producer["env"]["CI_TEST_CASES"])
+        self.assertEqual(
+            producer["env"]["CI_TEST_CASES"],
+            "${{ inputs.test_cases != '' && inputs.test_cases || inputs.default_cases }}",
+        )
         uploads = [step for step in prepare_job["steps"]
                    if step.get("uses", "").startswith("actions/upload-artifact@")]
         self.assertEqual(len(uploads), 1)
@@ -239,7 +247,10 @@ class CIContract(unittest.TestCase):
                 self.assertIn("workflow_dispatch", workflow["on"])
                 if suite:
                     self.assertIn(suite, caller["with"]["default_cases"])
-                    self.assertIn("inputs.test_cases", caller["with"]["test_cases"])
+                    self.assertEqual(caller["with"]["test_cases"], "${{ inputs.test_cases }}")
+                    manual_input = workflow["on"]["workflow_dispatch"]["inputs"]["test_cases"]
+                    self.assertEqual(manual_input["required"], "false")
+                    self.assertNotIn("default", manual_input)
                 if not enabled:
                     self.assertNotIn("pull_request", workflow["on"])
                     self.assertIn("false", caller["if"])
