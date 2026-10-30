@@ -11,10 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       test_cases:
-        description: JSON list of test_id or suite selectors
+        description: JSON list of test_id or suite selectors; leave empty to use default_cases
         type: string
-        required: true
-        default: '[{"suite":"a3_16p_tests"}]'
+        required: false
 
 permissions:
   contents: read
