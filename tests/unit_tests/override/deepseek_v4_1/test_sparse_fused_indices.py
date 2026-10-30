@@ -10,41 +10,13 @@ from itertools import pairwise
 import pytest
 import torch
 
-from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Model
+from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc
-
-
-def _metadata(bounds: list[int], *, compress_ratios: tuple[int, ...] = (1, 2)):
-    """Build the metadata for one packed row of these document boundaries, via the model.
-
-    The test states the boundaries it wants to exercise; the positions that produce them
-    are rebuilt here, so the metadata comes from the model's own builder rather than being
-    hand-rolled.  One ``arange`` per document, concatenated, is what a packed loader emits.
-    """
-    positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)]).unsqueeze(0)
-
-    class _ModelOwner:
-        """A stand-in for the model, as ``get_attention_masks`` sees it.
-
-        The hook is a method, so it reaches for the frame builders on ``self``; they are taken from
-        the model class rather than restated here, so a change to the frame algebra cannot leave the
-        two disagreeing.  ``needs_reference`` is stated because a stand-in has no config to read it
-        from, and True is the conservative answer: the reference half is built.
-        """
-
-        _frame = staticmethod(DeepSeekV41Model._frame)
-        _row_frames = DeepSeekV41Model._row_frames
-        _reference = DeepSeekV41Model._reference
-        needs_reference = True
-
-    owner = _ModelOwner()
-    owner.compress_ratios = compress_ratios
-    return DeepSeekV41Model.get_attention_masks(owner, positions)
 
 
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("bounds", [[0, 8], [0, 4, 8]], ids=["single-doc", "two-docs"])
-def test_kernel_receives_document_local_indices(monkeypatch, ratio, bounds):
+def test_kernel_receives_document_local_indices(monkeypatch, v41_metadata, ratio, bounds):
     """The kernel gets the selection as the selector made it: document-local, in TND layout.
 
     Nothing about the *values* is translated -- the fused selector and this port share one
@@ -53,9 +25,18 @@ def test_kernel_receives_document_local_indices(monkeypatch, ratio, bounds):
     a TND kernel wants ``[T, N2, K]``.
     """
     length = bounds[-1]
-    metadata = _metadata(bounds)
-    assert torch.equal(metadata.kernel.q.cu_seqlens, torch.tensor(bounds, dtype=torch.int32))
-    cu_cmp = metadata.kernel.frame_for(ratio).cu_seqlens
+    # The entry this layer would read in a run: its own ratio's frames and, for the selection's
+    # width, its own geometry's metadata -- this test replaces the kernel node wholesale, so what
+    # it pins is the layout the node is handed, but the metadata is still the real pairing.
+    metadata = v41_metadata(
+        bounds,
+        ratio=ratio,
+        geometry=AicpuGeometry(
+            window_size=2, num_heads=2, head_dim=4, index_topk=5, index_num_heads=2, index_head_dim=4
+        ),
+    )
+    assert torch.equal(metadata.cu_seq_q, torch.tensor(bounds, dtype=torch.int32))
+    cu_cmp = metadata.cmp_k.cu_seqlens
 
     # Document-local indices, -1 for unused slots, interleaved: another document's first
     # entry, the first/last own entry, an unused slot and an exclusive-end index -- the
@@ -73,7 +54,19 @@ def test_kernel_receives_document_local_indices(monkeypatch, ratio, bounds):
         return torch.zeros_like(q), torch.zeros((1, q.shape[0], q.shape[1]))
 
     monkeypatch.setattr(ascendc._SparseMLA, "apply", kernel)
-    attention = ascendc.AscV41SparseAttention.Config(window_size=2, softmax_scale=0.5, compress_ratio=ratio).build()
+    attention = ascendc.AscV41SparseAttention.Config(
+        window_size=2,
+        softmax_scale=0.5,
+        compress_ratio=ratio,
+        # The kernel node is replaced below, so this test is about the selection's layout rather
+        # than about the metadata lookup; the config still states the geometry the metadata above
+        # was sized with, the way a run pairs them.
+        num_heads=2,
+        head_dim=4,
+        index_topk=5,
+        index_num_heads=2,
+        index_head_dim=4,
+    ).build()
     q = torch.zeros((1, length, 2, 4), dtype=torch.bfloat16)
     topk_before = indices.clone()
     out = attention(
@@ -100,7 +93,7 @@ def test_kernel_receives_document_local_indices(monkeypatch, ratio, bounds):
 
 
 @pytest.mark.parametrize("with_shared", [False, True], ids=["window", "shared-kv"])
-def test_backward_routes_kernel_gradients_and_ignores_the_lse_gradient(monkeypatch, with_shared):
+def test_backward_routes_kernel_gradients_and_ignores_the_lse_gradient(monkeypatch, v41_metadata, with_shared):
     q = torch.ones(4, 2, 4, requires_grad=True)
     original = torch.ones(4, 1, 4, requires_grad=True)
     shared = torch.ones(2, 1, 4, requires_grad=True) if with_shared else None
@@ -154,7 +147,20 @@ def test_backward_routes_kernel_gradients_and_ignores_the_lse_gradient(monkeypat
         shared,
         indices,
         sink,
-        _metadata([0, 4]),  # attention_masks: the frames the kernels grid
+        # The entry this layer reads: the geometry the ``apply`` signature is driven with below
+        # (two heads of width four, a window of two, and a two-wide selection).
+        v41_metadata(
+            [0, 4],
+            ratio=2 if with_shared else 0,
+            geometry=AicpuGeometry(
+                window_size=2,
+                num_heads=2,
+                head_dim=4,
+                index_topk=2,
+                index_num_heads=2,
+                index_head_dim=4,
+            ),
+        ),
         0.5,
         2 if with_shared else 0,
         2,

@@ -7,7 +7,8 @@
 # Run this script on a single node.
 # Append CLI arguments to override the defaults below:
 #   ./examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh --training.steps 5
-# USE_GOLDEN=1 selects Golden. For deterministic execution, append
+# USE_GOLDEN=1 selects the reference combination (the model's default attention).
+# For deterministic execution, append
 # --debug.seed 42 --debug.deterministic to the command line.
 
 set -euo pipefail
@@ -29,7 +30,7 @@ CKPT_SAVE_LOAD_PATH="${CKPT_SAVE_LOAD_PATH:-/path/to/save_ckpt}" # your model sa
 TP=1
 PP=1
 EP=1
-CP=1
+CP="${CP:-1}"
 DP_SHARD=1
 DP_REPLICATE=1
 SPMD_BACKEND="spmd_types"
@@ -54,6 +55,7 @@ HF_ASSETS_ARGS="
 # Dataloader
 DATALOADER_ARGS="
     --dataloader.dataset ${DATASET}
+    --dataloader.per_doc_alignment $((128 * CP))
     --dataloader.dataset-path ${DATASET_PATH}
 "
 
@@ -65,6 +67,7 @@ PARALLELISM_ARGS="
     --parallelism.expert-parallel-degree ${EP}
     --parallelism.tensor-parallel-degree ${TP}
     --parallelism.context-parallel-degree ${CP}
+    --parallelism.context-parallel-load-balancer doc_chunk
     --parallelism.pipeline-parallel-degree ${PP}
 "
 
@@ -123,7 +126,6 @@ OPTIMIZER_OVERRIDES="
 if [[ "${USE_GOLDEN}" == "1" ]]; then
     NPU_OPS_OVERRIDES=(
         torchtitan_npu.override.common.rope.workaround
-        torchtitan_npu.override.deepseek_v4.sparse_attn.golden
     )
 else
     NPU_OPS_OVERRIDES=(
@@ -131,11 +133,9 @@ else
         torchtitan_npu.override.common.rms_norm.asc
         torchtitan_npu.override.common.rope.asc_complex
 
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li_metadata
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li
+        torchtitan_npu.override.deepseek_v4.lightning_indexer.asc
 
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc
+        'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8}'
         # MHC
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post

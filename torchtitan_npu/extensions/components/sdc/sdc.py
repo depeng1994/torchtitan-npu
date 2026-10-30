@@ -95,14 +95,13 @@ class SDC(Configurable):
         checker.set_grad_sample_interval(config.grad_sample_interval)
         if config.with_checksum:
             # Model compile wrappers exist, but the first training graph is still lazy.
-            from torchtitan_npu.compile.sdc_checksum import install_checksum_pass
+            from torchtitan_npu.extensions.compile.sdc_checksum import install_checksum_pass
 
             install_checksum_pass()
 
         checker.init_stream()
         for name, parameter in self._iter_gradient_candidates(model_parts):
-            if parameter.dtype == torch.bfloat16:
-                checker.matmul_with_bf16 = True
+            checker.matmul_dtype_supported = True
             if not checker.parameter_filtering():
                 continue
             state_key = f"{name}_backward"

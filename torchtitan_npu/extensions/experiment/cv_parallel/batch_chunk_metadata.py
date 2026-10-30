@@ -6,45 +6,56 @@
 """Prebuild full and half-batch attention metadata for CV chunking."""
 
 from dataclasses import dataclass
-from itertools import pairwise
-from typing import cast
+from typing import Any, cast
 
 import torch
-from torchtitan.config import derive, override
-from torchtitan.models.common.attention import VarlenMetadata
+from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
-from torchtitan_npu.models.common.metadata_extension import LightningIndexerMetadata, MetadataExtension
 from torchtitan_npu.models.deepseek_v4.metadata import (
-    CompressedVarlenMetadata,
-    build_compressed_varlen_metadata,
-    register_pytree_node_for_dataclass,
+    DeepSeekV4Metadata,
+    build_v4_metadata,
 )
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
-    AscCompressedVarlenMetadata,
-    AscMetadataExtension,
+    AscV4Metadata,
+    build_aicpu_metadata,
 )
 
 from . import _BATCH_CHUNK_PAIR_ATTR
 
 
 @dataclass(kw_only=True, slots=True)
-class BatchChunkAscCompressedVarlenMetadata(AscCompressedVarlenMetadata):
+class BatchChunkAscV4Metadata(AscV4Metadata):
     batch_chunk_tensors: tuple[tuple[torch.Tensor, ...], ...] | None = None
 
 
-register_pytree_node_for_dataclass(BatchChunkAscCompressedVarlenMetadata)
+if BatchChunkAscV4Metadata not in SUPPORTED_NODES:
+    register_dataclass(
+        BatchChunkAscV4Metadata,
+        serialized_type_name=(f"{BatchChunkAscV4Metadata.__module__}.{BatchChunkAscV4Metadata.__name__}"),
+    )
+
+
+def _row_positions(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """The row's document-relative positions (``[1, N]``), reconstructed from its grid.
+
+    They are a function of the boundaries alone -- a document's positions restart at zero --
+    so the metadata carries the grid and every consumer that needs the positions derives them
+    instead of the entry storing a second copy of the row.
+    """
+    lengths = torch.diff(cu_seqlens)
+    return (
+        torch.arange(int(cu_seqlens[-1]), device=cu_seqlens.device) - torch.repeat_interleave(cu_seqlens[:-1], lengths)
+    ).reshape(1, -1)
 
 
 def _plain_batch_chunk_metadata(
-    metadata: CompressedVarlenMetadata,
-) -> tuple[CompressedVarlenMetadata, CompressedVarlenMetadata]:
-    """Build two local plain-stream contracts at an aligned token boundary."""
-    if metadata.window is not None:
+    metadata: DeepSeekV4Metadata,
+) -> tuple[DeepSeekV4Metadata, DeepSeekV4Metadata]:
+    """Build two local plain-stream contracts at an aligned document boundary."""
+    if metadata.cp is not None:
         raise ValueError("batch chunk metadata does not support context parallelism")
-    varlen = metadata.varlen
-    if not torch.equal(varlen.cu_seq_q, varlen.cu_seq_k):
-        raise ValueError("batch chunk metadata requires cu_seq_q == cu_seq_k")
-    cu_host = tuple(int(value) for value in varlen.cu_seq_q.cpu().tolist())
+    cu = metadata.swa_k.cu_seqlens
+    cu_host = tuple(int(value) for value in cu.cpu().tolist())
     total_tokens = cu_host[-1]
     if total_tokens < 2 or total_tokens % 2:
         raise ValueError(f"batch chunk metadata requires an even positive token extent, got {total_tokens}")
@@ -55,72 +66,64 @@ def _plain_batch_chunk_metadata(
             f"batch boundary at token {split_token}; boundaries={cu_host}"
         )
     split_index = cu_host.index(split_token)
-    ratios = tuple(metadata.plans)
-    qk_share_storage = varlen.cu_seq_k is varlen.cu_seq_q
+    # One entry is one geometry, so both chunks re-cut the same ratio's grid; the documents do
+    # not cross the split, so each chunk is a whole number of pooling blocks again.
+    ratio = metadata.ratio
+    positions = _row_positions(cu)
     chunks = []
     for start_index, end_index, token_offset in (
         (0, split_index, 0),
         (split_index, len(cu_host) - 1, split_token),
     ):
-        local_host = tuple(boundary - token_offset for boundary in cu_host[start_index : end_index + 1])
-        local_cu = (varlen.cu_seq_q[start_index : end_index + 1] - token_offset).contiguous()
-        local_lengths = tuple(right - left for left, right in pairwise(local_host))
-        local_max = max(local_lengths)
-        local_varlen = VarlenMetadata(
-            cu_seq_q=local_cu,
-            # Preserve the full contract's pytree alias structure. A shared
-            # q/k tensor contributes one runtime role; distinct tensors
-            # contribute two roles and are remapped independently.
-            cu_seq_k=local_cu if qk_share_storage else local_cu.clone(),
-            max_q=local_max,
-            max_k=local_max,
-            cu_seq_q_host=local_host,
-        )
-        chunks.append(build_compressed_varlen_metadata(local_varlen, ratios))
+        local_cu = (cu[start_index : end_index + 1] - token_offset).contiguous()
+        local_positions = positions[..., token_offset : cu_host[end_index]]
+        chunks.append(build_v4_metadata(local_positions, ratio, cu_seq_q=local_cu))
     return cast(
-        "tuple[CompressedVarlenMetadata, CompressedVarlenMetadata]",
+        "tuple[DeepSeekV4Metadata, DeepSeekV4Metadata]",
         tuple(chunks),
     )
 
 
 def _metadata_tensor_fields(
-    metadata: AscCompressedVarlenMetadata,
+    metadata: AscV4Metadata,
 ) -> dict[str, torch.Tensor]:
-    """Return tensor fields whose full/chunk values have identical roles."""
+    """Return tensor fields whose full/chunk values have identical roles.
+
+    A tensor that several roles share (the query frame's boundaries *are* the row's, and the
+    sliding-window frame's too) is tagged once, under the first role that names it: two tags on
+    one object would leave whichever was written last.  The full batch and its chunks derive
+    their frames the same way, so the surviving role is the same on both sides.
+    """
     tensors: dict[str, torch.Tensor] = {}
+    tagged: set[int] = set()
 
     def add(name: str, value: object) -> None:
-        if isinstance(value, torch.Tensor):
+        if isinstance(value, torch.Tensor) and id(value) not in tagged:
             tensors[name] = value
+            tagged.add(id(value))
 
-    add("varlen.cu_seq_q", metadata.varlen.cu_seq_q)
-    if metadata.varlen.cu_seq_k is not metadata.varlen.cu_seq_q:
-        add("varlen.cu_seq_k", metadata.varlen.cu_seq_k)
-    for ratio, plan in metadata.plans.items():
-        for field_name in (
-            "cu_seqlens_cmp_k",
-            "block_remainder",
-            "gather_indices",
-            "block_positions",
-            "first_indices",
-            "compressed_rows",
-            "cmp_k_global_gather_indices",
-        ):
-            add(f"plans.{ratio}.{field_name}", getattr(plan, field_name))
-    for ratio, plan in metadata.asc_plans.items():
-        for field_name in (
-            "smla_metadata",
-            "smla_grad_metadata",
-            "li_metadata",
-            "slig_metadata",
-        ):
-            add(f"asc_plans.{ratio}.{field_name}", getattr(plan, field_name))
+    # The kernel frames: the query's, the sliding window's and the compressed axis's.  Their
+    # role names stay geometry-free on purpose: the full batch and its chunks carry the same
+    # geometry, so the pairing is by role, and the ratio is part of the metadata, not the name.
+    for frame_name in ("q", "swa_k", "cmp_k"):
+        frame = getattr(metadata, frame_name)
+        if frame is None:
+            continue
+        add(f"{frame_name}.cu_seqlens", frame.cu_seqlens)
+        add(f"{frame_name}.seqused", frame.seqused)
+        add(f"{frame_name}.residual", frame.residual)
+    assert metadata.aicpu_metadata is not None, "batch chunk metadata requires the AscendC record tier"
+    # The records are grouped by the kernel that reads them, one field per direction.
+    for group_name in ("sparse_attn", "lightning_indexer"):
+        group = getattr(metadata.aicpu_metadata, group_name)
+        add(f"aicpu.{group_name}.fwd", group.fwd)
+        add(f"aicpu.{group_name}.bwd", group.bwd)
     return tensors
 
 
 def _tag_batch_chunk_metadata(
-    full: AscCompressedVarlenMetadata,
-    chunks: tuple[AscCompressedVarlenMetadata, AscCompressedVarlenMetadata],
+    full: AscV4Metadata,
+    chunks: tuple[AscV4Metadata, AscV4Metadata],
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     """Tag and pack only tensor roles consumed by the full-batch graph.
 
@@ -151,37 +154,59 @@ def _tag_batch_chunk_metadata(
     )
 
 
-class BatchChunkMetadataExtension(AscMetadataExtension):
-    @dataclass(kw_only=True, slots=True)
-    class Config(AscMetadataExtension.Config):
-        pass
+def _batch_chunk_metadata(metadata: AscV4Metadata) -> BatchChunkAscV4Metadata:
+    """Add the two batch chunks' records beside the full batch's.
 
-    def __init__(self, config: Config):
-        super().__init__(config)
-        self._chunk_li_metadata: LightningIndexerMetadata | None = None
-
-    def __call__(self, metadata) -> BatchChunkAscCompressedVarlenMetadata:
-        assert self._chunk_li_metadata is not None, "cv_parallel must bind the model's LI metadata provider"
-        build_metadata = super().__call__
-        full = build_metadata(metadata)
-        first, second = _plain_batch_chunk_metadata(metadata)
-        chunks = (
-            build_metadata(self._chunk_li_metadata(first)),
-            build_metadata(self._chunk_li_metadata(second)),
+    The fused core's own config built the full microbatch's metadata (upstream
+    #4897); this re-cuts that contract at the equal batch boundary and rebuilds the
+    local records from the geometry that rides on it.  A quantized selector's entry
+    is refused: its records are its own backend's operator, and this re-cut has no
+    backend to ask (mirroring ``QuantV4Metadata.prepare_cp_metadata``).
+    """
+    if type(metadata) is not AscV4Metadata:
+        raise TypeError(
+            "batch chunk metadata cannot re-cut "
+            f"{type(metadata).__name__}: its records are its own backend's "
+            "(the quantized selector refuses the re-cut); run without cv_parallel "
+            "or with the BF16 fused selector."
         )
-        return BatchChunkAscCompressedVarlenMetadata(
-            varlen=full.varlen,
-            plans=full.plans,
-            window=full.window,
-            seq_len_host=full.seq_len_host,
-            asc_plans=full.asc_plans,
-            batch_chunk_tensors=_tag_batch_chunk_metadata(full, chunks),
-        )
+    first, second = _plain_batch_chunk_metadata(metadata)
+
+    asc = metadata.aicpu_metadata
+    if asc is None:
+        raise ValueError("batch chunk metadata requires the fused entry's AI_CPU records")
+    geometry = asc.geometry
+
+    def doc_chunk_records(chunk: DeepSeekV4Metadata) -> AscV4Metadata:
+        """This tier's records: the selector's and the attention's."""
+        return build_aicpu_metadata(chunk, geometry=geometry)
+
+    chunks = (doc_chunk_records(first), doc_chunk_records(second))
+    return BatchChunkAscV4Metadata(
+        ratio=metadata.ratio,
+        q=metadata.q,
+        swa_k=metadata.swa_k,
+        cmp_k=metadata.cmp_k,
+        position_k=metadata.position_k,
+        slots=metadata.slots,
+        cp=metadata.cp,
+        a3_workaround=metadata.a3_workaround,
+        aicpu_metadata=metadata.aicpu_metadata,
+        batch_chunk_tensors=_tag_batch_chunk_metadata(metadata, chunks),
+    )
 
 
-@override(target=MetadataExtension.Config, description="Precompute AscendC metadata for two equal batch chunks")
-def asc_metadata(cfg: MetadataExtension.Config) -> AscMetadataExtension.Config:
-    # Register the pipeline only when this experimental override is activated.
-    from . import cv_parallel  # noqa: F401
+def chunk_attention_metadata(extra_kwargs: dict[str, Any]) -> None:
+    """Re-cut this step's built entries into the full batch plus its two chunks, in place.
 
-    return derive(cfg, BatchChunkMetadataExtension.Config)
+    The fused core's own config built one entry per geometry (upstream #4897); the
+    re-cut is a property of this trainer's batch, so it happens at the step boundary,
+    before anything traces or runs.  An entry that already carries the chunks passes
+    through, so a boundary entered twice cannot cut the same entry twice.
+    """
+    metadata = extra_kwargs.get("attention_metadata")
+    if not metadata:
+        return
+    for key, entry in cast("dict[object, AscV4Metadata]", metadata).items():
+        if not isinstance(entry, BatchChunkAscV4Metadata):
+            metadata[key] = _batch_chunk_metadata(entry)

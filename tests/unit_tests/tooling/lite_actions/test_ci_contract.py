@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-# Licensed under the BSD-style license found in the LICENSE file.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 """Schema-3 producer, waiter correlation, workflow and output boundary checks."""
 
@@ -179,3 +181,55 @@ class CIContract(unittest.TestCase):
         with patch.dict(os.environ, env), patch.object(self.waiter, "get", return_value={"artifacts": []}):
             with self.assertRaisesRegex(ValueError, "re-run all jobs"):
                 self.waiter.main()
+
+    def test_waiter_skips_nonobject_json_and_still_finds_valid_result(self):
+        result, args, comment = self.result_fixture()
+        for invalid in [None, [], 0, {**result, "status": []}]:
+            self.assertEqual(self.waiter.find_result([comment(result), comment(invalid)], **args), result)
+
+    def test_waiter_rejects_utf8_and_escaped_request_over_budget(self):
+        result, args, comment = self.result_fixture()
+        for lines in [["中文" * 90] * 20, ['\\"' * 90] * 20]:
+            self.assertIsNone(self.waiter.find_result([comment({**result, "last_20_lines": lines})], **args))
+
+    def test_waiter_uses_etag_and_reuses_304_response(self):
+        import io
+        import urllib.error
+
+        module = self.waiter
+        module.HTTP_CACHE.clear()
+
+        class Response:
+            headers = {"ETag": "test-etag"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def read(self):
+                return b"[]"
+
+        with patch.object(module.urllib.request, "urlopen", return_value=Response()):
+            self.assertEqual(module.get("/test", "isolated-token"), [])
+        with patch.object(
+            module.urllib.request,
+            "urlopen",
+            side_effect=urllib.error.HTTPError("https://example.invalid", 304, "unchanged", {}, io.BytesIO()),
+        ) as open_url:
+            self.assertEqual(module.get("/test", "isolated-token"), [])
+            self.assertEqual(open_url.call_args.args[0].get_header("If-none-match"), "test-etag")
+        module.HTTP_CACHE.clear()
+
+    def test_waiter_treats_rate_limit_as_retryable(self):
+        import io
+        import urllib.error
+
+        module = self.waiter
+        error = urllib.error.HTTPError(
+            "https://example.invalid", 403, "rate limit", {"X-RateLimit-Remaining": "0"}, io.BytesIO()
+        )
+        with patch.object(module.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaises(module.RetryableAPIError):
+                module.get("/rate-test", "isolated-token")

@@ -10,12 +10,11 @@
 
 The TorchTitan revision pinned by ``requirements.txt`` applies scores after
 combine. This patch adds the opt-in score transport needed by standard EP1/EP2
-dispatch while keeping the default path numerically identical. DeepEP keeps
-its pinned dispatch/combine behavior for now, but exposes the same
-``absorb_router_scores`` configuration knob for NPU dispatcher composition;
-score absorption remains disabled by default. HybridEP, MinimalAsyncEP, and
-TorchAO keep their pinned behavior and are not patched here. The dispatcher
-contract follows the upstream design in
+dispatch while keeping the default path numerically identical. DeepEP only
+exposes the same ``absorb_router_scores`` configuration knob here; pre-W2
+absorption is implemented by the NPU dispatcher override. HybridEP,
+MinimalAsyncEP, and TorchAO keep their pinned behavior and are not patched here.
+The dispatcher contract follows the upstream design in
 https://github.com/pytorch/torchtitan/pull/4095.
 """
 
@@ -128,16 +127,19 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
         num_global_tokens_per_local_expert_EP_e: torch.Tensor,
         ep_size: int,
     ) -> tuple[torch.Tensor, list[int], list[int]]:
-        # Patch override: upstream copies input_splits to CPU with
-        # non_blocking=True and relies on the later blocking output_splits
-        # copy to sync the stream. Under torch.compile the scheduler may
-        # hoist the input_splits reads above the blocking copy (no data
-        # dependency between them), so the reads race with the async D2H
-        # copy and return uninitialized memory -- garbage split sizes make
-        # the compiled backward fail with "Split sizes doesn't match total
-        # dim 0 size" at the variable-size data all-to-all. Copy each split
-        # list synchronously; the extra sync is negligible because the
-        # output_splits copy already blocks.
+        # Patch override: keep exactly two blocking _to_copy CPU copies
+        # in this method. Upstream's graph_trainer ep_overlap pass tags the
+        # ops launched here (annotate_moe_ep_regions wraps this override)
+        # and structurally validates "exactly two token-count sync CPU
+        # copies" per MoE chunk -- it schedules the region around the pair
+        # and rewrites the first copy to non_blocking while the last one
+        # stays blocking. Merging both copies into one stacked D2H (PR
+        # #1036) left a single tagged copy and crashed GraphTrainer at
+        # graph build time. Each copy also blocks on its own: upstream's
+        # original async input_splits copy races under inductor scheduling
+        # (reads hoisted above the blocking output_splits copy read
+        # uninitialized memory -- "Split sizes doesn't match total dim 0
+        # size" at the variable-size data all-to-all).
         num_global_tokens_per_local_expert_EP_e = torch.ops._c10d_functional.wait_tensor(
             num_global_tokens_per_local_expert_EP_e
         )
@@ -359,13 +361,7 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
 
 
 class DeepEPTokenDispatcher(TorchTitanDeepEPTokenDispatcher):
-    """DeepEP dispatcher with a forward-compatible absorption config knob.
-
-    DeepEP's score transport is owned by its backend-specific dispatch state,
-    so this patch intentionally does not alter dispatch or combine. The
-    ``absorb_router_scores`` field is exposed for dispatcher config composition
-    and remains disabled by default until DeepEP pre-W2 absorption is wired.
-    """
+    """Expose the absorption setting for backend-specific DeepEP dispatchers."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(TorchTitanDeepEPTokenDispatcher.Config):

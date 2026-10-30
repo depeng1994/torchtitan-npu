@@ -9,7 +9,8 @@
 #   NODE_IPS=192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13 \
 #     ./examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
 #     --checkpoint.initial-load-path /path/to/model_ckpt --training.steps 5
-# USE_GOLDEN=1 selects Golden. For deterministic execution, append
+# USE_GOLDEN=1 selects the reference combination (the model's default attention).
+# For deterministic execution, append
 # --debug.seed 42 --debug.deterministic to the command line.
 
 set -euo pipefail
@@ -76,6 +77,7 @@ HF_ASSETS_ARGS="
 # Dataloader
 DATALOADER_ARGS="
     --dataloader.dataset ${DATASET}
+    --dataloader.per_doc_alignment $((128 * CP))
     --dataloader.dataset-path ${DATASET_PATH}
 "
 
@@ -87,6 +89,7 @@ PARALLELISM_ARGS="
     --parallelism.expert-parallel-degree ${EP}
     --parallelism.tensor-parallel-degree ${TP}
     --parallelism.context-parallel-degree ${CP}
+    --parallelism.context-parallel-load-balancer doc_chunk
     --parallelism.pipeline-parallel-degree ${PP}
 "
 
@@ -148,7 +151,6 @@ OPTIMIZER_OVERRIDES="
 if [[ "${USE_GOLDEN}" == "1" ]]; then
     NPU_OPS_OVERRIDES=(
         torchtitan_npu.override.common.rope.workaround
-        torchtitan_npu.override.deepseek_v4.sparse_attn.golden
     )
 else
     NPU_OPS_OVERRIDES=(
@@ -157,11 +159,9 @@ else
         torchtitan_npu.override.common.rope.asc_partial
         torchtitan_npu.override.deepseek_v4.compressor.asc
 
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li_metadata
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li
+        torchtitan_npu.override.deepseek_v4.lightning_indexer.asc
 
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata
-        torchtitan_npu.override.deepseek_v4.sparse_attn.asc
+        'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":128}'
         # MHC
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post

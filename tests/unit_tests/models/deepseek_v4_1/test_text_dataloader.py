@@ -12,7 +12,9 @@ import torch
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
-from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Model, compression_alignment
+from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess, tiny_v41_model
+from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
+from torchtitan_npu.models.common.packing import compression_alignment
 from torchtitan_npu.patches.torchtitan.hf_datasets.text_datasets import (
     AlignedHuggingfaceDataloader,
     AlignedTextDataset,
@@ -146,74 +148,50 @@ def test_dp_shards_partition_the_aligned_stream(tokenizer):
         assert int(inputs["input"].numel()) % 2 == 0
 
 
-def test_hook_builds_metadata_and_forwards_nothing_extra():
-    """The model-owned mask hook turns packed positions into doc ids and boundaries.
+def test_the_seam_builds_the_metadata_and_forwards_nothing_extra(monkeypatch):
+    """The attention backend turns packed positions into the packed frames.
 
-    The hook consumes ``positions`` and attaches the metadata; it must not leave behind a
-    batch key the forward does not accept, which is how the metadata stays the hook's
-    business rather than the model's signature.
+    The builder consumes ``positions`` and returns the metadata the layers read; it must not
+    leave behind a batch key the forward does not accept, which is how the metadata stays the
+    backends' business rather than the model's signature.
     """
-
-    class _HookOwner:
-        # The hook dispatches to the model's own metadata builder, so attach the real construction
-        # methods, the frame builders it reaches for on ``self``, and the ratio table its
-        # selection-mask precompute reads.  ``needs_reference`` is stated because a stand-in has no
-        # config to read it from, and True is the conservative answer.
-        compress_ratios = (2,)
-        _frame = staticmethod(DeepSeekV41Model._frame)
-        _row_frames = DeepSeekV41Model._row_frames
-        _reference = DeepSeekV41Model._reference
-        needs_reference = True
-        build_attention_masks = DeepSeekV41Model.build_attention_masks
-        get_attention_masks = DeepSeekV41Model.get_attention_masks
-
     positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3, 4, 5]], dtype=torch.long)
-    tokens = torch.zeros_like(positions)
-    extra = {"positions": positions, "input": tokens}
+    model, _ = tiny_v41_model(monkeypatch)
+    _, _, extra = preprocess(model, positions, positions, positions)
 
-    _, _, extra = _HookOwner().build_attention_masks(tokens, tokens, extra)
-
-    metadata = extra["attention_masks"]
-    elapsed = torch.cumsum((positions == 0).to(torch.int32), dim=-1) - 1
-    torch.testing.assert_close(metadata.ref.doc_ids_BL, elapsed, rtol=0, atol=0)
+    # The seam's own keys and nothing else: no ``valid_tokens``, no second mask object.
+    assert set(extra) == {"positions", "attention_metadata"}
+    metadata = extra["attention_metadata"]
+    # One entry per ``(backend config, compression ratio)``: the entry *is* one geometry, and
+    # ``cu_seq_k`` is that geometry's own grid, so a stack that pools at three ratios carries
+    # three entries rather than one ratio table every layer divides.
+    assert set(metadata) == {(CompressedSparseInnerAttention2.Config, ratio) for ratio in (0, 1, 2)}
     # The ragged cumulative form of the two document starts plus the row total.
     expected_cu = torch.tensor([0, 4, 10], dtype=torch.int32)
-    torch.testing.assert_close(metadata.kernel.q.cu_seqlens, expected_cu, rtol=0, atol=0)
-    assert metadata.ref.selection_masks.keys() == {2}
-    # Two documents of four and six tokens: entry j covers tokens [2j, 2j + 2) and is
-    # visible to a query only when the group is complete (j < (t + 1) // 2) and belongs
-    # to the query's own document -- an entry's document is the one its *first* token is
-    # in, which the loader's alignment invariant keeps a whole number of groups.
-    visible, _, _ = metadata.ref.selection_masks[2]
-    assert visible.shape == (10, 5)
-    assert visible[1, 0]  # query 1 sees entry 0: complete, same document
-    assert not visible[0, 0]  # query 0 does not: entry 0 is not complete yet
-    assert visible[4, 1] is not None and not visible[4, 1]  # entry 1 is document 0's
-    assert visible[9, 4]  # entry 4 covers tokens 8-9, document 1's only group
-    assert not visible[9, 1]  # ... and document 0's entries stay invisible to it
+    for (backend, ratio), frames in metadata.items():
+        assert backend is CompressedSparseInnerAttention2.Config
+        torch.testing.assert_close(frames.cu_seq_q, expected_cu, rtol=0, atol=0)
+        # The pool grid is the same backend's ratio applied once, where the ratio is known: a
+        # layer that pools reads this boundary set instead of dividing one it was handed.  A
+        # layer that does not pool addresses the row itself.
+        expected_pool = expected_cu if ratio <= 1 else (expected_cu // ratio).to(torch.int32)
+        torch.testing.assert_close(frames.cu_seq_k, expected_pool, rtol=0, atol=0)
 
 
-def test_the_metadata_carries_no_validity_marks():
+def test_the_metadata_carries_no_validity_marks(monkeypatch):
     """Row validity is the label mask, so the metadata carries no mark tensor.
 
-    The packed loader marks structural padding with ``IGNORE_INDEX``, which the loss
-    consumes directly; the model must not expect a mark field the loader no longer emits.
+    The packed loader marks structural padding with ``IGNORE_INDEX``, which the loss consumes
+    directly; the model must not expect a mark field the loader no longer emits.
     """
-
-    class _HookOwner:
-        # As above: the hook is a method, so the builders it calls on ``self`` come with it.
-        compress_ratios = (2,)
-        _frame = staticmethod(DeepSeekV41Model._frame)
-        _row_frames = DeepSeekV41Model._row_frames
-        _reference = DeepSeekV41Model._reference
-        needs_reference = True
-        build_attention_masks = DeepSeekV41Model.build_attention_masks
-        get_attention_masks = DeepSeekV41Model.get_attention_masks
-
     positions = torch.arange(6).unsqueeze(0)
     tokens = torch.zeros_like(positions)
     labels = torch.full_like(positions, IGNORE_INDEX)
     labels[0, 1] = 7
-    _, _, extra = _HookOwner().build_attention_masks(tokens, labels, {"positions": positions})
+    model, _ = tiny_v41_model(monkeypatch)
+    _, _, extra = preprocess(model, tokens, labels, positions)
+
     assert "valid_tokens" not in extra
-    assert not hasattr(extra["attention_masks"], "valid_tokens_BL")
+    for frames in extra["attention_metadata"].values():
+        assert not hasattr(frames, "valid_tokens")
+        assert not hasattr(frames, "valid_tokens_BL")

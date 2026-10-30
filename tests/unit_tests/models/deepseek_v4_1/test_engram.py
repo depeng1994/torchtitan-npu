@@ -125,6 +125,28 @@ def test_hash_resets_ngram_context_at_packed_document_boundary():
     torch.testing.assert_close(packed_hashes[:, 2:], document_hashes, rtol=0, atol=0)
 
 
+def test_per_row_history_and_one_window_state_the_same_rows():
+    """Two history contracts, one meaning: the tokens before the local rows.
+
+    ``[B, H]`` states one window shared by every local row (what a contiguous shard hands over);
+    ``[B, L, H]`` states each row's own predecessors (what a document-parallel layout produces).
+    Where both can express the same rows they must hash identically.
+    """
+    table = _build_engram().table
+    ids = torch.tensor([[9, 10]], dtype=torch.int64)
+    positions = torch.tensor([[0, 1]], dtype=torch.int64)
+
+    # Two n-gram orders, so a row looks two tokens back: the window carries both distances.
+    window = table.hash(ids, positions, token_history=torch.tensor([[9, 9]], dtype=torch.int64))
+    per_row = table.hash(ids, positions, token_history=torch.tensor([[[9, 9], [9, 9]]], dtype=torch.int64))
+    torch.testing.assert_close(window, per_row, rtol=0, atol=0)
+
+    # The first row starts its document, so its entries are masked either way; giving it another
+    # document's tail changes nothing, which is the mask the per-row contract relies on.
+    other_tail = table.hash(ids, positions, token_history=torch.tensor([[[5, 5], [9, 9]]], dtype=torch.int64))
+    torch.testing.assert_close(window, other_tail, rtol=0, atol=0)
+
+
 def test_forward_backward_matches_official_demo_dataflow():
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(3)
@@ -228,7 +250,7 @@ def test_debug_flavor_enables_engram_and_selects_sparse_adam():
 
 def test_released_v41_geometry_builds_published_logical_tables():
     """Official row totals exercise prime allocation across both complete layers."""
-    full = model_registry("deepseek_v4_1_flash_40layers_16experts_vision")
+    full = model_registry("deepseek_v4_1_flash_40layers_24experts_multimodal")
     layers = [(i, layer.engram) for i, layer in enumerate(full.model.layers) if layer.engram is not None]
     # Source: deepseek-ai/DeepSeek-V4.1-Flash, revision 2bc89ac, text_config.
     assert [i for i, _ in layers] == [1, 14]
@@ -287,3 +309,34 @@ def test_explicit_disable_preserves_selected_optimizer(optimizer):
     )
     adapter = DeepSeekV41StateDictAdapter(trainer.model_spec.model, None)
     assert adapter.to_hf({}) == {}
+
+
+@pytest.mark.parametrize("fused_attention", [False, True], ids=["reference", "fused"])
+def test_model_config_accepts_parameterized_engram_override(fused_attention):
+    from torchtitan.config.override import apply_overrides
+
+    from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_text
+    from torchtitan_npu.override.deepseek_v4_1.engram.mxfp8 import MXFP8HostOffloadEngramTable
+
+    config = deepseek_v4_1_debugmodel_text()
+    config.hf_assets_path = "tests/assets/deepseek_v3"
+    config.training.seq_len = 512
+    config.override.imports = [
+        (
+            "torchtitan_npu.override.deepseek_v4_1.engram.host_offload_mxfp8",
+            {"num_max_tokens_per_rank": 3072, "shard_over_efsdp": True},
+        ),
+    ]
+    if fused_attention:
+        config.override.imports += [
+            "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
+            ("torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc", {}),
+        ]
+    # Follow Trainer's order: model validation runs before applying overrides.
+    config.model_spec.model.update_from_config(config=config)
+    apply_overrides(config.override, config)
+
+    tables = [layer.engram.table for layer in config.model_spec.model.layers if layer.engram is not None]
+    assert tables
+    assert all(isinstance(table, MXFP8HostOffloadEngramTable.Config) for table in tables)
+    assert all(table.num_max_tokens_per_rank == 3072 and table.shard_over_efsdp for table in tables)

@@ -36,6 +36,11 @@ _GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
     "w1_EFD": spmd.S(1),
     "w2_EDF": spmd.S(2),
     "w3_EFD": spmd.S(1),
+    "w13_lora_a": spmd.R,
+    "w1_lora_b": spmd.S(1),
+    "w3_lora_b": spmd.S(1),
+    "w2_lora_a": spmd.S(2),
+    "w2_lora_b": spmd.R,
 }
 
 _replicate_weight = ShardingConfig(
@@ -85,17 +90,19 @@ def set_engram_sharding_config(engram_cfg, *, enable_ep: bool, enable_sp: bool) 
             "input_ids_BL": token_src,
             "positions_BL": token_src,
             "image_mask": token_src,
+            "token_history": token_src,
         },
         in_dst_shardings={
             "hidden_states_BLMD": hidden,
             "input_ids_BL": token_dst,
             "positions_BL": token_dst,
             "image_mask": token_dst,
+            "token_history": token_src,
         },
         out_src_shardings=hidden,
         out_dst_shardings=hidden,
         local_map=LocalMapConfig(
-            in_grad_placements=(hidden, None, None, None),
+            in_grad_placements=(hidden, None, None, None, None),
         ),
     )
 
@@ -113,7 +120,7 @@ def dense_token_ids_sequence_parallel_placement():
 
 
 def set_inner_attention_sharding(inner_cfg) -> None:
-    """Placement for Attention Gym's ``selected_attention`` call.
+    """Placement for Attention Gym's ``gather_attn`` call.
 
     Under context parallelism the KV streams are the **whole row** -- gathered declaratively at
     this boundary, the V4 compressed-container pattern -- while ``q``, ``topk_indices`` and the

@@ -6,7 +6,8 @@
 from .components import checkpoint  # noqa: F401, I001
 from . import trainer  # noqa: F401
 from .components import metrics, optimizer, validate  # noqa: F401
-from .distributed import context_parallel, full_dtensor, parallel_dims  # noqa: F401
+from .distributed import context_parallel, full_dtensor  # noqa: F401
+import torchtitan_npu.patches.torchtitan.distributed.checkpoint.filesystem  # noqa: F401
 from .distributed.flex_shard import dist_muon  # noqa: F401
 from .experiments.graph_trainer import (  # noqa: F401
     chunked_loss,
@@ -15,4 +16,9 @@ from .experiments.graph_trainer import (  # noqa: F401
     ep_ready_nodes_dedup,
     ep_shape_live_out,
 )
-from .models.common import decoder, moe, rope, token_dispatcher  # noqa: F401
+
+# ``attention_metadata`` carries the backend-owned metadata contract and must
+# be applied before ``decoder`` binds the map builder that reads it, and before
+# ``mtp`` dispatches that map per layer.
+from .models.common import attention_metadata, decoder, moe, rope, token_dispatcher  # noqa: F401
+from .models.deepseek_v3 import mtp  # noqa: F401

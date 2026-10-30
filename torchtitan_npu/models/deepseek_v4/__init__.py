@@ -10,7 +10,6 @@ from functools import partial
 from typing import cast
 
 import torch.nn as nn
-from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import ComplexRoPE, Embedding, Linear, RMSNorm, RoPE
@@ -24,10 +23,10 @@ from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
-from torchtitan_npu.models.common.metadata_extension import LightningIndexerMetadata
+from torchtitan_npu.models.common.carry_exchange import CarryExchange
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
-from .attention import Attention, CompressedSparseAttention, CompressedSparseInnerAttention, UnitScaleRMSNorm
+from .attention import Attention, CompressedSparseInnerAttention, UnitScaleRMSNorm
 from .compressor import Compressor, Indexer, LightningIndexer
 from .mhc import HcHead, HcPost, HcPre
 from .model import (
@@ -40,7 +39,6 @@ from .mtp import (
     MTPLoss,
 )
 from .parallelize import parallelize_deepseek_v4
-from .reference import ReferenceMetadataExtension
 from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
 __all__ = [
@@ -114,6 +112,7 @@ def _make_compressor_config(
         head_dim=head_dim,
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
+        carry_exchange=CarryExchange.Config(ratio=compress_ratio),
         param_init=_APE_INIT,
         wkv=Linear.Config(
             in_features=dim,
@@ -240,11 +239,6 @@ def _make_v4_attn_config(
         softmax_scale=softmax_scale,
         index_topk=index_topk,
     )
-    compressed_sparse_attention_cfg = CompressedSparseAttention.Config(
-        lightning_indexer=lightning_indexer_cfg,
-        inner_attention=inner_attention_cfg,
-    )
-
     return Attention.Config(
         n_heads=n_heads,
         head_dim=head_dim,
@@ -253,8 +247,8 @@ def _make_v4_attn_config(
         n_groups=n_groups,
         compress_ratio=compress_ratio,
         norm_eps=norm_eps,
+        lightning_indexer=lightning_indexer_cfg,
         inner_attention=inner_attention_cfg,
-        compressed_sparse_attention=compressed_sparse_attention_cfg,
         # Attention sites are head_dim wide; the base rope may be reused by
         # the indexer (index_head_dim wide), so split is pinned per site.
         rope=dataclasses.replace(rope, split=head_dim - rope_head_dim),
@@ -386,7 +380,6 @@ def _build_v4_layers(
     n_groups: int,
     compress_ratios: tuple[int, ...],
     window_size: int,
-    block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE,
     norm_eps: float,
     index_n_heads: int,
     index_head_dim: int,
@@ -503,14 +496,13 @@ def _build_mtp_layers(
         attention.compress_ratio = 1
         attention.compressor = None
         attention.indexer = None
-        # MTP attention is dense; disable the prebuilt LI wrapper branch too.
-        attention.compressed_sparse_attention.lightning_indexer = None
+        # MTP attention is dense; disable the prebuilt selector branch too.
+        attention.lightning_indexer = None
         # Swap the plain rope in (the main layer may carry the compress-theta
         # variant) while keeping the per-site split pin: rope receives the
         # full-width head_dim tensor and rotates only its trailing channels.
         attention.rope = copy.deepcopy(dataclasses.replace(rope, split=attention.head_dim - attention.rope_head_dim))
-        inner_attention = attention.compressed_sparse_attention.inner_attention
-        inner_attention.compress_ratio = 1
+        cast("CompressedSparseInnerAttention.Config", attention.inner_attention).compress_ratio = 1
 
         moe = copy.deepcopy(inner_cfg.moe)
         moe.router.gate.param_init = _depth_init(layer_id)
@@ -571,7 +563,6 @@ def _make_v4_config(
     n_groups: int,
     compress_ratios: tuple[int, ...],
     window_size: int,
-    block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE,
     norm_eps: float,
     index_n_heads: int,
     index_head_dim: int,
@@ -614,6 +605,9 @@ def _make_v4_config(
         beta_slow=1.0,
         original_seq_len=original_seq_len,
     )
+
+    # The per-microbatch metadata is one entry per geometry, and the MTP depths'
+    # dense (ratio 1) layers share the ratio-1 entry the main layers read.
 
     layers = _build_v4_layers(
         n_layers=n_layers,
@@ -672,23 +666,6 @@ def _make_v4_config(
             param_init=_output_linear_init(dim),
         ),
         layers=layers,
-        window_size=window_size,
-        block_size=block_size,
-        metadata_extension=ReferenceMetadataExtension.Config(
-            window_size=window_size,
-            block_size=block_size,
-            num_heads=n_heads,
-            head_dim=head_dim,
-            index_n_heads=index_n_heads,
-            index_head_dim=index_head_dim,
-            index_topk=index_topk,
-        ),
-        lightning_indexer_metadata=LightningIndexerMetadata.Config(
-            window_size=window_size,
-            index_n_heads=index_n_heads,
-            index_head_dim=index_head_dim,
-            index_topk=index_topk,
-        ),
         hc_mult=hc_mult,
         compress_ratios=compress_ratios,
         n_layers=n_layers,

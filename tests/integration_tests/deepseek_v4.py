@@ -8,27 +8,24 @@ from dataclasses import replace
 from tests.integration_tests import OverrideDefinitions
 
 # DeepSeek-V4 NPU recipe from the example scripts.  Ascend attention and MHC
-# overrides are only used on the non-golden path.
+# overrides are only used on the fused path.
 NPU_OVERRIDES = (
     "--override.imports",
     "torchtitan_npu.override.common.rms_norm.asc",
     "torchtitan_npu.override.common.rope.asc_complex",
-    "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li_metadata",
-    "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li",
-    "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata",
-    "torchtitan_npu.override.deepseek_v4.sparse_attn.asc",
+    "torchtitan_npu.override.deepseek_v4.lightning_indexer.asc",
+    'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8}',
     "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
     "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
     "torchtitan_npu.override.common.token_dispatcher.asc",
 )
 
-# DeepSeek-V4 golden reference recipe. Golden uses the reference MoE token
-# dispatcher path so the checked-in loss baselines stay independent of the NPU
-# fused token-dispatcher implementation.
+# DeepSeek-V4 reference recipe. It runs the model-dir default (attn-gym's
+# reference attention and the reference MoE token dispatcher) so the checked-in
+# loss baselines stay independent of the NPU fused implementations.
 GOLDEN_OVERRIDES = (
     "--override.imports",
     "torchtitan_npu.override.common.rope.workaround",
-    "torchtitan_npu.override.deepseek_v4.sparse_attn.golden",
 )
 
 
@@ -41,6 +38,8 @@ def _build_case(
     use_golden: bool = True,
     check_loss: bool = True,
     extra_override_imports: tuple[str, ...] = (),
+    env_vars: dict[str, str] | None = None,
+    disabled: bool = False,
 ) -> OverrideDefinitions:
     """Build one DeepSeek-V4 integration case.
 
@@ -57,6 +56,8 @@ def _build_case(
         ngpu=ngpu,
         use_golden=use_golden,
         check_loss=check_loss,
+        env_vars=env_vars,
+        disabled=disabled,
     )
 
 
@@ -103,17 +104,53 @@ def build_deepseek_v4_checkpoint_resume_test_list() -> list[OverrideDefinitions]
 
 
 def build_deepseek_v4_quantized_test_list() -> list[OverrideDefinitions]:
-    return [replace(
-        build_deepseek_v4_checkpoint_resume_test_list()[1],
-        test_name="dsv4_lora_block_fp8_ep2_fsdp2",
-        test_descr="DeepSeek-V4 block-FP8 base and floating LoRA training EP2/FSDP2",
-        env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_quantized_training"},
-        override_args=[(*GOLDEN_OVERRIDES, "--training.steps=2", "--training.global-batch-size=2",
-                        "--optimizer.name=AdamW", "--parallelism.data-parallel-shard-degree=2",
-                        "--parallelism.expert-parallel-degree=2", "--hf-assets-path=tests/assets/deepseek_v3")],
-        expected_steps=((1, 2),),
-        check_resume=False,
-    )]
+    return [
+        OverrideDefinitions(
+            test_name="dsv4_mxfp4_communication_fsdp2",
+            test_descr="MXFP4 QAT communication, two forward/backward/optimizer steps on A5",
+            env_vars={"MODULE": "torchtitan_npu.models.deepseek_v4", "CONFIG": "deepseek_v4_debugmodel"},
+            override_args=[
+                (
+                    *GOLDEN_OVERRIDES,
+                    "--training.steps=2",
+                    "--training.global-batch-size=2",
+                    "--training.seq-len=256",
+                    "--parallelism.data-parallel-shard-degree=2",
+                    "--parallelism.expert-parallel-degree=1",
+                    "--parallelism.fsdp-reshard-after-forward=always",
+                    "--hf-assets-path=tests/assets/deepseek_v3",
+                    "--extension.quantization.enable-quantized-training",
+                    "--extension.quantization.recipe=all_block_fp8",
+                    "--extension.quantization.enable-mxfp4-qat",
+                    "--extension.quantization.enable-fsdp-prequantize",
+                    "--extension.quantization.fsdp-prequantize-dtype=mxfp4",
+                )
+            ],
+            ngpu=2,
+            use_golden=True,
+            check_loss=False,
+            expected_steps=((1, 2),),
+        ),
+        replace(
+            build_deepseek_v4_checkpoint_resume_test_list()[1],
+            test_name="dsv4_lora_block_fp8_ep2_fsdp2",
+            test_descr="DeepSeek-V4 block-FP8 base and floating LoRA training EP2/FSDP2",
+            env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_quantized_training"},
+            override_args=[
+                (
+                    *GOLDEN_OVERRIDES,
+                    "--training.steps=2",
+                    "--training.global-batch-size=2",
+                    "--optimizer.name=AdamW",
+                    "--parallelism.data-parallel-shard-degree=2",
+                    "--parallelism.expert-parallel-degree=2",
+                    "--hf-assets-path=tests/assets/deepseek_v3",
+                )
+            ],
+            expected_steps=((1, 2),),
+            check_resume=False,
+        ),
+    ]
 
 
 def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
@@ -126,15 +163,28 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "CONFIG": "deepseek_v4_debugmodel",
                 "TRAIN_FILE": "tests.integration_tests.anticipatory_routing",
             },
-            override_args=[(*GOLDEN_OVERRIDES,
-                "--training.steps=10", "--training.seq-len=256", "--training.global-batch-size=1",
-                "--parallelism.data-parallel-shard-degree=1", "--parallelism.expert-parallel-degree=1",
-                "--hf-assets-path=tests/assets/deepseek_v3", "--debug.seed=42",
-                "--checkpoint.enable", "--checkpoint.no-load-only", "--checkpoint.interval=2",
-                "--checkpoint.keep-latest-k=0", "--checkpoint.no-last-save-model-only",
-                "--anticipatory.enable", "--anticipatory.delay-steps=1", "--anticipatory.active-steps=2",
-                "--anticipatory.max-rollbacks=1", "--anticipatory.detector.warmup-steps=4",
-            )],
+            override_args=[
+                (
+                    *GOLDEN_OVERRIDES,
+                    "--training.steps=10",
+                    "--training.seq-len=256",
+                    "--training.global-batch-size=1",
+                    "--parallelism.data-parallel-shard-degree=1",
+                    "--parallelism.expert-parallel-degree=1",
+                    "--hf-assets-path=tests/assets/deepseek_v3",
+                    "--debug.seed=42",
+                    "--checkpoint.enable",
+                    "--checkpoint.no-load-only",
+                    "--checkpoint.interval=2",
+                    "--checkpoint.keep-latest-k=0",
+                    "--checkpoint.no-last-save-model-only",
+                    "--anticipatory.enable",
+                    "--anticipatory.delay-steps=1",
+                    "--anticipatory.active-steps=2",
+                    "--anticipatory.max-rollbacks=1",
+                    "--anticipatory.detector.warmup-steps=4",
+                )
+            ],
             ngpu=1,
             timeout=600,
             use_golden=True,
@@ -144,12 +194,19 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             test_name="dsv4_lora_ep2_fsdp2",
             test_descr="DeepSeek-V4 LoRA A/B training, frozen base and PEFT export EP2/FSDP2",
             env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_training"},
-            override_args=[(*GOLDEN_OVERRIDES,
-                "--training.steps=2", "--training.global-batch-size=2", "--optimizer.name=Muon",
-                "--parallelism.data-parallel-shard-degree=2", "--parallelism.expert-parallel-degree=2",
-                "--hf-assets-path=tests/assets/deepseek_v3",
-                "--checkpoint.enable", "--checkpoint.interval=10000",
-            )],
+            override_args=[
+                (
+                    *GOLDEN_OVERRIDES,
+                    "--training.steps=2",
+                    "--training.global-batch-size=2",
+                    "--optimizer.name=Muon",
+                    "--parallelism.data-parallel-shard-degree=2",
+                    "--parallelism.expert-parallel-degree=2",
+                    "--hf-assets-path=tests/assets/deepseek_v3",
+                    "--checkpoint.enable",
+                    "--checkpoint.interval=10000",
+                )
+            ],
             ngpu=2,
             use_golden=True,
             check_loss=False,
@@ -220,30 +277,43 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "--training.steps=1",
                 "--parallelism.expert-parallel-degree=2",
                 "--parallelism.context-parallel-degree=2",
+                "--parallelism.context-parallel-load-balancer=None",
                 "--parallelism.spmd-backend=spmd_types",
-                "--compile.enable",
-                "--compile.backend=aot_eager",
+                "--dataloader.per_doc_alignment=256",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",
                 "--optimizer.name=Muon",
             ),
             use_golden=False,
             check_loss=False,
+            # The fused CP2 path now hands the compressed and sliding-window kernels their
+            # rank-local prefix pools (see ``shard_asc_v4_metadata``), so the slab-width
+            # token indices that used to trip the AscendC IndexCheck stay inside each
+            # kernel's own key frame.  Re-enabled with that contract; the numeric CP gate
+            # (same weights via a seed checkpoint) is the 910 run.
         ),
         _build_case(
-            test_name="dsv4_mtp_smla_cp2_headtail",
-            test_descr="DeepSeek-V4 MTP SMLA Muon cp2 headtail",
+            test_name="dsv4_mtp_smla_cp2",
+            test_descr="DeepSeek-V4 MTP SMLA Muon cp2",
             ngpu=2,
+            env_vars={
+                "MODULE": "tests.integration_tests.mtp_config",
+                "CONFIG": "deepseek_v4_debugmodel_mtp",
+            },
             extra_args=(
                 "--training.steps=1",
                 "--parallelism.context-parallel-degree=2",
-                "--parallelism.context-parallel-load-balancer=headtail",
+                "--parallelism.context-parallel-load-balancer=None",
                 "--parallelism.spmd-backend=spmd_types",
+                "--dataloader.per_doc_alignment=256",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",
                 "--optimizer.name=Muon",
             ),
             use_golden=False,
             check_loss=False,
+            # Re-enabled with the rank-local prefix-pool contract: the selector, SLIG,
+            # SMLA and SMLAG share one key frame per rank, so the MTP CP2 case no longer
+            # hits the document-tail window.  Numeric gate: 910 (seed-checkpoint aligned).
         ),
     ]

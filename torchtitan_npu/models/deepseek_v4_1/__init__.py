@@ -382,6 +382,13 @@ def _make_v41_attn_config(
         rope=indexer_rope if owns_indexer else None,
     )
 
+    # The inner config states only what the reference core reads: its window, its scale and
+    # its own ratio, which is the divisor that turns the row's boundaries into the pooled
+    # axis it addresses.  The *kernel* geometry -- heads, head dim, the indexer's numbers --
+    # is not here: only a fused port's records need it, so it is stated where that port is
+    # configured (``sparse_attn.asc`` and its arguments, defaulting to the Flash shape), and a
+    # stack of three ratios builds three entries rather than every layer carrying the whole
+    # ratio table.
     inner_attention_cfg = CompressedSparseInnerAttention2.Config(
         window_size=window_size,
         softmax_scale=softmax_scale,
@@ -878,6 +885,7 @@ def _stripped(
     non_blocking_capacity_factor: float | None = None,
     *,
     num_experts: int = 4,
+    max_seq_len: int = 8192,
 ) -> DeepSeekV41Model.Config:
     """A single-card DeepSeek-V4.1 that differs from the flash flavor in layers alone.
 
@@ -891,8 +899,12 @@ def _stripped(
     full-resolution layer, so the pool source is a Full Mode layer and the Reindex Mode
     layer after it searches what that source built.  Together with the ratio-2 Full Mode
     layer outside the hierarchy, all three branches of the fused selector are reachable.
+
+    Engram rides along: the fused kernels fix the released geometry, so a context-parallel
+    check of Engram cannot use the debug widths, and the tables come from the debug Engram
+    geometry (small, no tokenizer compression) on the first decoder layer.
     """
-    return _make_v41_config(
+    config = _make_v41_config(
         dim=5120,
         # The released MLA attention geometry; SMLA rejects anything but head_dim 512.
         n_heads=64,
@@ -907,7 +919,7 @@ def _stripped(
         index_topk=512,
         candidate_topk_blocks=2048,
         moe_inter_dim=2304,
-        max_seq_len=4096,
+        max_seq_len=max_seq_len,
         n_layers=len(V41_STRIPPED_COMPRESS_RATIOS),
         vocab_size=129280,
         window_size=128,
@@ -941,6 +953,7 @@ def _stripped(
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
     )
+    return _attach_engram(config, dataclasses.replace(_ENGRAM_DEBUG_GEOMETRY, layer_ids=(1,)))
 
 
 def _attach_engram(config, engram):
@@ -971,6 +984,15 @@ deepseek_v4_1_configs = {
         num_experts=16,
         vision=False,
     ),
+    "deepseek_v4_1_flash_40layers_24experts_multimodal": partial(
+        _deepseek_v4_1_flash,
+        num_experts=24,
+    ),
+    "deepseek_v4_1_flash_40layers_24experts_text": partial(
+        _deepseek_v4_1_flash,
+        num_experts=24,
+        vision=False,
+    ),
     "deepseek_v4_1_debugmodel": _debugmodel,
     "deepseek_v4_1_debugmodel_text": partial(_debugmodel, vision=False),
     "deepseek_v4_1_stripped": _stripped,
@@ -996,6 +1018,11 @@ def model_registry(
         validate_converter_order(converters)
         for converter_cfg in converters:
             config = converter_cfg.build().convert(config)
+    state_dict_adapter = DeepSeekV41StateDictAdapter
+    if getattr(config, "lora", None) is not None:
+        from .lora import DeepSeekV41LoRAStateDictAdapter
+
+        state_dict_adapter = DeepSeekV41LoRAStateDictAdapter
     return ModelSpec(
         name="deepseek_v4_1",
         flavor=flavor,
@@ -1003,7 +1030,7 @@ def model_registry(
         parallelize_fn=parallelize_deepseek_v4_1,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=_register_step_pre_hooks,
-        state_dict_adapter=DeepSeekV41StateDictAdapter,
+        state_dict_adapter=state_dict_adapter,
     )
 
 
@@ -1011,6 +1038,8 @@ def _register_step_pre_hooks(optimizers, model_parts, parallel_dims) -> None:
     """Register the MoE balancing step hook."""
     from torchtitan.components.optimizer import register_moe_load_balancing_hook
 
+    if any(getattr(model, "lora_config", None) is not None for model in model_parts):
+        return
     register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
 
 

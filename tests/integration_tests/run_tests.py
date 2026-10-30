@@ -18,7 +18,9 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 # torchtitan-npu override: the runner consumes the case definition at runtime.
@@ -28,6 +30,13 @@ from tests.integration_tests.deepseek_v4 import (
     build_deepseek_v4_checkpoint_resume_test_list,
     build_deepseek_v4_quantized_test_list,
     build_deepseek_v4_test_list,
+)
+from tests.integration_tests.deepseek_v4_1 import (
+    build_deepseek_v4_1_checkpoint_test_list,
+    build_deepseek_v4_1_fused_test_list,
+    build_deepseek_v4_1_golden_test_list,
+    build_deepseek_v4_1_quantized_test_list,
+    build_deepseek_v4_1_test_list,
 )
 from tests.integration_tests.ema import assert_ema_checkpoint_written, build_ema_test_list
 from tests.integration_tests.loss_compare import (
@@ -43,8 +52,19 @@ from tests.integration_tests.qwen3_5 import build_qwen3_5_test_list
 def build_models_test_list() -> list[OverrideDefinitions]:
     """Return the model integration cases for the default smoke suite."""
 
+    # The DeepSeek-V4.1 golden case is back in the default suite alongside the
+    # V4.1 LoRA cases (build_deepseek_v4_1_test_list). The V4 checkpoint-resume
+    # and EMA groups stay out: run in the A3 CI pool they fail inside the HCCL
+    # scatter AI-CPU kernel during `dcp.save`
+    # (soName=libscatter_aicpu_kernel.so, funcName=HcclLaunchAicpuKernelA3 ->
+    # "ACL stream synchronize failed, error code:507018"), which is why !812
+    # pulled them out. Both remain available through the dedicated
+    # `deepseek_v4_checkpoint` and `ema` suites until the runtime supports that
+    # checkpoint path.
     return (
         build_deepseek_v4_test_list()
+        + build_deepseek_v4_1_test_list()
+        + build_deepseek_v4_1_golden_test_list()
         + build_deepseek_v3_2_test_list()
         + build_qwen3_5_test_list()
     )
@@ -57,21 +77,50 @@ def build_engram_hf_test_list():
     return build()
 
 
+def build_engram_cp_test_list():
+    from tests.integration_tests.engram_cp import build_engram_cp_test_list as build
+
+    return build()
+
+
 # torchtitan-npu override: register the DeepSeek-V4, V4.1 and V3.2 NPU suites.
 _TEST_SUITES_FUNCTION = {
     "models": build_models_test_list,
     "deepseek_v3_2": build_deepseek_v3_2_test_list,
     "deepseek_v4": build_deepseek_v4_test_list,
+    "deepseek_v4_1": build_deepseek_v4_1_test_list,
+    "deepseek_v4_1_checkpoint": build_deepseek_v4_1_checkpoint_test_list,
+    "deepseek_v4_1_fused": build_deepseek_v4_1_fused_test_list,
+    "deepseek_v4_1_golden": build_deepseek_v4_1_golden_test_list,
+    "deepseek_v4_1_quantized": build_deepseek_v4_1_quantized_test_list,
     "deepseek_v4_checkpoint": build_deepseek_v4_checkpoint_resume_test_list,
     "deepseek_v4_quantized": build_deepseek_v4_quantized_test_list,
     "ema": build_ema_test_list,
     "deepseek_v4_1_engram_hf": build_engram_hf_test_list,
+    "deepseek_v4_1_engram_cp": build_engram_cp_test_list,
     "qwen3_5": build_qwen3_5_test_list,
 }
 
 # Held while a test writes its captured output so concurrent tests do not
 # interleave their lines.
 _OUTPUT_LOCK = threading.Lock()
+
+
+@dataclass
+class _CaseTiming:
+    """Wall time of one integration case, for the end-of-run summary."""
+
+    test_name: str
+    ngpu: int
+    start: float
+    elapsed: float
+
+
+# torchtitan-npu override: every case records its wall time here so the runner
+# can print the per-case cost once the run is over. Cases run concurrently, so
+# the list has its own lock.
+_CASE_TIMINGS: list[_CaseTiming] = []
+_CASE_TIMINGS_LOCK = threading.Lock()
 
 
 class GPUPool:
@@ -279,17 +328,20 @@ def _run_cmd(
     cmd: list[str],
     env: dict[str, str],
     timeout: float | None = None,
+    *,
+    prefix: str | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run ``cmd`` (an argv list, no shell), capturing merged stdout/stderr.
+    """Run ``cmd`` (an argv list, no shell), streaming merged stdout/stderr live.
 
-    Output is *not* streamed to the parent in real time: when running tests
-    concurrently we want each test's log to appear as one contiguous block
-    rather than interleaved line-by-line with other tests.
+    Each line is written through the output lock, prefixed with the case name, so
+    concurrent cases stay attributable while their progress is visible as it
+    happens: a case the platform kills still leaves the lines it printed, which is
+    what makes a stalled case diagnosable.  The last lines are kept on the result's
+    ``stdout`` for the failure message.
 
     On timeout the child's whole process group is terminated (see
     ``_terminate_process_group``) and a synthetic ``CompletedProcess`` with
-    ``returncode=-1`` is returned, with ``stdout`` populated with whatever the
-    child had emitted so far, so callers do not need to special-case
+    ``returncode=-1`` is returned, so callers do not need to special-case
     ``TimeoutExpired``.
     """
     proc = subprocess.Popen(
@@ -301,28 +353,37 @@ def _run_cmd(
         encoding="utf-8",
         errors="replace",
         start_new_session=True,
+        bufsize=1,
     )
+    tail: deque[str] = deque(maxlen=200)
+
+    def _pump() -> None:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = raw.rstrip("\n")
+            tail.append(line)
+            if prefix is None:
+                with _OUTPUT_LOCK:
+                    sys.stderr.write(f"{line}\n")
+                    sys.stderr.flush()
+            else:
+                _emit_line(prefix, line)
+
+    reader = threading.Thread(target=_pump, name=f"run-cmd-{prefix or 'case'}", daemon=True)
+    reader.start()
     try:
-        stdout, _ = proc.communicate(timeout=timeout)
-        return subprocess.CompletedProcess(cmd, proc.returncode, stdout=stdout or "", stderr=None)
+        returncode = proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         _terminate_process_group(proc)
-        stdout, _ = proc.communicate()
-        return subprocess.CompletedProcess(cmd, -1, stdout=stdout or "", stderr=None)
+        returncode = -1
+    reader.join(timeout=30)
+    return subprocess.CompletedProcess(cmd, returncode, stdout="\n".join(tail), stderr=None)
 
 
-def _emit_block(prefix: str, header: str, body: str, footer: str = "") -> None:
-    """Atomically write a multi-line block prefixed with ``[prefix] ``.
-
-    Holds the global output lock for the entire block so concurrent tests do
-    not interleave their lines.
-    """
+def _emit_line(prefix: str, line: str) -> None:
+    """Write one case-owned output line, holding the cross-case output lock."""
     with _OUTPUT_LOCK:
-        sys.stderr.write(header)
-        for line in body.splitlines():
-            sys.stderr.write(f"[{prefix}] {line}\n")
-        if footer:
-            sys.stderr.write(footer)
+        sys.stderr.write(f"[{prefix}] {line}\n")
         sys.stderr.flush()
 
 
@@ -376,12 +437,9 @@ def _check_phase_results(
         try:
             assert_losses_equal(golden_losses, test_losses)
         except AssertionError:
-            mismatch_body = "\n".join(f"[GOLDEN_MISMATCH] {step} {test_losses[step]}" for step in sorted(test_losses))
-            _emit_block(
-                test_name,
-                f"[GOLDEN_MISMATCH] {test_name} — dumping actual losses for regeneration:\n",
-                mismatch_body,
-            )
+            _emit_line(test_name, f"[GOLDEN_MISMATCH] {test_name} — dumping actual losses for regeneration:")
+            for step in sorted(test_losses):
+                _emit_line(test_name, f"[GOLDEN_MISMATCH] {step} {test_losses[step]}")
             raise
 
 
@@ -426,6 +484,13 @@ def run_single_test(
         env.update(test_flavor.env_vars)
     env["NGPU"] = str(test_flavor.ngpu)
     env["LOG_RANK"] = all_ranks
+    if test_flavor.ngpu >= 4:
+        # The only 4-NPU model case shares the host with concurrent 2-NPU cases; give it a
+        # distinct host side base port so it cannot collide with their default 60000.  Do not
+        # inherit a platform-set value: an out-of-range port fails every rank at HCCL init.
+        env["HCCL_IF_BASE_PORT"] = "61000"
+    else:
+        env.pop("HCCL_IF_BASE_PORT", None)
 
     golden_losses = None
     if test_flavor.check_loss:
@@ -462,21 +527,22 @@ def run_single_test(
         )
 
         start_ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        # torchtitan-npu override: capture the child output and emit it as one
-        # contiguous block, so concurrently running tests never interleave
-        # their lines.
-        result = _run_cmd(cmd, env=env, timeout=test_flavor.timeout)
-        returncode = result.returncode
-        captured = result.stdout or ""
-
-        end_ts = time.strftime("%Y-%m-%d %H:%M:%S")
         header = (
-            f"===== [{test_name}] start {start_ts} end {end_ts} "
-            f"flavor: {test_flavor.test_descr} (rc={returncode}) =====\n"
+            f"===== [{test_name}] start {start_ts} flavor: {test_flavor.test_descr} =====\n"
             f"===== [{test_name}] command: {shown_cmd} =====\n"
         )
-        footer = f"===== [{test_name}] end of output (rc={returncode}) =====\n"
-        _emit_block(test_name, header, captured, footer)
+        with _OUTPUT_LOCK:
+            sys.stderr.write(header)
+            sys.stderr.flush()
+        # torchtitan-npu override: stream the child's output as it is produced,
+        # under the case's own prefix, so a case that never finishes still shows
+        # where it stopped in the platform log.
+        result = _run_cmd(cmd, env=env, timeout=test_flavor.timeout, prefix=test_name)
+        returncode = result.returncode
+        captured = result.stdout or ""
+        with _OUTPUT_LOCK:
+            sys.stderr.write(f"===== [{test_name}] end of output (rc={returncode}) =====\n")
+            sys.stderr.flush()
 
         if returncode != 0:
             tail = "\n".join(captured.splitlines()[-50:])
@@ -497,6 +563,52 @@ def run_single_test(
     if test_flavor.check_resume:
         assert test_flavor.expected_steps is not None
         compare_checkpoint_metrics(case_dir / "test_run", test_flavor.expected_steps)
+
+
+def _record_case_timing(test_name: str, ngpu: int, start: float, elapsed: float) -> None:
+    with _CASE_TIMINGS_LOCK:
+        _CASE_TIMINGS.append(_CaseTiming(test_name, ngpu, start, elapsed))
+
+
+def _run_single_test_timed(
+    test_flavor: OverrideDefinitions,
+    output_dir: str,
+    module: str | None = None,
+    config: str | None = None,
+    **kwargs,
+) -> None:
+    """Run one case and record its wall time for the end-of-run summary.
+
+    The window covers everything the case costs: all of its phases plus the
+    loss/checkpoint validation between them. Recording happens in ``finally``
+    so a failed or timed-out case still shows up in the summary — which is
+    exactly when its cost matters most.
+    """
+    start = time.monotonic()
+    try:
+        run_single_test(test_flavor, output_dir, module, config, **kwargs)
+    finally:
+        _record_case_timing(test_flavor.test_name, test_flavor.ngpu, start, time.monotonic() - start)
+
+
+def _print_case_timings() -> None:
+    """Print the per-case wall times recorded during this run.
+
+    Emitted as the last block of the run, after the scheduling telemetry, so a
+    CI reader gets each case's cost directly instead of correlating the
+    per-case ``start``/``end`` headers of the output blocks by hand. Summed
+    case time is the sequential equivalent; the pool window printed just above
+    is the wall time actually spent.
+    """
+    with _CASE_TIMINGS_LOCK:
+        timings = sorted(_CASE_TIMINGS, key=lambda timing: timing.start)
+    if not timings:
+        return
+    width = max(len(timing.test_name) for timing in timings)
+    log_print(f"[timing] per-case wall time ({len(timings)} case(s)):")
+    for timing in timings:
+        log_print(f"[timing]   {timing.test_name:<{width}}  ngpu={timing.ngpu}  {timing.elapsed:.1f}s")
+    log_print(f"[timing]   sum of case times: {sum(timing.elapsed for timing in timings):.1f}s")
 
 
 def _filter_tests(
@@ -584,7 +696,7 @@ def run_tests(
             gpus = pool.acquire(test_flavor.ngpu)
             log_print(f"[parallel] {test_flavor.test_name}: acquired NPUs {gpus} (ngpu={test_flavor.ngpu})")
             try:
-                run_single_test(
+                _run_single_test_timed(
                     test_flavor,
                     args.output_dir,
                     module,
@@ -612,7 +724,7 @@ def run_tests(
     else:
         for test_flavor in runnable:
             try:
-                run_single_test(
+                _run_single_test_timed(
                     test_flavor,
                     args.output_dir,
                     module,
@@ -622,6 +734,10 @@ def run_tests(
             except Exception as exc:
                 log_print(str(exc))
                 failed_tests.append((test_flavor.test_name, str(exc)))
+
+    # torchtitan-npu override: per-case cost, printed as the run's last block so
+    # it is still emitted when a case failed above.
+    _print_case_timings()
 
     if failed_tests:
         failure_summary = "\n".join(f"  {name}: {error}" for name, error in failed_tests)

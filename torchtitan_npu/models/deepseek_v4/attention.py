@@ -6,12 +6,8 @@
 from dataclasses import dataclass, field
 
 import torch
-from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE, BlockMask
-from torchtitan.models.common.attention import (
-    BaseAttention,
-    FlexAttention,
-    VarlenAttention,
-)
+from attn_gym.sparse import AuxRequest, gather_attn
+from torchtitan.models.common.attention import BaseAttention, VarlenAttention
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
@@ -20,9 +16,7 @@ from torchtitan.protocols.module import Module
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor, Indexer, LightningIndexer
-from .metadata import CompressedVarlenMetadata
-from .reference import ReferenceCompressedVarlenMetadata
-from .token_dispatcher import CPTokenDispatcher
+from .metadata import DeepSeekV4Metadata, build_v4_metadata
 
 
 class UnitScaleRMSNorm(RMSNorm):
@@ -47,252 +41,158 @@ class UnitScaleRMSNorm(RMSNorm):
         return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
 
 
-class CompressedSparseInnerAttention(FlexAttention):
-    """DeepSeek sparse attention core for DeepSeek-V4 (varlen-typed reference).
+class CompressedSparseInnerAttention(Module):
+    """DeepSeek sparse attention core for DeepSeek-V4.
 
-    The core attends over the concatenated container KV ``[0, S + n_cmp + 1)``,
-    where the first ``S`` positions are the uncompressed sliding-window KV
-    (``swa_k``), the next ``n_cmp`` positions are the compressed KV in the
-    ``[B, S // ratio, D]`` container grid (``cmp_k``), and the last position is
-    a learned attention sink token:
+    The core is Attention Gym's ``gather_attn`` over the packed offsets the metadata already
+    carries, so no document-aware block mask is built per layer:
 
-    - sliding window: fixed ``mask_mod`` pattern, restricted to the query
-      token's document;
-    - compressed blocks: for HCA (``compress_ratio=128``) all causally
-      reachable blocks of the same document, also a fixed pattern; for CSA
-      (``compress_ratio=4``) each query attends only its top-k selected
-      container slots, chosen by ``Indexer.select`` against the dense mask
-      from the model's ``build_attention_masks``;
-    - attention sink: always attendable via ``score_mod``.
+    - ``compress_ratio == 1``: sliding window plus sink, no compressed stream;
+    - ``compress_ratio == 4`` (CSA): the selector's picks, already numbered inside each query's
+      own document -- the numbering ``gather_attn`` addresses a packed pool by;
+    - a higher ratio (the model's HCA layers): every causally reachable compressed slot of the
+      query's own document, which those layers reach without a selector.
 
-    ``_build_block_mask`` is the single-document container formulation (kept
-    for upstream parity and its unit test); ``_build_varlen_block_mask`` is the
-    document-packed path driven by ``CompressedVarlenMetadata``.  NPU overrides
-    replace the whole ``forward`` (fused SMLA/CSA kernels consume the raw
-    ``q / swa_k / cmp_k / idx_q / idx_k / idx_w`` tensors).
+    NPU overrides replace the whole class; they answer the same contract.  Two limits of this
+    default are worth knowing before it is used for training:
+
+    - it does **not** chunk the query axis: the operator materialises intermediates that grow
+      with the sequence length, the window/selection width and the head dimension, so it is a
+      debugging and numerics reference rather than the path to train on -- the fused
+      ``sparse_attn.asc`` / ``sparse_attn.pypto`` recipes are the ones the model ships (both
+      replace this class and keep working under context parallel, which this core refuses);
+    - it carries no indexer loss of its own: the LI objective is a property of a fused port (its
+      SMLAG backward hands the fused selector its teacher), so a recipe that runs this core
+      trains no gradient for the indexer's compressor.
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(  # pyrefly: ignore [bad-override]
-        VarlenAttention.Config
-    ):
-        # Redeclared as the int DSA window (replaces the inherited varlen
-        # ``window_size`` tuple, which is never used by the DSA path).
+    class Config(VarlenAttention.Config):
+        # The int DSA window, replacing the varlen attention's ``(left, right)`` tuple: the
+        # model's window is a count of preceding tokens.  The varlen base is also the type the
+        # pinned decoder's mask dispatch recognises on the stacks that still build a single
+        # mask object; this stack builds its metadata through the seam instead.
         window_size: int  # pyrefly: ignore [bad-override]
         compress_ratio: int
         softmax_scale: float
         index_topk: int
-        block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
-        # Consumed by the inherited ``FlexAttention.__init__`` (kernel options
-        # for the flex_attention backend of the reference path).
-        kernel_options: dict = field(default_factory=dict)
+        return_lse: bool = False
+        """Hand back the per-head log-sum-exp beside the output.  A test hook: nothing in the
+        model consumes it, and a fused core takes its own from the kernel."""
+
+        @property
+        def attention_metadata_key(self):
+            """This layer's own entry: the core's class plus its compression ratio.
+
+            One entry per geometry is what lets the builder derive exactly the grid this layer
+            addresses -- no stack-wide ratio table on any config, and no entry shared by layers
+            whose kernels address different pools.
+            """
+            return (type(self), self.compress_ratio)
+
+        def build_attention_metadata(
+            self,
+            positions: torch.Tensor,
+            *,
+            padding_mask: torch.Tensor | None = None,
+            max_num_documents: int | None = None,
+            max_context_length: int | None = None,
+        ) -> DeepSeekV4Metadata:
+            """This geometry's per-microbatch contract (upstream #4897).
+
+            Built from the pre-shard ``positions`` alone: the entry carries the row's boundaries
+            and its own ratio's fold of them, so one build serves every layer of this geometry --
+            the decoder keys the map by this config's :attr:`attention_metadata_key`.  This
+            builder's contract refuses context parallel; the fused core's config builds an entry
+            whose hook rebuilds it for this rank.
+            """
+            del padding_mask, max_num_documents, max_context_length
+            # A document starts where ``positions`` resets to 0; this layer's ratio folds the row
+            # into the pool grid its kernels address.  The selector's records are the selector
+            # port's business: this builder produces the row's frames only, and a fused selector
+            # backend attaches its own records.
+            return build_v4_metadata(positions, self.compress_ratio)
 
     def __init__(self, config: Config) -> None:
-        super().__init__(config)  # pyrefly: ignore [bad-argument-type]
+        super().__init__()
         # Subclasses read ``self.window_size`` as an int.
         self.window_size = config.window_size
         self.compress_ratio = config.compress_ratio
         self.softmax_scale = config.softmax_scale
         self.index_topk = config.index_topk
-        self.block_size = config.block_size
-
-    def _build_varlen_block_mask(
-        self,
-        metadata: ReferenceCompressedVarlenMetadata,
-        topk_indices: torch.Tensor | None,
-        n_cmp: int,
-        device,
-    ) -> BlockMask:
-        """Document-packed block mask driven by ``CompressedVarlenMetadata``.
-
-        The block listing is a superset (window range, selected/full compressed
-        region, sink); ``mask_mod`` applies the exact per-token predicates
-        (same document, per-document causal limit, top-k selection).
-        """
-        bsz, seqlen = metadata.batch_size, metadata.seq_len
-        bs = self.block_size
-        bq, bk = bs if isinstance(bs, tuple) else (bs, bs)
-        kv_len = seqlen + n_cmp + 1
-        n_kv_blocks = (kv_len + bk - 1) // bk
-        n_q_blocks = seqlen // bq
-        sink_idx = seqlen + n_cmp
-        ratio = self.compress_ratio
-        window_size = self.window_size
-        if metadata.plans.get(ratio) is None:
-            raise ValueError(f"No compression layout for ratio={ratio}.")
-        ref = metadata.reference.ratios[ratio]
-
-        # Static parts (window, sink, HCA range) are hoisted in the metadata;
-        # only the CSA top-k blocks are scattered here.
-        bm = ref.static_blocks.expand(  # pyrefly: ignore [missing-attribute]
-            bsz, 1, -1, -1
-        ).clone()
-        if topk_indices is not None:
-            cmp_block_of = (seqlen + torch.arange(n_cmp, device=device)) // bk
-            block_of_topk = cmp_block_of[topk_indices].reshape(bsz, n_q_blocks, bq * topk_indices.size(-1))
-            bm[:, 0].scatter_add_(
-                -1,
-                block_of_topk.clamp(0, n_kv_blocks - 1),
-                torch.ones_like(block_of_topk, dtype=torch.int32),
-            )
-        bm = (bm > 0).to(torch.int32)  # pyrefly: ignore [missing-attribute]
-        kv_num_blocks = bm.sum(dim=-1).to(torch.int32)
-        kv_indices = torch.argsort(bm, dim=-1, descending=True, stable=True).to(torch.int32)
-
-        cmp_sel = torch.zeros(bsz, seqlen, max(n_cmp, 1), dtype=torch.bool, device=device)
-        if topk_indices is not None:
-            cmp_sel.scatter_(2, topk_indices.clamp(0, max(n_cmp, 1) - 1), True)
-
-        doc_of_token = metadata.reference.doc_of_token
-        pos_in_doc = metadata.reference.pos_in_doc
-        if ratio > 1 and n_cmp > 0:
-            cmp_doc = ref.doc_of_block
-            cmp_local = ref.block_local
-        else:
-            # No compressed slots: keep the gather safe with dummy values.
-            cmp_doc = torch.full((bsz, max(n_cmp, 1)), -1, dtype=torch.int32, device=device)
-            cmp_local = torch.full((bsz, max(n_cmp, 1)), -1, dtype=torch.int32, device=device)
-
-        def csa_varlen_mask_mod(
-            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
-        ) -> torch.Tensor:
-            doc_q = doc_of_token[b, q_idx]
-            kv_safe = kv_idx.clamp(0, seqlen - 1)
-            swa = (
-                (kv_idx < seqlen)
-                & (kv_idx <= q_idx)
-                & (q_idx - kv_idx < window_size)
-                & (doc_of_token[b, kv_safe] == doc_q)
-            )
-            is_sink = kv_idx == sink_idx
-            if ratio > 1:
-                c = kv_idx - seqlen
-                in_cmp = (c >= 0) & (c < n_cmp)
-                c_safe = c.clamp(0, max(n_cmp, 1) - 1)
-                same_doc = (
-                    cmp_doc[  # pyrefly: ignore [unsupported-operation]
-                        b, c_safe
-                    ]
-                    == doc_q
-                )
-                causal = cmp_local[  # pyrefly: ignore [unsupported-operation]
-                    b, c_safe
-                ] < torch.div(pos_in_doc[b, q_idx] + 1, ratio, rounding_mode="floor")
-                if topk_indices is not None:
-                    topk_sel = cmp_sel[b, q_idx, c_safe]
-                    return swa | (in_cmp & same_doc & causal & topk_sel) | is_sink
-                return swa | (in_cmp & same_doc & causal) | is_sink
-            return swa | is_sink
-
-        return BlockMask.from_kv_blocks(
-            kv_num_blocks,
-            kv_indices,
-            BLOCK_SIZE=(bq, bk),
-            mask_mod=csa_varlen_mask_mod,
-            seq_lengths=(seqlen, kv_len),
-        )
+        self.return_lse = config.return_lse
 
     def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
         q,
         swa_k,
-        cmp_k=None,
-        idx_q=None,
-        idx_k=None,
-        idx_w=None,
+        attn_sink: torch.Tensor,
         *,
-        attn_sink: torch.Tensor | None = None,
-        sparse_indices=None,
-        attention_masks: ReferenceCompressedVarlenMetadata | None = None,
-    ) -> torch.Tensor:
-        if not isinstance(attention_masks, CompressedVarlenMetadata):
+        cmp_k=None,
+        topk_indices=None,
+        topk_scores=None,
+        attention_metadata: DeepSeekV4Metadata,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # ``topk_scores`` is the selector's student-logit edge (or a fused port's teacher
+        # carrier).  The reference core only gathers by ``topk_indices``, so it accepts the
+        # tensor for the shared forward contract and never reads it.
+        del topk_scores
+        if not isinstance(attention_metadata, DeepSeekV4Metadata):
             raise TypeError(
-                "CompressedSparseInnerAttention requires CompressedVarlenMetadata "
-                f"attention masks, got {type(attention_masks)}."
+                "CompressedSparseInnerAttention requires DeepSeekV4Metadata "
+                f"attention metadata, got {type(attention_metadata).__name__}."
             )
-        if attn_sink is None:
-            raise ValueError("CompressedSparseInnerAttention requires attn_sink")
-
-        metadata = attention_masks
+        if self.compress_ratio == 4 and (cmp_k is None) != (topk_indices is None):
+            raise ValueError("ratio-4 attention requires cmp_k and topk_indices together.")
         bsz, seqlen, _, head_dim = q.size()
         n_cmp = 0 if cmp_k is None else cmp_k.size(1)
-        sink_idx = seqlen + n_cmp
+        # The frames the kernels grid: the query's and, for a pooling geometry, the compressed
+        # pool's.  The reference path and a fused port read the same ones.
+        cu_seqlens = attention_metadata.q.cu_seqlens
+        if n_cmp == 0:
+            # A window-only layer: the pool is empty, and the operator wants both offsets.
+            cu_seqlens_k = cu_seqlens
+            kv_indices = q.new_empty((bsz, seqlen, 0), dtype=torch.long)
+            sparse_kv = q.new_zeros((bsz, 1, 0, head_dim))
+        else:
+            # ``n_cmp`` is this tensor's width, so the frame is present here.
+            assert cmp_k is not None
+            cmp_frame = attention_metadata.cmp_k
+            if cmp_frame is None:
+                raise ValueError("a compressed KV needs the entry's compressed frame")
+            cu_seqlens_k = cmp_frame.cu_seqlens
+            # The selection is an input: the selector's picks at ratio four, and the entry's
+            # precomputed reference selection for a geometry without a selector.
+            kv_indices = topk_indices if self.compress_ratio == 4 else attention_metadata.slots
+            if kv_indices is None:
+                raise ValueError("the entry carries no selection for this geometry")
+            sparse_kv = cmp_k.reshape(bsz, 1, n_cmp, head_dim)
 
-        topk_indices = None
-        if self.compress_ratio == 4:
-            if sparse_indices is None:
-                raise ValueError("CompressedSparseInnerAttention requires sparse_indices when compress_ratio=4")
-            if sparse_indices.ndim == 4 and sparse_indices.shape[2] == 1:
-                sparse_indices = sparse_indices.squeeze(2)
-            if sparse_indices.ndim != 3:
-                raise ValueError(
-                    "CompressedSparseInnerAttention expects sparse_indices with shape [B, L, K] or [B, L, 1, K]."
-                )
-            topk_indices = sparse_indices
-
-        kv = swa_k.unsqueeze(2)
-        if cmp_k is not None:
-            kv = torch.cat([kv, cmp_k.unsqueeze(2)], dim=1)
-        sink_kv = kv.new_zeros((bsz, 1, 1, head_dim))
-        kv = torch.cat([kv, sink_kv], dim=1)
-
-        block_mask = self._build_varlen_block_mask(metadata, topk_indices, n_cmp, q.device)
-
-        def v4_sink_score_mod(score, b, h, q_idx, kv_idx):
-            return torch.where(
-                kv_idx == sink_idx,
-                attn_sink[h],  # pyrefly: ignore [unsupported-operation]
-                score,
-            )
-
-        return super().forward(
-            q,
-            kv,
-            kv,
-            attention_masks=block_mask,
-            score_mod=v4_sink_score_mod,
+        aux = AuxRequest(lse=True) if self.return_lse else None
+        result = gather_attn(
+            q.transpose(1, 2),
+            swa_k.reshape(bsz, 1, seqlen, head_dim),
+            sparse_kv,
+            kv_indices,
+            attention_sink=attn_sink,
+            sliding_window_size=self.window_size,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
             scale=self.softmax_scale,
-            enable_gqa=True,
+            impl="reference",
+            return_aux=aux,
         )
-
-
-class CompressedSparseAttention(Module):
-    """Thin CP boundary containing LI and the sparse attention core."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        lightning_indexer: LightningIndexer.Config | None
-        inner_attention: CompressedSparseInnerAttention.Config
-
-    def __init__(self, config: Config):
-        super().__init__()
-        self.lightning_indexer = config.lightning_indexer.build() if config.lightning_indexer is not None else None
-        self.inner_attention = config.inner_attention.build()
-
-    def forward(
-        self, q, swa_k, cmp_k=None, *, idx_q=None, idx_k=None, idx_w=None, attn_sink=None, attention_masks=None
-    ):
-        sparse_indices = None
-        if self.lightning_indexer is not None:
-            sparse_indices = self.lightning_indexer(idx_q, idx_k, idx_w, attention_masks=attention_masks)
-        return self.inner_attention(
-            q,
-            swa_k,
-            cmp_k,
-            idx_q=idx_q,
-            idx_k=idx_k,
-            idx_w=idx_w,
-            sparse_indices=sparse_indices,
-            attn_sink=attn_sink,
-            attention_masks=attention_masks,
-        )
+        if aux is None:
+            assert isinstance(result, torch.Tensor)
+            return result.transpose(1, 2)
+        output, gathered = result
+        return output.transpose(1, 2), gathered.lse
 
 
 class Attention(BaseAttention):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseAttention.Config):
         n_heads: int
-        inner_attention: Module.Config
         rope: RoPE.Config
         head_dim: int
         rope_head_dim: int
@@ -312,15 +212,15 @@ class Attention(BaseAttention):
         wo_a: BatchedLinear.Config
         wo_b: Linear.Config
 
-        # Built only for ``compress_ratio > 1`` layers (``indexer`` only for
-        # ratio-4 CSA layers); the registry passes ``None`` otherwise.
+        # Built only for ``compress_ratio > 1`` layers (``indexer``/``lightning_indexer``
+        # only for ratio-4 CSA layers); the registry passes ``None`` otherwise.
         compressor: Compressor.Config | None
         indexer: Indexer.Config | None
-        compressed_sparse_attention: CompressedSparseAttention.Config
-
-        # The CP token dispatcher (the RoutedExperts mirror): a submodule of
-        # the attention, wired once by ``Attention.parallelize``.
-        token_dispatcher: CPTokenDispatcher.Config = field(default_factory=CPTokenDispatcher.Config)
+        lightning_indexer: LightningIndexer.Config | None
+        # The sparse core the decoder replaces wholesale with ``sparse_attn.asc``.  It is the
+        # layer's only metadata backend and the CP boundary for its KV streams; the annotation
+        # stays the base type because a port's config is a replacement of this node.
+        inner_attention: Module.Config
 
     def __init__(self, config: Config):
         super().__init__()
@@ -333,7 +233,9 @@ class Attention(BaseAttention):
         self.norm_eps = cfg.norm_eps
         self.rope = cfg.rope.build()
 
-        self.token_dispatcher = cfg.token_dispatcher.build()
+        # The CP mesh this layer restores its key side on, wired by ``parallelize``; ``None`` at
+        # one degree, where the metadata carries no plan and nothing moves.
+        self.cp_group = None
 
         self.wq_a = cfg.wq_a.build()
         self.q_norm = cfg.q_norm.build()
@@ -349,87 +251,90 @@ class Attention(BaseAttention):
 
         self.compressor = cfg.compressor.build() if cfg.compressor is not None else None
         self.indexer = cfg.indexer.build() if cfg.indexer is not None else None
-        self.compressed_sparse_attention = cfg.compressed_sparse_attention.build()
+        self.lightning_indexer = cfg.lightning_indexer.build() if cfg.lightning_indexer is not None else None
+        self.inner_attention = cfg.inner_attention.build()
 
     def parallelize(self, parallel_dims) -> None:
-        """Parallelize the attention, then wire the CP mesh on the
-        attention's own token dispatcher (the ``RoutedExperts.parallelize``
-        mirror).  The compressors' dispatchers are wired by their owners'
-        ``parallelize`` through the framework's ``Module.parallelize``
-        recursion."""
-        super().parallelize(parallel_dims)
-        self.token_dispatcher.wire_meshes(cp_mesh=parallel_dims.get_optional_mesh("cp"))
+        """Take the CP mesh the layer's key stream is restored on, then recurse.
 
-    def forward(self, x, attention_masks, positions):
+        The compressor and its carry exchange take the same mesh through their own
+        ``parallelize`` (the framework recurses into every child module), so nothing here wraps
+        them: their module paths, sharding and checkpoint entries stay as they are.
+        """
+        self.cp_group = parallel_dims.get_optional_mesh("cp")
+        super().parallelize(parallel_dims)
+
+    def forward(self, x, attention_metadata, positions):
         """The unified attention forward (CP and non-CP).
 
-        The Q side and the swa projection run on the local stream; the
-        token dispatcher's ops serve every consumer with no context-
-        parallel special-casing: ``gather`` exchanges the post-RoPE
-        ``swa_k`` rows (the window plan) into the packed ori stream, the
-        compressors gather their own block rows internally, and ``select``
-        packs the pooled streams into the padded containers.  The
-        containers' all-gather is declarative — the wrapper's
-        ``ShardingConfig`` (``cp: S(1) -> R``) emits it at the wrapper
-        boundary.
+        The input layout already put these rows on **chunk ``r`` of every document**, so the
+        query side projects them as they arrive and never moves.  The key side projects, rotates
+        and pools the same rows -- every step is per token, so it commutes with the layout -- and
+        each consumer restores what it reads on its own: the compressor its pooling window, the
+        core this rank's swa window, whose sharding then gathers the whole row at its boundary.
         """
-        window = attention_masks.window
         bsz, seqlen, _ = x.size()
+        metadata = attention_metadata
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr)
         q = q.view(bsz, seqlen, -1, self.head_dim)
         q = self.q_head_norm(q)
         # RoPE owns the [nope | rope] split: it receives the full-width
-        # tensor and rotates only the trailing rope_head_dim channels.
+        # tensor and rotates only the trailing rope_head_dim channels.  The
+        # positions are the ones the input layout carried with these rows.
         q = self.rope(q, positions=positions)
 
-        # The swa projection + RoPE run on the local rows (the sender's own
-        # doc-relative positions — the attention's positions convention
-        # resets per document); the window gather exchanges the post-RoPE
-        # rows into the packed ori stream.
+        # The key stream's own positions are the entry's: the input's at one degree, this rank's
+        # window under CP.  The queries rotate at the positions the input carried.
+        position_k = metadata.position_k
+
+        # The swa projection + RoPE run on the rows the layout produced: RoPE is per token, so it
+        # commutes with the movement.  The restore then hands the core this rank's window, whose
+        # sharding gathers the rows to the whole row at the core's own boundary.
         swa_k = self.kv_norm(self.wkv(x))
-        # Flatten only for a singleton batch; otherwise preserve per-batch
-        # positions so the RoPE cache matches the query's sequence length.
-        rope_positions = positions.reshape(1, -1) if positions is not None and bsz == 1 else positions
-        swa_k = self.rope(
-            swa_k.unsqueeze(2),
-            positions=rope_positions,
-        ).squeeze(2)
-        swa_k = self.token_dispatcher.gather(swa_k, window)
+        swa_k = self.rope(swa_k.unsqueeze(2), positions=positions).squeeze(2)
+        swa_k = metadata.key_stream(swa_k, group=self.cp_group)
 
         cmp_k = None
         idx_q = idx_k = idx_w = None
 
         if self.compress_ratio > 1 and self.indexer is not None:
+            # The selector's queries and weights ride the doc-chunk rows with the attention's;
+            # its compressor restores and carries for the keys it pools.
             idx_q, idx_k, idx_w = self.indexer(
                 x.detach(),
                 qr.detach(),
                 positions=positions,
-                attention_masks=attention_masks,
+                attention_metadata=metadata,
             )
-            # The indexer's outputs: idx_q / idx_w (local), idx_k (the
-            # pooled stream — packed into the container).
-            idx_k = self.token_dispatcher.select(idx_k, attention_masks.plans[4])
-
         if self.compress_ratio > 1:
             assert self.compressor is not None, "compress_ratio > 1 requires the compressor submodule."
-            plan = attention_masks.plans[self.compress_ratio]
-            pooled = self.compressor(x, attention_masks)
-            cmp_k = self.token_dispatcher.select(pooled, plan)
+            # The compressor owns the restore and the ratio-4 carry: it pools the window this rank
+            # holds and hands back the row's blocks, so the layer never sees either step.
+            cmp_k = self.compressor(
+                x,
+                position_k,
+                cu_seqlens=metadata.swa_k.cu_seqlens,
+                attention_metadata=metadata,
+            )
 
-        # Inner-attention positional contract: absent components are None.
-        #   sink + swa_k always; + cmp_k when compress_ratio > 1;
-        #   + idx_q/idx_k/idx_w when compress_ratio == 4 (indexer layer).
-        o = self.compressed_sparse_attention(
+        # Every selector returns indices and scores: the reference exposes student logits,
+        # while the AscendC, PyPTO and quantized backends expose the teacher-gradient carrier.
+        topk_indices = topk_scores = None
+        if self.lightning_indexer is not None:
+            topk_indices, topk_scores = self.lightning_indexer(idx_q, idx_k, idx_w, attention_metadata=metadata)
+
+        # Inner-attention positional contract: sink + swa_k always; the compressed pool and
+        # the selector's ``(topk_indices, topk_scores)`` pair only on a pooled layer.
+        o = self.inner_attention(
             q,
             swa_k,
-            cmp_k,
-            idx_q=idx_q,
-            idx_k=idx_k,
-            idx_w=idx_w,
-            attn_sink=self.attn_sink,
-            attention_masks=attention_masks,
+            self.attn_sink,
+            cmp_k=cmp_k,
+            topk_indices=topk_indices,
+            topk_scores=topk_scores,
+            attention_metadata=metadata,
         )
 
         o = self.rope(o, positions=positions, inverse=True)
@@ -440,4 +345,8 @@ class Attention(BaseAttention):
         o = o.view(bsz, seqlen, n_local_groups, -1)
         o = self.wo_a(o)
         o = o.reshape(bsz, seqlen, -1)
-        return self.wo_b(o)
+        o = self.wo_b(o)
+        # The projection is per token, so ``wo_b``'s output stays in the frame the input
+        # arrived in: the residual and every other consumer are token-wise, and the loss is
+        # taken against labels the same layout moved.
+        return o

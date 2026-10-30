@@ -3,23 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchao_npu.configs import (
-    ModuleSwapConfig,
-    ParamSwapConfig,
-    QuantCompressorConfig,
-    QuantLightningIndexerConfig,
-    QuantV41LightningIndexerConfig,
-    QuantV41SparseAttentionConfig,
-)
-
-__all__ = [
-    "ModuleSwapConfig",
-    "ParamSwapConfig",
-    "QuantCompressorConfig",
-    "QuantLightningIndexerConfig",
-    "QuantV41LightningIndexerConfig",
-    "QuantV41SparseAttentionConfig",
-]
+from torchao.utils import TorchAOBaseTensor
 
 
 def normalize_dim(dim: int, ndim: int) -> int:
@@ -27,3 +11,29 @@ def normalize_dim(dim: int, ndim: int) -> int:
     if not -ndim <= dim < ndim:
         raise IndexError(f"dim {dim} out of range for {ndim}D tensor")
     return dim % ndim
+
+
+class TorchAONpuBaseTensor(TorchAOBaseTensor):
+    """Base of the torchao_npu tensor subclasses. Not intended to be instantiated directly."""
+
+    tensor_data_names: list[str] = []
+    tensor_attribute_names: list[str] = []
+
+
+from torchao_npu.configs import (
+    DeepSeekV4QuantLightningIndexerConfig,
+    DeepSeekV41QuantCompressorConfig,
+    DeepSeekV41QuantLightningIndexerConfig,
+    DeepSeekV41QuantSparseAttentionConfig,
+    ModuleSwapConfig,
+    ParamSwapConfig,
+)
+
+__all__ = [
+    "DeepSeekV4QuantLightningIndexerConfig",
+    "DeepSeekV41QuantCompressorConfig",
+    "DeepSeekV41QuantLightningIndexerConfig",
+    "DeepSeekV41QuantSparseAttentionConfig",
+    "ModuleSwapConfig",
+    "ParamSwapConfig",
+]

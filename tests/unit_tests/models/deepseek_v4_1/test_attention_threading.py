@@ -19,12 +19,14 @@ import pytest
 import torch
 from torch.utils.checkpoint import DefaultDeviceType
 
+from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import layer_metadata, preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 from torchtitan_npu.models.deepseek_v4_1 import (
     V41_CANDIDATE_SOURCE_LAYER,
     V41_FULL_INDEX_SOURCE_LAYERS,
     V41_KV_SOURCE_LAYERS,
 )
+from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.indexer import REUSE
 
 _TOKENS = torch.arange(128).remainder(32).unsqueeze(0)
@@ -77,7 +79,7 @@ def _record_module_forwards(model):
         handles.append(layer.register_forward_hook(record_block, with_kwargs=True))
 
         def record_core(module, args, kwargs, output, *, name=name):
-            # The core's signature is (q, swa_k, attn_sink, attention_masks, *, cmp_k, ...),
+            # The core's signature is (q, swa_k, attn_sink, attention_metadata, *, cmp_k, ...),
             # so the compressed container travels as a keyword like the selection does.
             cores_in[name] = (kwargs.get("cmp_k"), kwargs.get("topk_indices"))
 
@@ -90,7 +92,7 @@ def test_cross_layer_state_is_threaded_from_source_to_consumer(monkeypatch) -> N
     model, _ = _tiny_debug_model(monkeypatch)
     blocks_in, blocks_out, cores_in, handles = _record_module_forwards(model)
     try:
-        _, _, kwargs = model.build_attention_masks(_TOKENS, _TOKENS, {"positions": _POSITIONS})
+        _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
         model(_TOKENS, **kwargs)
     finally:
         for handle in handles:
@@ -189,12 +191,12 @@ def test_candidate_pool_reaches_only_its_window_indexers(monkeypatch) -> None:
     registered_forward = indexer_module.HierarchicalIndexer.forward
     observed_masks = []
 
-    def record_forward(self, x, qr, positions, attention_masks, **kwargs):
+    def record_forward(self, x, qr, positions, attention_metadata, **kwargs):
         observed_masks.append(kwargs.get("candidates"))
-        return registered_forward(self, x, qr, positions, attention_masks, **kwargs)
+        return registered_forward(self, x, qr, positions, attention_metadata, **kwargs)
 
     monkeypatch.setattr(indexer_module.HierarchicalIndexer, "forward", record_forward)
-    _, _, kwargs = model.build_attention_masks(_TOKENS, _TOKENS, {"positions": _POSITIONS})
+    _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
     with torch.no_grad():
         model(_TOKENS, **kwargs)
 
@@ -208,26 +210,33 @@ def test_candidate_pool_reaches_only_its_window_indexers(monkeypatch) -> None:
     assert all(mask is pool for mask in observed_masks[pool_source + 1 :])
 
 
-def test_metadata_document_ids_restart_per_packed_document(monkeypatch) -> None:
-    """The only varlen metadata is a document id per token, derived from the positions."""
+def test_metadata_document_boundaries_restart_per_packed_document(monkeypatch) -> None:
+    """The varlen metadata is the row's boundaries, derived from the positions, and its pool grid.
+
+    One entry per ``(backend, compress_ratio)`` -- the entry *is* one geometry -- and the row is
+    all a *reference* backend reads: ``cu_seq_k`` is that backend's own ratio applied to those
+    boundaries once, where the ratio is known, so a layer that pools reads a boundary set instead
+    of dividing one it was handed.  The fused port's frames and the kernel records on top of that
+    row are the override tests' subject.
+    """
     model, _ = _tiny_debug_model(monkeypatch)
     positions = torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3, 0, 1]], dtype=torch.long)
+    tokens = torch.zeros_like(positions)
 
-    metadata = model.get_attention_masks(positions)
-
-    # torch.cumsum promotes the int32 input, so the document ids come back int64.
-    torch.testing.assert_close(
-        metadata.ref.doc_ids_BL,
-        torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1, 2, 2]], dtype=torch.int64),
-        rtol=0,
-        atol=0,
-    )
-
-    # The indexer's selection masks are precomputed once per forward, one per pooling
-    # ratio, so no layer rebuilds them.
-    assert set(metadata.ref.selection_masks) == {ratio for ratio in model.compress_ratios if ratio > 0}
-    for ratio, (visible, _, _) in metadata.ref.selection_masks.items():
-        assert visible.shape == (positions.size(1), positions.size(1) // ratio)
+    _, _, extra = preprocess(model, tokens, tokens, positions)
+    metadata = extra["attention_metadata"]
+    assert len(metadata) == 3, "one entry per (backend, compress_ratio) geometry"
+    # Three documents, so the boundaries are the row start plus every reset after it, and the
+    # query's own positions are the ones the row carries.  Every geometry shares the row and
+    # differs only in the key grid it folded there.
+    expected_cu = torch.tensor([0, 4, 8, 10], dtype=torch.int32)
+    for (backend, ratio), row in metadata.items():
+        assert backend is CompressedSparseInnerAttention2.Config
+        torch.testing.assert_close(row.cu_seq_q, expected_cu, rtol=0, atol=0)
+        expected_pool = expected_cu if ratio <= 1 else (expected_cu // ratio).to(torch.int32)
+        torch.testing.assert_close(row.cu_seq_k, expected_pool, rtol=0, atol=0)
+        # The key stream's positions are the entry's own, and at one degree they are the row's.
+        torch.testing.assert_close(row.position_k, positions)
 
 
 def test_weightless_compressor_passes_the_container_through(monkeypatch) -> None:
@@ -268,7 +277,7 @@ def test_student_logits_are_published_outside_training(monkeypatch) -> None:
     model.eval()
     blocks_in, blocks_out, _, handles = _record_module_forwards(model)
     try:
-        _, _, kwargs = model.build_attention_masks(_TOKENS, _TOKENS, {"positions": _POSITIONS})
+        _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
         with torch.no_grad():
             model(_TOKENS, **kwargs)
     finally:
@@ -296,7 +305,7 @@ def test_unreachable_selection_slots_are_marked_in_the_student_logits(monkeypatc
     model, _ = _tiny_debug_model(monkeypatch)
     _, blocks_out, _, handles = _record_module_forwards(model)
     try:
-        _, _, kwargs = model.build_attention_masks(_TOKENS, _TOKENS, {"positions": _POSITIONS})
+        _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
         model(_TOKENS, **kwargs)
     finally:
         for handle in handles:
@@ -352,13 +361,13 @@ def test_weightless_indexer_passes_the_selection_through(monkeypatch) -> None:
 def test_reuse_layer_without_the_shared_tensor_fails_loudly(monkeypatch) -> None:
     """A consumption contract that is not met is an error, not a silent empty reuse."""
     model, config = _tiny_debug_model(monkeypatch)
-    _, _, kwargs = model.build_attention_masks(_TOKENS, _TOKENS, {"positions": _POSITIONS})
-    attention_masks = kwargs["attention_masks"]
+    _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
+    attention_metadata = layer_metadata(model.layers["3"], kwargs)
     hidden = torch.zeros(1, _TOKENS.shape[1], config.dim)
 
     # A layer that reuses the compressed KV must be handed one.
     with pytest.raises(AssertionError, match="reuses the compressed KV"):
-        model.layers["3"].attention(hidden, _POSITIONS, attention_masks)
+        model.layers["3"].attention(hidden, _POSITIONS, attention_metadata)
 
     # A re-indexing layer must be handed the shared index keys; its compressed KV is
     # already in flight, so only the key is missing.
@@ -367,6 +376,6 @@ def test_reuse_layer_without_the_shared_tensor_fails_loudly(monkeypatch) -> None
         model.layers["24"].attention(
             hidden,
             _POSITIONS,
-            attention_masks,
+            attention_metadata,
             cmp_k=torch.zeros(1, _TOKENS.shape[1], head_dim),
         )

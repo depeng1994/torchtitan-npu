@@ -5,18 +5,23 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
+import math
 from dataclasses import dataclass, field
 
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
-from torch.distributed.device_mesh import DeviceMesh
+from attn_gym.sparse import gather_attn
+from attn_gym.sparse.indexer import lightning_indexer
 from torch.distributed.tensor import DTensor, Replicate
-from torch.nn.attention.flex_attention import BlockMask, create_mask
-from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common import LayerNorm, Linear
-from torchtitan.models.common.attention import AttentionMasksType, FlexAttention
+from torchtitan.models.common.attention import (
+    AttentionMasksType,
+    VarlenAttention,
+    VarlenMetadata,
+    create_varlen_metadata_for_document,
+)
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.deepseek_v3.model import (
     Attention as V3Attention,
@@ -27,9 +32,54 @@ from torchtitan.models.deepseek_v3.model import (
 from torchtitan.models.deepseek_v3.mtp import MTPDecoder
 from torchtitan.protocols.module import Module
 
-from torchtitan_npu.models.common.metadata_extension import MetadataExtension
-from torchtitan_npu.patches.torchtitan.models.common.aux_loss import LoggedAuxLoss
+from torchtitan_npu.models.common.document_intervals import document_intervals
+from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
+
+# The two forms of the packed offsets the reference core reads: the row's own documents, and
+# the rank-local segments the context-parallel transform derives from them.  They are not
+# related by inheritance, but they carry the same two offset tensors.
+AttentionMetadata = VarlenMetadata | CPVarlenMetadata
+
+_REFERENCE_CP_UNSUPPORTED = (
+    "the DeepSeek-V3.2 reference core is not context-parallel: attn-gym's indexer "
+    "selects a query's prefix of its own document, while a CP rank holds a "
+    "document's middle and needs the kernels' end-aligned causal range. Use the "
+    "AscendC override (override.deepseek_v3_2.sparse_attn.asc) under context "
+    "parallel."
+)
+
+
+class ReferenceVarlenMetadata(VarlenMetadata):
+    """The reference core's global packed layout, which context parallel cannot shard.
+
+    The refusal lives here, beside the layout it refuses (upstream #4617's hook, hosted
+    by the metadata rather than by the backend): a stack that cannot be sharded must say
+    so while the rank-local metadata is being prepared, or the layer would silently
+    attend to a global layout it does not hold.
+    """
+
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        """Refuse context parallel while the rank-local metadata is prepared.
+
+        attn-gym's indexer selects a query's prefix of its own document, while a CP rank
+        holds a document's middle; the kernels need their end-aligned causal range, which
+        this core cannot express.
+        """
+        del attention_metadata, permutation
+        raise ValueError(_REFERENCE_CP_UNSUPPORTED)
+
+
+def build_reference_varlen_metadata(positions: torch.Tensor) -> ReferenceVarlenMetadata:
+    """The packed document layout both DeepSeek-V3.2 attention cores read.
+
+    Together with :class:`ReferenceVarlenMetadata` this is the whole metadata
+    contract of the reference core; the AscendC core reads the same documents
+    and wraps the result, so the two backends' builders share this one call.
+    """
+    return ReferenceVarlenMetadata(*create_varlen_metadata_for_document(positions))
 
 
 @functools.cache
@@ -102,28 +152,61 @@ class Indexer(Module):
         idx_q_BLNH: torch.Tensor,
         idx_k_BL1H: torch.Tensor,
         idx_w_BLN: torch.Tensor,
-        dense_mask: torch.Tensor,
+        attention_masks: AttentionMetadata,
         index_topk: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Select top-k KV positions per query from indexer scores.
+        """The top-k selection and the student's logits at the slots it picked.
 
-        Args:
-            dense_mask: Dense ``[B, 1, Lq, Lkv]`` Boolean mask, where ``True``
-                marks an attendable position. It is materialized once per step
-                and shared by all layers.
+        Returns ``(topk_indices_BLqK, topk_scores_BLqK)``:
+
+        * the indices are numbered inside the query's own document, ``-1`` for a slot the
+          selection left unused -- the numbering ``gather_attn`` reads back, and the fused
+          kernels emit.  Causality and document isolation are the indexer's own
+          ``causal``/``cu_seqlens`` contract, so no mask is materialized here;
+        * the scores are the indexer's own logits ``sum_h w * relu(q . k)`` at those slots.
+          Selection is discrete and ``lightning_indexer`` returns indices alone, so this
+          second pass -- over ``K`` slots rather than the dense ``[B, Lq, Lkv]`` grid -- is
+          the one that carries the indexer's gradient.
+
+        The pass that picks runs under ``no_grad``; the pass that scores does not.
         """
-        Lkv = idx_k_BL1H.shape[1]
+        batch, seqlen, num_heads, head_dim = idx_q_BLNH.shape
+        tokens = batch * seqlen
+        # ``idx_w`` carries ``(H * D) ** -0.5`` because the fused NPU indexer reads the weights
+        # that way, while attn-gym's indexer applies that factor to its own score; it is taken
+        # back out for this one call, or the factor would be applied twice.  The scores below
+        # keep the folded convention, which is the one the fused kernel uses as well.
+        #
+        # attn-gym validates this call's weights against the queries' dtype, so it keeps the
+        # module's (its reference indexer upcasts its own accumulation to fp32); the score pass
+        # below is spelled in fp32 the way this model's removed dense scores were.
+        selection_weights_BLN = idx_w_BLN * math.sqrt(idx_w_BLN.size(-1) * idx_k_BL1H.size(-1))
+        with torch.no_grad():
+            topk_indices_BLqK = lightning_indexer(
+                idx_q_BLNH.reshape(1, tokens, num_heads, head_dim),
+                idx_k_BL1H.reshape(1, tokens, -1),
+                selection_weights_BLN.reshape(1, tokens, num_heads),
+                index_topk,
+                causal=True,
+                compress_ratio=1,
+                cu_seqlens=attention_masks.cu_seq_q,
+                cu_seqlens_k=attention_masks.cu_seq_k,
+                impl="reference",
+            ).reshape(batch, seqlen, -1)
 
-        scores_BLqHLkv = torch.relu(torch.einsum("blhd,bsd->blhs", idx_q_BLNH.float(), idx_k_BL1H.float()))
-        index_scores_BLqLkv = (scores_BLqHLkv * idx_w_BLN.unsqueeze(-1).float()).sum(dim=2)
-        index_scores_BLqLkv = index_scores_BLqLkv.where(dense_mask.squeeze(1), float("-inf"))
-
-        k = min(index_topk, Lkv)
-        topk_scores_BLqK, topk_indices_BLqK = index_scores_BLqLkv.topk(k, dim=-1)
-        return (
-            topk_indices_BLqK.where(topk_scores_BLqK.isfinite(), -1),
-            index_scores_BLqLkv,
-        )
+        # The picks are numbered inside their own document while the keys are stored in the
+        # packed row, so the shift between the two numberings is the document's pool start.
+        # A ``-1`` slot may name a real entry once shifted; its score is masked below.
+        pool_start_T1 = document_intervals(
+            attention_masks.cu_seq_q,
+            attention_masks.cu_seq_k,
+            num_tokens=tokens,
+        )[0]
+        slots_TK = topk_indices_BLqK.reshape(tokens, -1).long() + pool_start_T1
+        picked_TKD = idx_k_BL1H.reshape(tokens, -1).float()[slots_TK.clamp_min(0)]
+        dots_THK = torch.einsum("thd,tkd->thk", idx_q_BLNH.reshape(tokens, num_heads, head_dim).float(), picked_TKD)
+        scores_TK = (dots_THK.relu() * idx_w_BLN.reshape(tokens, num_heads).float().unsqueeze(-1)).sum(dim=1)
+        return topk_indices_BLqK, scores_TK.reshape(batch, seqlen, -1).masked_fill(topk_indices_BLqK < 0, -torch.inf)
 
     @staticmethod
     def _hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
@@ -132,56 +215,43 @@ class Indexer(Module):
         return F.linear(x, H) * (d**-0.5)
 
 
-def _build_selected_bm(
-    topk_indices_BLqK: torch.Tensor,
-    block_size: tuple[int, int],
-    kv_len: int,
-) -> BlockMask:
-    B, Lq, K = topk_indices_BLqK.shape
-    BQ, BK = block_size
-    assert Lq % BQ == 0, f"Lq ({Lq}) must be divisible by BQ ({BQ})"
-
-    nQ = Lq // BQ
-    nKV = (kv_len + BK - 1) // BK
-
-    # Convert token indices to KV-block indices, then aggregate all selected
-    # blocks within each query block.
-    block_kv = (topk_indices_BLqK // BK).reshape(B, nQ, BQ * K)
-    valid = (topk_indices_BLqK >= 0).reshape(B, nQ, BQ * K)
-
-    # Dense block-level mask: ``[B, 1, nQ, nKV]``.
-    bm = torch.zeros(B, 1, nQ, nKV, dtype=torch.int32, device=topk_indices_BLqK.device)
-    bm[:, 0].scatter_add_(-1, block_kv.clamp(min=0), valid.to(torch.int32))
-    bm = (bm > 0).to(torch.int32)
-
-    # Convert the dense mask to the ordered block representation.
-    kv_num_blocks = bm.sum(dim=-1).to(torch.int32)
-    kv_indices = torch.argsort(bm, dim=-1, descending=True, stable=True).to(torch.int32)
-
-    # Preserve token-level selection inside partially selected KV blocks.
-    def mask_mod(b, h, q_idx, k_idx):
-        return (topk_indices_BLqK[b, q_idx] == k_idx).any(dim=-1)
-
-    return BlockMask.from_kv_blocks(
-        kv_num_blocks,
-        kv_indices,
-        BLOCK_SIZE=(BQ, BK),
-        mask_mod=mask_mod,
-        seq_lengths=(Lq, kv_len),
-    )
+# The reference indexer loss guards two different spaces, and they cannot share one constant:
+#
+# * ``_MASKED_LOGIT`` lives in *logit* space: it stands in for ``-inf`` on a slot the selection left
+#   unused, so both softmaxes stay finite and the masked slot gets exactly zero mass instead of
+#   producing ``0 * -inf = NaN`` (which ``torch.where`` would carry through the unselected branch's
+#   backward).  It has to stay far below every real logit at all times, which is why it is enormous
+#   rather than the logarithm of some small probability.
+# * ``_MIN_TEACHER_MASS`` lives in *probability* space: the masked slot's mass is exactly zero, and
+#   the teacher's own ``log`` would be ``-inf`` there.  Its weight is zero too, so the value only
+#   has to be finite.
+#
+# Deriving one from the other would tie the mask's depth to the log guard (``log(1e-30) == -69`` is
+# not below a logit of, say, ``-100``), so they stay separate.
+_MASKED_LOGIT = -1e30
+_MIN_TEACHER_MASS = 1e-30
 
 
-class SparseIndexerLoss(LoggedAuxLoss):
+class SparseIndexerLoss(AuxLoss):
     """Indexer alignment loss with gradient injection.
 
-    Only top-k Q/K pairs are gathered, avoiding a dense
-    ``[B, Lq, Lkv]`` attention tensor.
+    Both distributions live on the selected slots alone: the caller hands over the
+    attention's logits and the indexer's logits at the top-k positions, and no dense
+    ``[B, Lq, Lkv]`` tensor is built on either side.
+
+    The selection arrives exactly as :meth:`Indexer.select` emits it -- numbered inside each
+    query's own document, ``-1`` for a slot it left unused -- together with the metadata whose
+    offsets say where those documents sit in the packed row, because the teacher reads the
+    keys' **rows** while the selection is numbered per document; the shift is applied here,
+    where the two numberings meet.
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(LoggedAuxLoss.Config):
+    class Config(AuxLoss.Config):
         coeff: float = 1.0
-        pass
+        # The indexer loss is additive over tokens, so ranks contribute distinct
+        # data: reduce over the loss mesh (dp+cp), not only the batch mesh.
+        reduce_mesh: str = "loss"
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -192,38 +262,108 @@ class SparseIndexerLoss(LoggedAuxLoss):
         k_BL1H: torch.Tensor,
         scale: float,
         topk_indices_BLqK: torch.Tensor,
-        index_scores_BLqLkv: torch.Tensor,
+        topk_scores_BLqK: torch.Tensor,
+        attention_masks: AttentionMetadata,
         *,
         carrier: torch.Tensor,
     ) -> torch.Tensor:
-        B, _Lq, _K = topk_indices_BLqK.shape
+        # A slot the selection left unused is masked out of both distributions with a large finite
+        # negative rather than ``-inf``: ``0 * -inf`` is NaN, and ``torch.where`` would carry that
+        # NaN through the unselected branch's backward.
+        valid_BLqK = topk_indices_BLqK >= 0
+        # The selection is numbered inside its own document; the teacher reads the keys of the
+        # packed row, so the shift between the two numberings is applied here, where the
+        # selection arrives.
+        pool_start_BL1 = document_intervals(
+            attention_masks.cu_seq_q,
+            attention_masks.cu_seq_k,
+            num_tokens=topk_indices_BLqK.size(0) * topk_indices_BLqK.size(1),
+        )[0].reshape((*topk_indices_BLqK.shape[:2], 1))
+        selected_rows_BLqK = torch.where(
+            valid_BLqK,
+            topk_indices_BLqK + pool_start_BL1,
+            topk_indices_BLqK,
+        )
+        slots_BLqK = selected_rows_BLqK.clamp(min=0)
 
-        k_sqz = k_BL1H.float().squeeze(2)
-        b_idx = torch.arange(B, device=topk_indices_BLqK.device)[:, None, None]
-        k_gathered = k_sqz[b_idx, topk_indices_BLqK.clamp(min=0)]
+        # Teacher: the attention's own distribution over the selected slots, taken as
+        # log-probabilities of the same logits -- not ``log(softmax(...))``, which underflows to
+        # ``-inf`` exactly where the student is peaked.  It is constant with respect to the indexer:
+        # the caller hands over detached q/k and the gradient arrives through ``carrier``.  This
+        # model has no window and no sink, so the selection is the whole support, every head's mass
+        # is one, and the teacher is the head-averaged softmax.
+        # The keys are read as one packed row -- the ``B * L`` tokens the metadata's offsets
+        # number -- rather than per batch element, so a selected row is addressed the same way
+        # whichever document and whichever batch element it came from.
+        k_sqz = k_BL1H.float().squeeze(2).reshape(-1, k_BL1H.size(-1))
+        k_gathered = k_sqz[slots_BLqK]
+        teacher_logits = torch.einsum("blhd,blkd->blhk", q_BLNH.float(), k_gathered).mul(scale)
+        teacher_logits = teacher_logits.masked_fill(~valid_BLqK.unsqueeze(2), _MASKED_LOGIT)
+        teacher = F.log_softmax(teacher_logits, dim=-1).exp().mean(dim=2)
 
-        logits = torch.einsum("blhd,blkd->blhk", q_BLNH.float(), k_gathered)
-        logits = logits * scale
-        logits = logits.masked_fill((topk_indices_BLqK < 0).unsqueeze(2), float("-inf"))
-        p = F.softmax(logits, dim=-1).mean(dim=2)
+        # Student: the indexer's log-probabilities over the same slots under the same mask, so its
+        # softmax normalizes exactly where the operator's does.  No epsilon or clamp appears on this
+        # path, so autograd yields the operator's ``Y - teacher`` exactly, saturated slots included.
+        # The selection marks an unused slot ``-inf``; the finite sentinel replaces it, so a row
+        # whose every slot is unused still gets a finite softmax instead of a NaN one.
+        student_logits = topk_scores_BLqK.float().masked_fill(~valid_BLqK, _MASKED_LOGIT)
+        log_student = F.log_softmax(student_logits, dim=-1)
 
-        scores_BLqK = index_scores_BLqLkv.gather(-1, topk_indices_BLqK.clamp(min=0))
-        scores_BLqK = scores_BLqK.masked_fill(topk_indices_BLqK < 0, float("-inf"))
-        q_pred = F.softmax(scores_BLqK, dim=-1)
+        # ``teacher * (log teacher - log student)`` is the teacher-weighted KL, summed over this
+        # microbatch's query rows.  The clamp only guards a mass that fp32 could underflow to zero;
+        # a row whose every slot is unused is uniform on both sides and contributes exactly zero.
+        kl = (teacher * (teacher.clamp_min(_MIN_TEACHER_MASS).log() - log_student)).sum(dim=-1)
+        # ``AuxLoss`` normalizes by the step's global valid-token count, the same denominator the
+        # main loss uses, so what is handed over is that sum rather than a mean already divided by
+        # the row count.
+        return self.inject(kl.sum(), carrier=carrier)
 
-        # Use the same epsilon as the fused NPU loss kernel for parity.
-        eps = 1e-8
-        kl_loss = (p * ((p + eps).log() - (q_pred + eps).log())).sum(dim=-1).mean()
-        return self.inject(carrier, kl_loss)
 
+class SparseInnerAttention(VarlenAttention):
+    """Sparse attention core for DSA, with separated nope/rope support.
 
-class SparseInnerAttention(FlexAttention):
-    """Sparse attention core for DSA, with separated nope/rope support."""
+    The core is two attn-gym calls: :func:`lightning_indexer` picks the slots and
+    :func:`gather_attn` attends to exactly them, so the selection *is* the softmax's whole
+    support -- this model has no sliding window and no sink.  The value is the KV latent's
+    un-rotated prefix: MLA's absorbed value is ``k_nope``, and attn-gym carries one tensor
+    per KV source, so the same ``[nope | rope]`` latent is the key and (for its ``nope``
+    prefix) the value; the rope tail of the attention output is dropped.
+
+    Both calls read the packed layout the varlen metadata describes, one document per
+    segment, and both number the pool the same way -- the indexer emits document-local
+    indices, at ratio 1 the row is its own candidate pool, and ``gather_attn`` reads them
+    back in that numbering.  Only the unsharded layout is supported: attn-gym's causal
+    selection is a query's *prefix* of its document, while a context-parallel rank holds a
+    document's middle, where the fused kernels' end-aligned convention is required.
+
+    This is the reference core: attn-gym's eager implementations do not chunk, so the
+    indexer materializes its ``[B, T, H, T]`` score and ``gather_attn`` its
+    ``[B, kv_heads, T, topk, D]`` slots in fp32, and the footprint grows with ``T * topk``
+    (one 2048/2048/128-head layer measured 26.75 GiB on 910C).  Training runs the fused
+    AscendC kernels instead -- ``override.deepseek_v3_2.sparse_attn.asc``.
+    """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(FlexAttention.Config):
+    class Config(VarlenAttention.Config):
         index_topk: int
         indexer_loss: SparseIndexerLoss.Config = field(default_factory=SparseIndexerLoss.Config)
+
+        def build_attention_metadata(
+            self,
+            positions: torch.Tensor,
+            *,
+            padding_mask: torch.Tensor | None = None,
+            max_num_documents: int | None = None,
+            max_context_length: int | None = None,
+        ) -> ReferenceVarlenMetadata:
+            """The packed document layout the reference core reads.
+
+            Upstream #4897 makes the attention backend own this construction, so
+            the decoder builds it once per microbatch and every layer of this
+            geometry shares it.
+            """
+            del padding_mask, max_num_documents, max_context_length
+            return build_reference_varlen_metadata(positions)
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -240,36 +380,29 @@ class SparseInnerAttention(FlexAttention):
         idx_k_BL1H: torch.Tensor,
         idx_w_BLN: torch.Tensor,
         *,
-        attention_masks: dict[str, BlockMask | torch.Tensor],
+        attention_masks: AttentionMetadata,
         scale: float,
     ) -> torch.Tensor:
+        if isinstance(attention_masks, CPVarlenMetadata):
+            raise ValueError(_REFERENCE_CP_UNSUPPORTED)
         q_BLNH = torch.cat([q_nope_BLNH, q_rope_BLNH], dim=-1)
         k_BL1H = torch.cat([k_nope_BL1H, k_rope_BL1H], dim=-1)
-        v_BL1H = k_nope_BL1H
 
-        block_mask = attention_masks["block_mask"]
-        dense_mask = attention_masks["dense_mask"]
-        assert isinstance(block_mask, BlockMask)
-        assert isinstance(dense_mask, torch.Tensor)
-
-        topk_indices_BLqK, index_scores_BLqLkv = Indexer.select(
+        topk_indices_BLqK, topk_scores_BLqK = Indexer.select(
             idx_q_BLNH,
             idx_k_BL1H,
             idx_w_BLN,
-            dense_mask,
+            attention_masks,
             self.index_topk,
         )
 
-        with spmd.no_typecheck():
-            selected_bm = _build_selected_bm(topk_indices_BLqK, block_mask.BLOCK_SIZE, k_BL1H.shape[1])
-
-        output_BLNH = super().forward(
+        output_BLNH = self._sparse_attention(
             q_BLNH,
             k_BL1H,
-            v_BL1H,
-            attention_masks=selected_bm,
-            scale=scale,
-            enable_gqa=True,
+            topk_indices_BLqK,
+            attention_masks,
+            k_nope_BL1H.size(-1),
+            scale,
         )
         if self.training:
             output_BLNH = self.indexer_loss(
@@ -277,10 +410,47 @@ class SparseInnerAttention(FlexAttention):
                 k_BL1H.detach(),
                 scale,
                 topk_indices_BLqK,
-                index_scores_BLqLkv,
+                topk_scores_BLqK,
+                attention_masks,
                 carrier=output_BLNH,
             )
         return output_BLNH
+
+    @staticmethod
+    def _sparse_attention(
+        q_BLNH: torch.Tensor,
+        k_BL1H: torch.Tensor,
+        topk_indices_BLqK: torch.Tensor,
+        attention_masks: AttentionMetadata,
+        value_head_dim: int,
+        scale: float,
+    ) -> torch.Tensor:
+        """One masked softmax over the selected slots, as a single ``gather_attn`` call.
+
+        The batch is packed into one row, which is the numbering the metadata's offsets
+        describe.  ``sliding_window_size=0`` leaves the local branch with no slot of its
+        own, so the sparse pool is the entire support; the same latent is passed for both
+        KV sources because a ``[nope | rope]`` key is also its own value on the ``nope``
+        prefix.  ``local_kv`` still has to be a query-length tensor for attn-gym's shape
+        check, which the key itself already is.
+        """
+        batch, seqlen, _, head_dim = q_BLNH.shape
+        tokens = batch * seqlen
+        kv_B1TD = k_BL1H.reshape(1, tokens, 1, head_dim).transpose(1, 2)
+        output_B1TD = gather_attn(
+            q_BLNH.reshape(1, tokens, -1, head_dim).transpose(1, 2),
+            kv_B1TD,
+            kv_B1TD,
+            topk_indices_BLqK.reshape(1, tokens, -1),
+            None,
+            sliding_window_size=0,
+            cu_seqlens=attention_masks.cu_seq_q,
+            cu_seqlens_k=attention_masks.cu_seq_k,
+            scale=scale,
+            impl="reference",
+        )
+        assert isinstance(output_B1TD, torch.Tensor)
+        return output_B1TD.transpose(1, 2).reshape(batch, seqlen, -1, head_dim)[..., :value_head_dim]
 
 
 class Attention(V3Attention):
@@ -399,12 +569,15 @@ class DeepSeekV32Model(DeepSeekV3Model):
     """DeepSeek-V3.2 model based on DeepSeek V3.
 
     The model replaces MLA with DSA and applies V3.2-specific sharding.
+
+    The model carries no metadata seam of its own: its attention backends build
+    the per-microbatch metadata (``SparseInnerAttention.Config``, or the
+    AscendC override's ``AscSparseInnerAttention.Config``), and the decoder
+    builds and dispatches it as upstream #4897 does.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV3Model.Config):
-        metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
-
         def update_from_config(self, *, config, **kwargs):
             if hasattr(config, "training"):
                 seq_len = config.training.seq_len
@@ -423,62 +596,3 @@ class DeepSeekV32Model(DeepSeekV3Model):
                 enable_sp=parallelism.enable_sequence_parallel,
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
-
-    def __init__(self, config: Config):
-        super().__init__(config)
-        self._metadata_extension = config.metadata_extension.build()
-
-    def build_attention_masks(
-        self,
-        inputs,
-        labels,
-        extra_kwargs,
-        *,
-        cp_mesh: DeviceMesh | None = None,
-        load_balancer_type: str | None = None,
-    ):
-        """The model-owned per-batch metadata construction (the single
-        overridable mask-handling seam).
-
-        The core mask comes from the (flex- or varlen-typed) inner attention;
-        under context parallel the generic ``prepare_context_parallel_input``
-        shards it.  The DSA block mask + the shared dense attendability mask
-        are derived from a flex ``BlockMask``; a varlen mask passes through
-        to the ``metadata_extension`` (the AscendC TND conversion)."""
-        positions = extra_kwargs.get("positions")
-        masks = super().get_attention_masks(positions=positions)
-        if cp_mesh is not None:
-            # ``prepare_context_parallel_input`` shards ``attention_masks``
-            # only when the key is already present (it never adds it), so the
-            # built masks must be handed over before the CP shard call.
-            extra_kwargs["attention_masks"] = masks
-            inputs, labels, extra_kwargs = prepare_context_parallel_input(
-                inputs,
-                labels,
-                extra_kwargs,
-                cp_mesh,
-                inputs.device,
-                load_balancer_type,
-            )
-            masks = extra_kwargs["attention_masks"]
-        attention_masks = self._build_block_mask(masks) if isinstance(masks, BlockMask) else masks
-        if self._metadata_extension is not None:
-            attention_masks = self._metadata_extension(attention_masks)
-        extra_kwargs["attention_masks"] = attention_masks
-        return inputs, labels, extra_kwargs
-
-    @staticmethod
-    def _build_block_mask(masks: BlockMask) -> dict:
-        """The DSA block mask and its shared dense attendability mask."""
-        B = masks.kv_num_blocks.shape[0]
-        seq_len = masks.seq_lengths[0]
-        device = masks.kv_num_blocks.device
-        dense_mask = create_mask(
-            masks.mask_mod,
-            B,
-            1,
-            seq_len,
-            seq_len,
-            device=device,
-        )
-        return {"block_mask": masks, "dense_mask": dense_mask}

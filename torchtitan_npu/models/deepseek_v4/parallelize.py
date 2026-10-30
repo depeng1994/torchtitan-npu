@@ -24,7 +24,10 @@ from torchtitan.experiments.graph_trainer.compile import (
 )
 from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
 
+from torchtitan_npu.models.common.compile_policy import skip_compile_under_cp
 from torchtitan_npu.patches.torch.distributed.fsdp import policy_overrides
+
+from .lora import is_lora_parameter
 
 if TYPE_CHECKING:
     from torchtitan.config import CompileConfig, ParallelismConfig
@@ -100,6 +103,7 @@ def parallelize_deepseek_v4(
     dump_folder: str,
 ):
     """Apply DSV4 parallelism with per-parameter FP32 SmoE policies."""
+    compile_config = skip_compile_under_cp(model, compile_config, parallel_dims)
     with policy_overrides(_dsv4_fp32_overrides(model, training)):
         parallelized_model = parallelize_deepseekv3(
             model,
@@ -112,7 +116,7 @@ def parallelize_deepseek_v4(
         )
     if getattr(parallelized_model, "lora_config", None) is not None:
         for name, parameter in parallelized_model.named_parameters():
-            if "lora_" not in name:
+            if not is_lora_parameter(name):
                 parameter.requires_grad_(False)
     return parallelized_model
 

@@ -1,5 +1,7 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-# Licensed under the BSD-style license found in the LICENSE file.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 """Fast 16P distributed-launch smoke; intentionally does not load DSV4 weights."""
 from tests.integration_tests import OverrideDefinitions

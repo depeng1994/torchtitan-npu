@@ -5,8 +5,9 @@
 
 """Override: run DeepSeek-V3.2 sparse attention with fused AscendC kernels.
 
-The TND sequence-length metadata extension and the fused attention core
-live together here.
+The TND metadata the fused kernels take and the fused attention core live
+together here: both belong to the same backend, so the backend's config builds
+the metadata (upstream #4897) and its forward consumes it.
 """
 
 from __future__ import annotations
@@ -16,16 +17,21 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch_npu
+from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
 from torchtitan.models.common.attention import (
     VarlenAttention,
     VarlenMetadata,
 )
 
-from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 from torchtitan_npu.models.deepseek_v3_2.model import (
     SparseIndexerLoss,
+    build_reference_varlen_metadata,
 )
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
+from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
+    cp_shard_context,
+)
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 
 @spmd.register_autograd_function
@@ -46,7 +52,6 @@ class _AscSparseIndexerLossFunc(torch.autograd.Function):
         k_rope_T1H,
         actual_seq_qlen,
         actual_seq_klen,
-        coeff,
         acc_buffer,
     ):
         ctx.save_for_backward(
@@ -64,7 +69,6 @@ class _AscSparseIndexerLossFunc(torch.autograd.Function):
         ctx.scale_value = scale_value
         ctx.actual_seq_qlen = actual_seq_qlen
         ctx.actual_seq_klen = actual_seq_klen
-        ctx.coeff = coeff
         ctx.acc_buffer = acc_buffer
         return torch.zeros((), device=q_nope_TNH.device, dtype=torch.float32)
 
@@ -83,7 +87,6 @@ class _AscSparseIndexerLossFunc(torch.autograd.Function):
         k_rope_T1H,
         actual_seq_qlen,
         actual_seq_klen,
-        coeff,
         acc_buffer,
     ):
         return _AscSparseIndexerLossFunc.apply(
@@ -100,7 +103,6 @@ class _AscSparseIndexerLossFunc(torch.autograd.Function):
             k_rope_T1H,
             actual_seq_qlen,
             actual_seq_klen,
-            coeff,
             acc_buffer,
         )
 
@@ -137,12 +139,19 @@ class _AscSparseIndexerLossFunc(torch.autograd.Function):
             sparse_mode=3,
         )
 
-        # Convert summed KL outputs using coeff / (tokens * global batch size).
+        # ``grad_scale`` arrives from ``AuxLoss.inject`` and already carries
+        # ``coeff / global_valid_tokens`` -- one factor for the coefficient and one
+        # for the step's token count, the denominator the main loss uses.
         d_q_idx = d_q_idx * grad_scale
         d_k_idx = d_k_idx * grad_scale
         d_w = d_w * grad_scale
 
-        ctx.acc_buffer.add_(loss.squeeze() * grad_scale / ctx.coeff)
+        # The kernel answers with the summed KL only on the backward, so the metric
+        # is accumulated here; ``inject``'s forward accumulation adds the zero
+        # placeholder it was handed.
+        denominator = AuxLoss._step_denominator
+        assert denominator is not None, "AuxLoss.set_step_denominator() must be called"
+        ctx.acc_buffer.add_(loss.squeeze() / denominator)
 
         return (
             None,
@@ -203,11 +212,11 @@ class AscSparseIndexerLoss(SparseIndexerLoss):
             k_rope_T1H,
             actual_seq_qlen,
             actual_seq_klen,
-            self.coeff,
-            self._acc,
+            self.instance_acc,
         )
-        # Normalize the summed KL value before logging.
-        return self.inject(carrier, dummy / q_nope_TNH.shape[0])
+        # ``AuxLoss`` owns the per-step normalization: the summed KL goes in raw,
+        # and the coefficient and the global valid-token count are applied inside.
+        return self.inject(dummy, carrier=carrier)
 
 
 class AscSparseInnerAttention(VarlenAttention):
@@ -217,6 +226,24 @@ class AscSparseInnerAttention(VarlenAttention):
     class Config(VarlenAttention.Config):
         index_topk: int
         indexer_loss: AscSparseIndexerLoss.Config
+
+        def build_attention_metadata(
+            self,
+            positions: torch.Tensor,
+            *,
+            padding_mask: torch.Tensor | None = None,
+            max_num_documents: int | None = None,
+            max_context_length: int | None = None,
+        ) -> AscVarlenMetadata:
+            """The TND metadata this backend consumes (upstream #4897).
+
+            The packed layout comes from the reference core's builder -- the
+            fused path reads the same documents -- and the host length lists the
+            TND kernels take are read here: once per microbatch for every layer
+            of this geometry, instead of once per layer.
+            """
+            del padding_mask, max_num_documents, max_context_length
+            return AscVarlenMetadata.from_varlen(build_reference_varlen_metadata(positions))
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
@@ -318,32 +345,59 @@ class AscSparseInnerAttention(VarlenAttention):
 
 @dataclass(frozen=True, eq=False)
 class AscVarlenMetadata:
-    """Varlen metadata with CPU sequence lengths required by TND kernels.
+    """Varlen metadata with the host offsets the TND kernels require.
 
-    The handler extracts both length lists in one device-to-host transfer.
+    ``actual_seq_qlen``/``actual_seq_klen`` are the CANN ``actual_seq_lengths``
+    form of the packed layout -- the cumulative end offsets, not per-segment
+    lengths -- read off the device once per batch and kept next to the tensor
+    they came from, so a rank's copy is re-read in one transfer.
     """
 
     varlen_meta: VarlenMetadata | CPVarlenMetadata
     actual_seq_qlen: list[int]
     actual_seq_klen: list[int]
 
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        """This rank's copy of the packed layout (upstream #4617's CP half).
 
-class AscVarlenMetadataExtension(MetadataExtension):
-    """The AscendC TND metadata extension: extracts the host sequence-length
-    lists the TND kernels require from the model-built varlen mask."""
+        The global documents are re-cut for the load-balancer permutation, so the host
+        length lists are re-read from the rank-local offsets: the TND kernels receive
+        exactly the segments this rank runs.  The hook lives here, on the layout it
+        rebuilds, rather than on the backend that produced it.
 
-    @dataclass(kw_only=True, slots=True)
-    class Config(MetadataExtension.Config):
-        pass
-
-    def __call__(self, metadata) -> AscVarlenMetadata:
-        assert isinstance(metadata, (VarlenMetadata, CPVarlenMetadata)), (
-            f"expected VarlenMetadata or CPVarlenMetadata, got {type(metadata)}"
+        The balancer is rebuilt here rather than received, because 0.3.0's CP entry takes
+        its *type* and builds the object internally; anything but ``headtail`` means that
+        entry sharded with no permutation, so this derivation passes no balancer either and
+        stays in step with the shard.  An unusable type never reaches here: the pinned entry
+        rejects it first (``ptrr`` included, since the map path hands it no masks).
+        """
+        del permutation
+        context = cp_shard_context()
+        if context.cp_mesh is None or context.positions is None:
+            raise ValueError("prepare_cp_metadata needs the CP mesh and the pre-shard positions")
+        batch_size, seq_len = context.positions.shape
+        return AscVarlenMetadata.from_varlen(
+            CPVarlenMetadata.from_global(
+                attention_metadata.varlen_meta,
+                context.cp_mesh,
+                batch_size,
+                seq_len,
+                load_balancer=(
+                    _HeadTailLoadBalancer(seq_len, context.cp_mesh.size(0), context.cp_mesh.device_type)
+                    if context.load_balancer_type == "headtail"
+                    else None
+                ),
+            )
         )
-        cu_q, cu_k = metadata.cu_seq_q, metadata.cu_seq_k
+
+    @classmethod
+    def from_varlen(cls, varlen_meta: VarlenMetadata | CPVarlenMetadata) -> AscVarlenMetadata:
+        """Read both host offset lists of a packed layout in one transfer."""
+        cu_q, cu_k = varlen_meta.cu_seq_q, varlen_meta.cu_seq_k
         actual_seq_qlen, actual_seq_klen = torch.stack([cu_q[1:], cu_k[1:]]).cpu().tolist()
-        return AscVarlenMetadata(
-            varlen_meta=metadata,
+        return cls(
+            varlen_meta=varlen_meta,
             actual_seq_qlen=actual_seq_qlen,
             actual_seq_klen=actual_seq_klen,
         )

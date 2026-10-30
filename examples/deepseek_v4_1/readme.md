@@ -1,6 +1,6 @@
 ### V4.1 独立训练基线与融合栈
 
-V4.1 的模型、图像路由、压缩 attention、metadata 和并行化均由 `torchtitan_npu/models/deepseek_v4_1` 持有，不依赖 V4 模型或其专属 override。模型默认算子是 Attention Gym 的 eager `selected_attention`（`CompressedSparseInnerAttention2`）与公共 MoE 工厂；模型目录不含 indexer 训练目标，eager 路径也没有：它只在 A5 的两个融合 override 同开时由两者的反向传递，见下文。
+V4.1 的模型、图像路由、压缩 attention、metadata 和并行化均由 `torchtitan_npu/models/deepseek_v4_1` 持有，不依赖 V4 模型或其专属 override。模型默认算子是 Attention Gym 的 eager `gather_attn`（`CompressedSparseInnerAttention2`）与公共 MoE 工厂；模型目录不含 indexer 训练目标，eager 路径也没有：它只在 A5 的两个融合 override 同开时由两者的反向传递，见下文。
 
 当前支持 **FSDP + EP、TP1 / CP1 / PP1、eager 执行与 torch.compile**，保留 FullAC 与图文输入。A3 脚本组织公共实验参数与融合列表，A5 调用 A3 并追加 CPU 亲和性、partial 文本 RoPE、两项 SwiGLUGroup、sparse attention 与 mHC Sinkhorn；两种入口均通过 `USE_GOLDEN=1` 选择 reference。A3 默认融合包含 RMSNorm、文本（`asc_complex`）与视觉 RoPE、MoE token dispatcher 和 mHC post；A5 将文本 RoPE 换为 `asc_partial` 并追加 routed/shared SwiGLUGroup、sparse 与 Sinkhorn。routed experts 的 grouped GEMM 是 reference 与融合共用的公共路径，不再作为独立融合开关。已接入量化入口及 Host Engram；不支持 MTP、DSpark、GraphTrainer；不支持的 TP、CP、PP 和 compile 配置在入口拒绝。
 
@@ -40,7 +40,7 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
     --training.steps 3 --lr-scheduler.total-steps 3 --lr-scheduler.warmup-steps 2
 ```
 
-默认实验为 40 层 / 16 专家、seq4096（4k）、local/global batch 1/8、FSDP8/EP8、Muon（NS steps=10）、eager、FullAC，训练与调度均为 40 步。Python 配方保留模型结构、数据协议和优化器参数布局；实验参数由脚本组织，末尾 CLI 参数覆盖脚本默认值。`CONFIG` 可选择 `deepseek_v4_1_debugmodel_multimodal` 调试宽度，硬件选择仍由脚本负责。
+单机 8 卡默认使用 40 层模型，A3 为 16 个路由专家，A5 为 24 个路由专家；均使用 seq4096（4k）、local/global batch 1/8、FSDP8/EP8、Muon（NS steps=10）、eager、FullAC，训练与调度均为 40 步。Python 配方保留模型结构、数据协议和优化器参数布局；实验参数由脚本组织，末尾 CLI 参数覆盖脚本默认值。`CONFIG` 可选择 `deepseek_v4_1_debugmodel_multimodal` 调试宽度，硬件选择仍由脚本负责。
 
 关闭 Engram 使用 `--no-engram-enabled`；优化器由脚本显式选择，末尾 `--optimizer.name AdamW` 仍可覆盖。A3 单机使用 `--training.seq-len 2048`，脚本保留 4k 默认配置。A5 多机保留与单机一致的 swap override；可通过 `OPTIMIZER_OVERRIDES` 显式覆盖。
 
@@ -78,6 +78,8 @@ A5 默认每机 8 卡、EP128/FSDP128、TP1/CP1/PP1、MBS1/GBS1024、100 步、M
 - 原生 DCP 完整续训：`--checkpoint.enable --checkpoint.initial-load-path /path/to/dcp/step-N --checkpoint.no-initial-load-in-hf --checkpoint.no-initial-load-in-hf-quantized --checkpoint.no-initial-load-model-only`。恢复模型、优化器和训练状态；并行布局与原 checkpoint 保持兼容。
 - 普通 HF 权重初始化：`--checkpoint.enable --checkpoint.initial-load-path /path/to/hf --checkpoint.initial-load-in-hf --checkpoint.no-initial-load-in-hf-quantized --checkpoint.initial-load-model-only`。只加载模型权重，优化器重新初始化。
 - 输入包含官方格式的 Engram MXFP8 权重时，在 HF 初始化参数上追加 `--checkpoint.initial-load-in-hf-quantized`，按 row/block scale 反量化到训练参数。该选项描述输入 checkpoint 格式，与训练时是否启用 Engram MXFP8 算子相互独立。
+
+Engram HF 表以全局逻辑行保存，不包含本地 padding，支持 EP 分片和 EP × EFSDP 联合分片的权重导入导出；离线 DCP 转 HF 同样支持这两种表布局。这不包含原生优化器状态在不同分片布局之间的自动迁移。
 
 当前补齐的是 Engram 表及 gate 的 HF 映射和 MXFP8 读取；V4.1 主线尚不能直接读取官方整包的所有非 Engram 量化权重（例如 Attention），因此开启 quantized 选项不意味着官方整包可以直接开始训练。HF 导出遵循 `export_dtype`，不导出优化器状态，也不生成官方 MXFP8 发布格式。
 
@@ -169,13 +171,15 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
 | `common.rope.asc_complex`（A3 文本） | attention/compressor/indexer 的 split-aware 文本旋转（公共 `ComplexRoPE.Config`，保留 split/theta/YaRN） | Ascend rotary mul（interleave） |
 | `common.rope.asc_partial`（A5 文本） | 同上三处文本位点；单个 `inplace_partial_rotary_mul` 只旋转尾部 `dim` 通道 | AscendC partial rotary |
 | `common.rope.asc_half_rotation` | 视觉塔 2D 位置表的 half 旋转（半宽 cos/sin，融合前复制为全宽表，逐 batch 折叠保位置） | 同上 |
-| `sparse_attn.asc`（仅 A5，须与下一行同开） | 替换完整 attention forward；反向除自身梯度外还在 `topk_scores` 梯度上产出 indexer 教师 | Ascend sparse flash MLA |
-| `lightning_indexer.asc`（仅 A5，须与上一行同开） | 替换 selector 节点 |
+| `sparse_attn.asc`（仅 A5，须与下一行同开） | 替换完整 attention forward；反向除自身梯度外还在 `topk_scores` 梯度上产出 indexer 教师。该 config 按**自己的几何**（每个 `(端口, compress_ratio)` 一个 map entry）每微批预计算 SMLA 与 indexer 元数据（`sparse_flash_mla_metadata` / `sparse_flash_mla_grad_metadata` / `lightning_indexer_metadata` / `sparse_lightning_indexer_kl_loss_grad_metadata`），随 entry 的 `aicpu_metadata` 字段下发，前向/重算/反向直接读字段（没有查表）。几何即该 config 自己的必填字段（无默认值），由该入口的五个参数一次写入，默认值即 V4.1-Flash 的发布形状；记录是内核 metadata 的唯一来源：拿着没经过端口构建的 metadata 前向会直接失败，不会在层里补一次算子调用（没有 inline 回退） | Ascend sparse flash MLA + CANN `*_metadata` |
+| `lightning_indexer.asc`（仅 A5，须与上一行同开） | 替换 selector 节点 | CANN `lightning_indexer` + `sparse_lightning_indexer_kl_loss_grad` |
 | `common.swiglu_group.asc`（仅 A5） | `*.moe.routed_experts.inner_experts` 的 grouped SwiGLU（FQN 限定） | cann_ops_nn.swiglu_group |
 | `common.swiglu_group.asc_shared_experts`（仅 A5） | `*.moe.shared_experts` 的 SwiGLU（FQN 限定，不替换视觉 MLP） | 同上 |
 | `common.token_dispatcher.asc` | 公共 MoE 的 permute / re-routing / unpermute；reference 不启用 | Ascend token dispatcher |
 | `mhc.asc_hc_post` | mHC post 变换 | Ascend mHC post |
 | `mhc.asc_sinkhorn`（仅 A5） | `HcPre._split_sinkhorn`（新接口，`hc_eps` 字段） | npu_mhc_sinkhorn |
+
+量化路径不是这两个 override 的包装，而是另一个 backend：开启 `--extension.quantization.enable-sparse-attention-quantization` 后，量化后的 sparse attention（`torchao_npu` 里 fused attention 的拷贝）由 converter 安装，它自己构建 entry 的四份 metadata（含量化 selector 的两条 schedule），因此 `sparse_attn.asc` 在该路径上不生效；`--extension.quantization.li-quantization mxfp4` 必须与该开关同时开启，否则非量化 attention 的 BF16 schedule 会被量化 kernel 读到（垃圾索引，kernel 可能崩），converter 会直接报错。非量化路径的 `lightning_indexer.fwd_sparse` / `.sparse_length` 当前留空，等带 candidate 的非量化算子落地后由 port 填。
 
 routed experts 已走公共 grouped GEMM（`_ClampGroupedExperts` → 仓内 NPU `_grouped_mm`），reference 与融合共用，不改变模型参数名称、FSDP/EP 或 checkpoint 格式。融合输出、输入/权重梯度与训练轨迹的误差需与迁移后同配置 reference 对照验收；仅运行成功不代表数值或性能验收完成。
 
@@ -192,3 +196,7 @@ CPU 测试覆盖两类 seam 的输出/梯度、partial 非连续输入、逐 bat
 ### 验证范围
 
 CPU 单测覆盖模型与融合配置选择、RoPE 输出/梯度等核心行为；不保留专用的 V4.1 两卡手动冒烟 suite。真实训练通过上述 A3/A5 入口执行。历史 A3 的 50 步对照见 PR 845；该证据不代表当前 HEAD 或 A5 新 CANN 已完成重验。
+
+## LoRA
+
+通过 [LoRA 脚本](deepseek_v4_1_flash_lora_4k_a3.sh) 复用 CPT 入口。默认配置为多模态 `deepseek_v4_1_flash_lora`，设置 `CONFIG=deepseek_v4_1_flash_text_lora` 可选择纯文本模型。AdamW/Muon、Engram 冻结、native DCP 恢复和 PEFT 导出/合并方式见 [V4.1 LoRA 指南](../../docs/feature_guides/deepseek_v4_1_lora.md)。

@@ -12,22 +12,13 @@ tests/assets/deepseek_v3/
 └── tokenizer_config.json
 ```
 
-如需使用其他 Tokenizer，可通过 `HF_ASSETS_PATH` 指定：
-
-```bash
-export HF_ASSETS_PATH=/path/to/tokenizer
-```
+如需使用其他 Tokenizer，修改单卡命令中的 `--hf-assets-path`。
 
 2. 准备数据集。
 
-已在 `tests/assets/c4_test/` 中预置 `c4_test` 测试数据集，示例 wrapper 默认使用该目录，无需额外下载。
+已在 `tests/assets/c4_test/` 中预置 `c4_test` 测试数据集，单卡命令直接使用该目录，无需额外下载。
 
-使用其他数据集时，需同时指定数据集名称和目录：
-
-```bash
-export DATASET=dataset_name
-export DATASET_PATH=/path/to/dataset
-```
+使用其他数据集时，需同时修改单卡命令中的 `--dataloader.dataset` 和 `--dataloader.dataset-path`。
 
 ## 配置 CANN 环境变量
 
@@ -68,13 +59,12 @@ bash scripts/run_train.sh \
 ```
 
 > [!NOTE]
-> 示例 wrapper / 底层 launcher 配置项说明：
+> 通用 launcher 配置项说明：
 > - `ASCEND_SET_ENV_PATH`：可选，自定义 CANN `set_env.sh` 路径；设置后优先加载该文件。
 > - `MODULE`：模型 Python 模块，默认为 `torchtitan.models.deepseek_v3`。
 > - `CONFIG`：`torchtitan/models/deepseek_v3/config_registry.py` 中注册的配置函数，默认为 `deepseek_v3_debugmodel`。
 > - `NGPU`：当前节点参与训练的 NPU 数量，默认为 `1`。
-> - `HF_ASSETS_PATH`：Tokenizer 目录，默认为仓内 `tests/assets/deepseek_v3`。
-> - `DATASET` 和 `DATASET_PATH`：数据集名称和目录，默认使用仓内的 `tests/assets/c4_test/`。
+> - Tokenizer 和数据集由上述命令中的 CLI 参数指定；`scripts/run_train.sh` 不读取 `HF_ASSETS_PATH`、`DATASET` 或 `DATASET_PATH` 环境变量。
 > - 脚本后的其他参数会原样传给 `torchtitan_npu.train`，可用于覆盖配置函数中的训练和并行参数。
 
 
@@ -146,7 +136,7 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 | `li-quantization` | `fp8`、`mxfp8`、`mxfp4`、`hif8` | 选择 LI Q/K 的量化类型，默认不启用；DeepSeek-V4.1 仅支持 `mxfp4`。 |
 | `kv-norm-quantization.format` | `mxfp8` | 启用 DeepSeek-V4 KV Cache 的 MXFP8 量化。 |
 | `enable-fsdp-prequantize` | `--enable-fsdp-prequantize` / `--no-enable-fsdp-prequantize` | 在 FSDP all-gather 前预量化 Block FP8 权重，减少通信量，默认关闭。 |
-| `fsdp-prequantize-fqns` | FQN 后缀模式列表（默认 `None`） | 仅在 `enable-fsdp-prequantize` 下生效。白名单内的权重保留预量化、其余显式关闭；`None` 用 recipe 默认白名单，显式空表与开关开启冲突会报 `ValueError`。命中权重的分片若不满足对齐约束，运行时立即报错终止（不静默回退），并给出移除该 FQN 或调整并行度的提示。 |
+| `fsdp-prequantize-fqns` | FQN 后缀模式列表（默认 `None`） | 仅在 `enable-fsdp-prequantize` 下生效。白名单内的权重保留预量化、其余显式关闭；`None` 用 recipe 默认白名单，显式空表与开关开启冲突会报 `ValueError`。多个模式写在同一参数内并以英文逗号分隔（如 `.attention.wq_b,.attention.wo_a`）。命中权重的分片若不满足对齐约束，运行时立即报错终止（不静默回退），并给出移除该 FQN 或调整并行度的提示。 |
 | `enable-hif8-save-quant-codes` | `--enable-hif8-save-quant-codes` / `--no-enable-hif8-save-quant-codes` | 把 HiF8 量化矩乘算子（`npu_quantize`/`npu_dynamic_quant`/`npu_grouped_matmul`/`npu_quant_matmul`）结果保留在 selective activation checkpointing 保存边界内，backward 不再重新推导；仅在 `recipe=all_hif8` 时生效，默认关闭。 |
 | `save-block-ops-level` | `0`-`3`（默认 `0`） | 把 attention / mHC / MoE-routing 相关 NPU 自定义算子加入 selective activation checkpointing 的 MUST_SAVE 列表，用显存换取 backward 更少重复计算。 |
 
@@ -154,10 +144,10 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 
 DeepSeek-V4.1 复用上述 TorchAO-NPU 低精度入口，当前面向 A5（Ascend 950）硬件。Lightning Indexer 与稀疏 attention 量化的配置、组合、依赖和限制见[低精度训练特性指南](../feature_guides/low_precision_training.md#deepseek-v41-li-与稀疏-attention-量化)。
 
-DeepSeek-V4.1 使用 `li-quantization=mxfp4` 启用 Lightning Indexer量化，使用
-`enable-sparse-attention-quantization` 启用 KV source Compressor 与稀疏 attention 量化。两项可在
-标准 A5 融合路径提供 BF16 fallback 的前提下独立选择；`USE_GOLDEN=1` 不提供这些
-fallback。启动日志中出现
+DeepSeek-V4.1 使用 `li-quantization=mxfp4` 启用 Lightning Indexer 量化，使用
+`enable-sparse-attention-quantization` 启用 KV source Compressor 与稀疏 attention 量化。
+稀疏 attention 量化可单独启用；启用 Lightning Indexer 量化时必须同时启用稀疏 attention
+量化。标准 A5 融合路径提供 BF16 fallback，`USE_GOLDEN=1` 不提供这些 fallback。启动日志中出现
 `Applied TorchAO-NPU recipe=...` 表示 recipe 已应用。
 
 DeepSeek-V4.1 模型做 Block FP8 低精度预训练可运行以下脚本：

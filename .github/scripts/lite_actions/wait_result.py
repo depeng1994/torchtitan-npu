@@ -1,16 +1,17 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-# Licensed under the BSD-style license found in the LICENSE file.
-
 #!/usr/bin/env python3
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Consume only identity-matched schema-3 results; never upload training logs."""
 
-import datetime as dt
 import json
 import os
-from pathlib import Path
 import time
-import urllib.request
+import urllib.error
 import urllib.parse
+import urllib.request
 
 REPO = "torchtitan-npu/torchtitan-npu"
 STATUS = {"PASS", "FAIL", "INFRA_ERROR", "RESOURCE_TIMEOUT", "TIMED_OUT", "CANCELLED", "NOT_RUN"}
@@ -24,6 +25,8 @@ def find_result(comments, *, run_id, attempt, sha, digest, item, workflow, autho
         try:
             r = json.loads(c["body"].split("\n", 1)[1])
         except ValueError:
+            continue
+        if not isinstance(r, dict):
             continue
         expected = dict(
             schema=3,
@@ -44,7 +47,8 @@ def find_result(comments, *, run_id, attempt, sha, digest, item, workflow, autho
             continue
         lines = r.get("last_20_lines")
         if (
-            r.get("status") not in STATUS
+            not isinstance(r.get("status"), str)
+            or r.get("status") not in STATUS
             or not isinstance(lines, list)
             or len(lines) > 20
             or any(not isinstance(s, str) or len(s) > 180 or any(ord(c) < 32 for c in s) for s in lines)
@@ -71,6 +75,8 @@ def find_progress(comments, run_id, attempt, item, digest, author):
             r = json.loads(c["body"][17:])
         except ValueError:
             continue
+        if not isinstance(r, dict):
+            continue
         if all(
             r.get(k) == v
             for k, v in dict(
@@ -81,13 +87,34 @@ def find_progress(comments, run_id, attempt, item, digest, author):
     return None
 
 
+HTTP_CACHE = {}
+
+
+class RetryableAPIError(RuntimeError):
+    pass
+
+
 def get(path, token):
-    req = urllib.request.Request(
-        f"https://api.github.com/repos/{REPO}" + path,
-        headers={"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json"},
-    )
-    with urllib.request.urlopen(req, timeout=25) as r:
-        return json.load(r)
+    headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json"}
+    previous = HTTP_CACHE.get(path)
+    if previous and previous[0]:
+        headers["If-None-Match"] = previous[0]
+    request = urllib.request.Request(f"https://api.github.com/repos/{REPO}" + path, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            data = json.load(response)
+            HTTP_CACHE[path] = (response.headers.get("ETag"), data)
+            return data
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304 and previous:
+            return previous[1]
+        if exc.code in (429, 500, 502, 503, 504) or (
+            exc.code == 403 and (exc.headers.get("X-RateLimit-Remaining") == "0" or exc.headers.get("Retry-After"))
+        ):
+            raise RetryableAPIError(f"GitHub temporarily unavailable: HTTP {exc.code}") from exc
+        raise
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RetryableAPIError("GitHub temporarily unreachable") from exc
 
 
 def main():
@@ -106,20 +133,32 @@ def main():
     start = time.monotonic()
     heartbeat = 0
     accepted = False
-    artifacts = get(f"/actions/runs/{run_id}/artifacts?per_page=100", token)
+    while True:
+        try:
+            artifacts = get(f"/actions/runs/{run_id}/artifacts?per_page=100", token)
+            break
+        except RetryableAPIError:
+            if time.monotonic() - start >= 300:
+                raise TimeoutError("GitHub artifact API unavailable") from None
+            time.sleep(60)
     if not any(
         a["name"] == f"lite-ci-request-{attempt}" and not a.get("expired") for a in artifacts.get("artifacts", [])
     ):
         raise ValueError("No plan for this attempt; re-run all jobs")
     while time.monotonic() - start < 16800:
-        comments = []
-        for page in range(1, 21):
-            rows = get(f"/commits/{sha}/comments?per_page=100&page={page}", token)
-            comments.extend(rows)
-            if len(rows) < 100:
-                break
-        else:
-            raise ValueError("comment listing exceeds correlation budget")
+        try:
+            comments = []
+            for page in range(1, 21):
+                rows = get(f"/commits/{sha}/comments?per_page=100&page={page}", token)
+                comments.extend(rows)
+                if len(rows) < 100:
+                    break
+            else:
+                raise ValueError("comment listing exceeds correlation budget")
+        except RetryableAPIError:
+            print("WAITING_GITHUB_API", flush=True)
+            time.sleep(60)
+            continue
         phase = find_progress(comments, run_id, attempt, item, digest, author)
         accepted = accepted or phase is not None
         result = find_result(
@@ -148,7 +187,7 @@ def main():
         if time.monotonic() >= heartbeat:
             print(f"{item['test_id']} {phase or 'WAITING_WORKER'}", flush=True)
             heartbeat = time.monotonic() + 60
-        time.sleep(12)
+        time.sleep(60)
     raise TimeoutError("TIMED_OUT waiting for assigned worker")
 
 

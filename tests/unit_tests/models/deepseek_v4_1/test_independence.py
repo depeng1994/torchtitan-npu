@@ -76,10 +76,19 @@ registry._make_v41_config = tiny_config
 
 cfg = registry.model_registry("deepseek_v4_1_debugmodel").model
 cfg.vocab_size = cfg.tok_embeddings.num_embeddings = cfg.lm_head.out_features = 64
+from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
+from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_text
+
+adapter = DeepSeekV41StateDictAdapter(cfg, None)
+recipe = deepseek_v4_1_debugmodel_text()
+assert recipe.model_spec.model.layers
+assert not any(name == blocked or name.startswith(blocked + ".")
+               for name in sys.modules for blocked in Blocker.blocked)
+from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 model = build_cpu_model(cfg)
 tokens = torch.arange(128).remainder(32).unsqueeze(0)
-_, _, kwargs = model.build_attention_masks(tokens, tokens, {"positions": torch.arange(128).unsqueeze(0)})
+_, _, kwargs = preprocess(model, tokens, tokens, torch.arange(128).unsqueeze(0))
 out = model(tokens, **kwargs)
 assert torch.isfinite(out).all()
 out.square().mean().backward()

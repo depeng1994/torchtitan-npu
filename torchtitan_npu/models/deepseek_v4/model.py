@@ -3,32 +3,22 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor.experimental._context_parallel._load_balancer import (
-    _HeadTailLoadBalancer,
-)
-from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE
 from torchtitan.distributed.context_parallel import cp_shard
-from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
 from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 
-from torchtitan_npu.models.common.metadata_extension import (
-    LightningIndexerMetadata,
-    MetadataExtension,
-)
+from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import resolve_cp_layout
 
-from .metadata import CompressedVarlenMetadata, build_compressed_varlen_metadata
+from .metadata import DeepSeekV4Metadata
 from .mhc import HcPost, HcPre
 from .mtp import DeepSeekV4MTPDecoder, MTPBatch, prepare_mtp_batch
-from .token_dispatcher import build_cp_plan
 
 if TYPE_CHECKING:
     from .compressor import Indexer
@@ -64,12 +54,12 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         self,
         x: torch.Tensor,
         input_ids: torch.Tensor,
-        attention_masks: AttentionMasksType | None,
+        attention_metadata: DeepSeekV4Metadata | None,
         positions: torch.Tensor | None = None,
     ):
         residual = x
         x, post, comb = self.hc_attn_pre(x)
-        x = self.attention(self.attention_norm(x), attention_masks, positions)
+        x = self.attention(self.attention_norm(x), attention_metadata, positions)
         x = self.hc_post(x, residual, post, comb)
         residual = x
         x, post, comb = self.hc_ffn_pre(x)
@@ -84,12 +74,6 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         vocab_size: int
         compress_ratios: tuple[int, ...]
         n_layers: int
-        window_size: int
-        block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
-        metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
-        lightning_indexer_metadata: LightningIndexerMetadata.Config = field(
-            default_factory=LightningIndexerMetadata.Config
-        )
 
         def update_from_config(self, *, config, **kwargs):
             if hasattr(config, "training"):
@@ -112,9 +96,11 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                         raise ValueError(f"n_groups ({n_groups}) must be divisible by tp ({tp})")
 
             # Context parallel is supported on the AscendC fused path only: the
-            # model's build_attention_masks derives the per-rank dispatch
-            # plan when the trainer passes the CP mesh; the model-dir
-            # reference tier and the golden stay no-CP-only and raise there.
+            # core's own metadata (its records depend on the frames) derives the
+            # rank-local frames when the model's preprocessing hands the CP mesh
+            # to the seam, and only the fused kernels take those frames through
+            # their own metadata.  The compressor is CP-agnostic either way: its
+            # carry is applied by ``CarryExchange`` outside it.
             from .sharding import set_deepseek_v4_sharding_config
 
             set_deepseek_v4_sharding_config(
@@ -146,7 +132,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
             for layers in (self.layers, self.mtp_layers):
                 for layer in layers:
                     attention = layer.attention
-                    inner_attention = attention.compressed_sparse_attention.inner_attention
+                    inner_attention = attention.inner_attention
                     num_flops_per_token += (
                         6 * attention.n_heads * (2 * attention.head_dim) * min(seq_len, inner_attention.window_size)
                     )
@@ -179,125 +165,76 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
 
     def __init__(self, config: Config):
         super().__init__(config)
-        cfg = config
 
         self.lora_config = getattr(config, "lora", None)
-        self.compress_ratios = tuple(cfg.compress_ratios) + tuple(
-            layer.attention.compress_ratio for layer in cfg.mtp_layers
-        )
-        self.window_size = cfg.window_size
-        self.block_size = cfg.block_size
 
-        self._metadata_extension = cfg.metadata_extension.build()
-        self._lightning_indexer_metadata = cfg.lightning_indexer_metadata.build()
-
-    def build_attention_masks(
+    def preprocess_inputs(
         self,
-        inputs,
-        labels,
-        extra_kwargs,
+        input_dict: dict[str, torch.Tensor],
+        labels: torch.Tensor,
         *,
-        cp_mesh: DeviceMesh | None = None,
-        load_balancer_type: str | None = None,
-    ):
-        """The model-owned per-batch metadata construction (the single
-        overridable mask-handling seam).
+        parallel_dims: Any,
+        device: torch.device,
+        parallelism: Any,
+        max_num_documents: int | None = None,
+        max_context_length: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        """Prepare the MTP batch on the global row, then shard both for context parallel.
 
-        One entry for both modes: the common contract
-        (``build_compressed_varlen_metadata``) is always built; under CP
-        ``_build_cp_metadata`` shards the inputs and derives the rank-local
-        plan from the global context in-frame (no plan-time communication);
-        the ``metadata_extension`` (e.g. the reference tier or the AscendC
-        kernel metadata) runs last.
+        The base seam (upstream #4116) builds each attention backend's metadata
+        once per microbatch and shards the inputs for context parallel.  The MTP
+        depths' rolled tokens have to be derived from the *global* row — a shift
+        across a shard boundary is not a shift — so they are prepared here,
+        before the base call, and cut by the same ``cp_shard`` afterwards: the
+        layout is the permutation that shard shards by, so the depths land on the
+        rows that predict them (a local slice, no communication).
+
+        The layout itself -- **chunk ``r`` of every document**, i.e.
+        ``--parallelism.context-parallel-load-balancer doc_chunk`` -- is the seam's:
+        the shard builds its balancer from the row and permutes the replicated row
+        before slicing, so no rank moves anything.  The depths ride the same shard,
+        handed the same row's positions, so the two agree row for row by
+        construction.  Without context parallel or without MTP depths nothing changes.
         """
-        positions = extra_kwargs.get("positions")
+        cp_mesh = parallel_dims.get_mesh("cp") if parallel_dims.cp_enabled else None
+        positions = input_dict.get("positions")
         mtp_batch = None
         if cp_mesh is not None and self.mtp_layers is not None:
             mtp_batch = prepare_mtp_batch(
-                inputs,
+                input_dict["input"],
                 labels,
                 positions,
                 len(self.mtp_layers),
             )
-        masks = self.get_attention_masks(positions=positions)
-        if not isinstance(masks, VarlenMetadata):
-            raise TypeError(
-                "DeepSeek-V4 compression requires a varlen stream (the "
-                "inner attention is varlen-typed), got "
-                f"{type(masks)}."
-            )
-        common = build_compressed_varlen_metadata(masks, self.compress_ratios)
-        if cp_mesh is not None:
-            inputs, labels, positions, common, mtp_batch = self._build_cp_metadata(
-                inputs,
-                labels,
-                positions,
-                common,
-                cp_mesh,
-                load_balancer_type,
-                mtp_batch,
-            )
-            extra_kwargs["positions"] = positions
-        if mtp_batch is not None:
-            extra_kwargs["mtp_batch"] = mtp_batch
-        if self._lightning_indexer_metadata is not None:
-            common = self._lightning_indexer_metadata(common)
-        if self._metadata_extension is not None:
-            common = self._metadata_extension(common)
-        extra_kwargs["attention_masks"] = common
-        return inputs, labels, extra_kwargs
 
-    def _build_cp_metadata(
-        self,
-        inputs,
-        labels,
-        positions,
-        common,
-        cp_mesh,
-        load_balancer_type,
-        mtp_batch,
-    ):
-        """The context-parallel metadata: shard the tensors via the generic
-        path and derive the rank-local plan from the global context (the
-        common metadata's varlen + the load-balancer permutation).
-
-        Returns ``(inputs, labels, positions, metadata, mtp_batch)``."""
-        seq_len = common.seq_len
-        cp_size = cp_mesh.size(0)
-        if seq_len % cp_size != 0:
-            raise ValueError(f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size}).")
-        shard_len = seq_len // cp_size
-        lb = _HeadTailLoadBalancer(seq_len, cp_size, cp_mesh.device_type) if load_balancer_type == "headtail" else None
-        tensors = (inputs, labels, positions)
-        if mtp_batch is not None:
-            tensors += tuple(mtp_batch)
-        tensors, _ = cp_shard(
-            cp_mesh,
-            tensors,
-            None,
-            load_balancer_type,
-            1,
-        )
-        inputs, labels, positions = tensors[:3]
-        if mtp_batch is not None:
-            mtp_batch = MTPBatch(*tensors[3:])
-        rank = cp_mesh.get_local_rank()
-        cp_meta, plans, window = build_cp_plan(
-            common.varlen,
-            lb,
-            rank=rank,
-            cp_size=cp_size,
-            shard_len=shard_len,
-            window_size=self.window_size,
-            ratios=sorted(set(self.compress_ratios)),
-        )
-        return (
-            inputs,
+        inputs, labels, extra_kwargs = super().preprocess_inputs(  # pyrefly: ignore [not-callable]
+            input_dict,
             labels,
-            positions,
-            CompressedVarlenMetadata(varlen=cp_meta, plans=plans, window=window),
-            mtp_batch,
+            parallel_dims=parallel_dims,
+            device=device,
+            parallelism=parallelism,
+            max_num_documents=max_num_documents,
+            max_context_length=max_context_length,
         )
+        if mtp_batch is not None:
+            # Narrowing for the type checker: the branch above only builds the batch with a mesh.
+            assert cp_mesh is not None, "the MTP batch is only prepared under context parallel"
+            # The layout the batch was sharded by, resolved exactly as the decoder resolves it:
+            # an unset flag means "the layout this stack declares", and reading the raw config
+            # value here would cut the depths contiguously while the inputs are permuted.
+            tensors, _ = cp_shard(
+                cp_mesh,
+                tuple(mtp_batch),
+                None,
+                resolve_cp_layout(
+                    parallelism.context_parallel_load_balancer,
+                    extra_kwargs.get("attention_metadata"),
+                ),
+                1,
+                positions=positions,  # pyrefly: ignore [unexpected-keyword]
+            )
+            extra_kwargs["mtp_batch"] = MTPBatch(*tensors)
+        return inputs, labels, extra_kwargs
 
 
 class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):

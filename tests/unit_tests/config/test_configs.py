@@ -14,7 +14,7 @@ from torchtitan.config import TrainingConfig as UpstreamTrainingConfig
 from torchtitan.trainer import Trainer
 
 import torchtitan_npu.config as npu_config
-import torchtitan_npu.extensions.trainer as trainer_module
+import torchtitan_npu.extensions.torchtitan.trainer as trainer_module
 from torchtitan_npu.config import (
     ExtensionConfig,
     MuonOptimizerProfile,
@@ -26,10 +26,9 @@ from torchtitan_npu.config import TrainingConfig as NPUTrainingConfig
 from torchtitan_npu.config import manager as config_manager
 from torchtitan_npu.config.configs import KVNormQuantizationConfig
 from torchtitan_npu.config.converters import TrainerConfigConverter
-from torchtitan_npu.distributed import utils as distributed_utils
-from torchtitan_npu.extensions.graph_trainer import GraphTrainerEx
-from torchtitan_npu.extensions.profiler import CANNProfiler
-from torchtitan_npu.extensions.trainer import TrainerEx
+from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import GraphTrainerEx
+from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
+from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 
 
 def _install_config_registry(
@@ -248,6 +247,56 @@ def test_config_manager_parses_quantization_extension(
     assert quantization.kv_norm_quantization.block_size == 64
 
 
+def test_config_manager_splits_comma_joined_fsdp_prequantize_fqns(monkeypatch, tmp_path):
+    """The A5 launch scripts pass the whitelist as one comma-joined argument."""
+    module_name = "_torchtitan_npu_prequantize_fqns_config_registry"
+
+    def test_config() -> Trainer.Config:
+        return Trainer.Config(hf_assets_path=str(tmp_path))
+
+    _install_config_registry(monkeypatch, module_name, test_config)
+
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            module_name,
+            "--config",
+            "test_config",
+            "--extension.quantization.enable-fsdp-prequantize",
+            "--extension.quantization.fsdp-prequantize-fqns",
+            ".attention.wq_b,.attention.wo_a",
+        ]
+    )
+
+    assert config.extension.quantization.fsdp_prequantize_fqns == [".attention.wq_b", ".attention.wo_a"]
+
+
+def test_config_manager_rejects_space_separated_fsdp_prequantize_fqns(monkeypatch, tmp_path):
+    """The old space-separated multi-value form leaves a stray token and must not parse."""
+    module_name = "_torchtitan_npu_prequantize_fqns_space_config_registry"
+
+    def test_config() -> Trainer.Config:
+        return Trainer.Config(hf_assets_path=str(tmp_path))
+
+    _install_config_registry(monkeypatch, module_name, test_config)
+
+    with pytest.raises(SystemExit) as exit_info:
+        ConfigManager().parse_args(
+            [
+                "--module",
+                module_name,
+                "--config",
+                "test_config",
+                "--extension.quantization.enable-fsdp-prequantize",
+                "--extension.quantization.fsdp-prequantize-fqns",
+                ".attention.wq_b",
+                ".attention.wo_a",
+            ]
+        )
+
+    assert exit_info.value.code != 0
+
+
 def test_kv_norm_quantization_config_validates_its_format():
     """
     Only the format is checked here; the block size is validated by the MX
@@ -442,9 +491,9 @@ def test_trainer_ex_applies_enabled_quantization_before_base_initialization(monk
     events = []
     source_model_spec = object()
     quantized_model_spec = object()
-    converter_module = types.ModuleType("interfaces.torchao_converter")
+    converter_module = types.ModuleType("torchtitan_npu.extensions.adaptor.torchao.converter")
 
-    def apply_quantization(model_spec, quantization_config, *, model_compile_enabled):
+    def apply_quantization(model_spec, quantization_config, *, model_compile_enabled, override_config=None):
         events.append(
             (
                 "quantize",
@@ -467,7 +516,7 @@ def test_trainer_ex_applies_enabled_quantization_before_base_initialization(monk
         events.append(("initialize_base", base_config.model_spec))
 
     converter_module.apply_quantization_converter = apply_quantization
-    monkeypatch.setitem(sys.modules, "interfaces.torchao_converter", converter_module)
+    monkeypatch.setitem(sys.modules, "torchtitan_npu.extensions.adaptor.torchao.converter", converter_module)
     monkeypatch.setattr(trainer_module, "set_allow_hf32", apply_hf32)
     monkeypatch.setattr(TrainerEx.__base__, "__init__", initialize_base_trainer)
 
@@ -497,7 +546,7 @@ def test_trainer_ex_applies_enabled_quantization_before_base_initialization(monk
 def test_trainer_ex_skips_disabled_quantization_and_preserves_model_spec(monkeypatch):
     source_model_spec = object()
     initialized_model_specs = []
-    converter_module = types.ModuleType("interfaces.torchao_converter")
+    converter_module = types.ModuleType("torchtitan_npu.extensions.adaptor.torchao.converter")
 
     def unexpected_quantization(*args, **kwargs):
         raise AssertionError("quantization converter must remain disabled")
@@ -508,7 +557,7 @@ def test_trainer_ex_skips_disabled_quantization_and_preserves_model_spec(monkeyp
         initialized_model_specs.append(base_config.model_spec)
 
     converter_module.apply_quantization_converter = unexpected_quantization
-    monkeypatch.setitem(sys.modules, "interfaces.torchao_converter", converter_module)
+    monkeypatch.setitem(sys.modules, "torchtitan_npu.extensions.adaptor.torchao.converter", converter_module)
     monkeypatch.setattr(trainer_module, "set_allow_hf32", lambda _allow_hf32: None)
     monkeypatch.setattr(TrainerEx.__base__, "__init__", initialize_base_trainer)
 
@@ -564,25 +613,3 @@ def test_trainer_ex_config_build_constructs_trainer_ex(monkeypatch):
     assert len(built_configs) == 1
     assert isinstance(built_configs[0], TrainerEx.Config)
     assert built_configs[0].training.extension.allow_hf32 is False
-
-
-@pytest.mark.parametrize(
-    "allow_hf32",
-    [False, True],
-    ids=("disabled", "enabled"),
-)
-def test_set_allow_hf32_updates_all_backends(monkeypatch, allow_hf32):
-    fake_torch_npu = types.SimpleNamespace(
-        npu=types.SimpleNamespace(
-            matmul=types.SimpleNamespace(allow_hf32=None),
-            conv=types.SimpleNamespace(allow_hf32=None),
-            aclnn=types.SimpleNamespace(allow_hf32=None),
-        )
-    )
-    monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
-
-    distributed_utils.set_allow_hf32(allow_hf32)
-
-    assert fake_torch_npu.npu.matmul.allow_hf32 is allow_hf32
-    assert fake_torch_npu.npu.conv.allow_hf32 is allow_hf32
-    assert fake_torch_npu.npu.aclnn.allow_hf32 is allow_hf32

@@ -14,6 +14,7 @@ from torchtitan_npu.models import deepseek_v4 as dsv4
 from torchtitan_npu.models.deepseek_v4 import lora, parallelize as dsv4_parallelize
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 from tests.unit_tests.models.deepseek_v4.lora_test_utils import _build_model_config
+from tests.unit_tests.models.mtp_test_utils import preprocess
 
 
 @pytest.fixture
@@ -47,7 +48,7 @@ def test_dsv4_special_parameters_follow_model_construction_dtype():
     with torch.device("meta"), utils.set_default_dtype(torch.bfloat16):
         model = spec.model.build()
 
-    adapter_dtypes = {parameter.dtype for name, parameter in model.named_parameters() if "lora_" in name}
+    adapter_dtypes = {parameter.dtype for name, parameter in model.named_parameters() if lora.is_lora_parameter(name)}
     assert adapter_dtypes == {torch.bfloat16}
 
 
@@ -128,7 +129,7 @@ def test_explicit_empty_targets_with_routed_experts_disabled_insert_no_adapters(
     with torch.device("meta"):
         model = spec.model.build()
 
-    assert not [name for name, _ in model.named_parameters() if "lora_" in name]
+    assert not [name for name, _ in model.named_parameters() if lora.is_lora_parameter(name)]
 
 
 @pytest.mark.parametrize("include_mtp", [False, True])
@@ -157,11 +158,13 @@ def test_converter_freezes_base_without_example_wrapper(monkeypatch, parallelize
     spec = dsv4.model_registry("debugmodel", converters=[lora.DeepSeekV4LoRAConverter.Config(rank=2, rank_experts=2)])
     with torch.device("meta"):
         model = spec.model.build()
+        model.register_parameter("pre_lora_cache", torch.nn.Parameter(torch.ones(2)))
     model = spec.parallelize_fn(model, **parallelize_kwargs)
+    assert not model.pre_lora_cache.requires_grad
     assert spec.post_optimizer_build_fn is not None
     parameters = dict(model.named_parameters())
-    assert any("lora_" in name for name in parameters)
-    assert all(parameter.requires_grad == ("lora_" in name) for name, parameter in parameters.items())
+    assert any(lora.is_lora_parameter(name) for name in parameters)
+    assert all(parameter.requires_grad == (lora.is_lora_parameter(name)) for name, parameter in parameters.items())
 
 
 @pytest.mark.parametrize(
@@ -201,18 +204,14 @@ def test_registry_model_forward_backward_freezes_base_and_differentiates_adapter
     model.init_states()
     model = spec.parallelize_fn(model, **parallelize_kwargs)
     inputs = torch.arange(128).reshape(1, 128)
-    inputs, _, kwargs = model.build_attention_masks(
-        inputs,
-        inputs,
-        {"positions": torch.arange(128).reshape(1, 128)},
-    )
+    inputs, _, kwargs = preprocess(model, inputs, inputs, torch.arange(128).reshape(1, 128))
     output = model(inputs, **kwargs)
     assert torch.isfinite(output).all()
     output.float().square().mean().backward()
-    adapters = {name: value for name, value in model.named_parameters() if "lora_" in name}
+    adapters = {name: value for name, value in model.named_parameters() if lora.is_lora_parameter(name)}
     assert adapters
     assert all(value.grad is not None and torch.isfinite(value.grad).all() for value in adapters.values())
-    assert all(value.grad is None for name, value in model.named_parameters() if "lora_" not in name)
+    assert all(value.grad is None for name, value in model.named_parameters() if not lora.is_lora_parameter(name))
 
 
 @pytest.mark.parametrize("use_lora", [False, True])
@@ -247,12 +246,28 @@ def test_shared_parallelization_and_optimizer_hook_preserve_training_mode(
             q = torch.randn(1, 4, 2, 3, requires_grad=True)
             k = torch.randn(1, 2, 3, requires_grad=True)
             w = torch.randn(1, 4, 2, requires_grad=True)
-            mask = torch.ones(1, 1, 4, 2, dtype=torch.bool)
+            picks = torch.tensor([[0, 1]] * 4, dtype=torch.int64).view(1, 4, 2)
+            cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+            cu_seqlens_k = torch.tensor([0, 2], dtype=torch.int32)
             context = partial(create_selective_checkpoint_contexts, list(ac.build().get_save_ops()))
-            _, actual = checkpoint(
-                dsv4.compressor.Indexer.select, q, k, w, mask, 2, use_reentrant=False, context_fn=context
+            actual = checkpoint(
+                dsv4.compressor.student_logits_at_picks,
+                q,
+                k,
+                w,
+                picks,
+                cu_seqlens,
+                cu_seqlens_k,
+                use_reentrant=False,
+                context_fn=context,
             )
-            expected = (torch.einsum("bshd,btd->bsht", q, k).relu() * w.unsqueeze(-1)).sum(2)
+            expected = torch.stack(
+                [
+                    (torch.einsum("hd,d->h", q[0, token], k[0, pick]).relu() * w[0, token]).sum()
+                    for token in range(4)
+                    for pick in (0, 1)
+                ]
+            ).view(1, 4, 2)
             torch.testing.assert_close(actual, expected)
             for result, reference in zip(
                 torch.autograd.grad(actual.sum(), (q, k, w)),
@@ -273,4 +288,4 @@ def test_shared_parallelization_and_optimizer_hook_preserve_training_mode(
     spec.post_optimizer_build_fn(None, [model], None)
     assert register_hook.call_count == (0 if use_lora else 1)
     for name, parameter in model.named_parameters():
-        assert parameter.requires_grad == (not use_lora or "lora_" in name)
+        assert parameter.requires_grad == (not use_lora or lora.is_lora_parameter(name))

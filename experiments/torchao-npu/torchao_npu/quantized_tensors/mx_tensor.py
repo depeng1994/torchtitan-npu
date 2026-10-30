@@ -5,20 +5,27 @@
 
 """MX quantized tensor: a single-axis MX-quantized tensor"""
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch_npu
 from torch.utils._python_dispatch import return_and_correct_aliasing
 
 from torchao_npu import normalize_dim
 from torchao_npu.quantization import _FP4_DTYPES, _SUPPORTED_MX_ELEM_DTYPES
-from torchao_npu.quantization.quant_configs import MXQuantizeConfig
+from torchao_npu.quantization.quant_configs import BlockMXQuantizeConfig, MXQuantizeConfig
+from torchao_npu.quantization.quant_primitives.block_mx import mxfp4_to_block_mx
 from torchao_npu.quantization.quant_primitives.mx import mx_dequantize, mx_quantize
 from torchao_npu.quantized_tensors import (
     logical_qdata_shape,
     permutation_from_transpose,
     resolve_pack_axis,
+    resolve_view_shape,
 )
 from torchao_npu.quantized_tensors.base_quantized_tensor import BaseQuantizedTensor
+
+if TYPE_CHECKING:
+    from torchao_npu.quantized_tensors.block_mx_tensor import BlockMXTensor
 
 aten = torch.ops.aten
 
@@ -29,23 +36,27 @@ class MXTensor(BaseQuantizedTensor):
     Stores the quantized ``qdata`` and its E8M0 ``scale``, together with the
     configs it was built from and the quantization axis.
 
-    Shape support is limited to the axis-preserving ops -- transpose / t /
-    permute / movedim -- which ``__torch_dispatch__`` translates onto ``qdata``
-    and ``scale``, keeping ``quant_axis`` and ``pack_axis`` in sync; dims may not
-    be merged or split. ``mm`` / ``bmm`` / ``addmm`` / ``_grouped_mm`` / ``linear`` /
-    ``matmul`` are intercepted too (see below). Every other op raises
-    ``NotImplementedError``, except the handlers inherited from
+    Shape support covers the axis-preserving ops -- transpose / t / permute /
+    movedim -- which ``__torch_dispatch__`` translates onto ``qdata`` and
+    ``scale``, keeping ``quant_axis`` and ``pack_axis`` in sync (those ops may
+    not merge or split dims). ``view`` / ``_unsafe_view`` instead re-factor the
+    leading dims, only when the quant axis is the last dim and
+    innermost-contiguous (and, for FP4, the pack axis is that same last dim);
+    the last dim may change only between multiples of ``2 * block_size`` (whole
+    packed block pairs). ``mm`` / ``bmm`` / ``addmm`` / ``_grouped_mm`` /
+    ``linear`` / ``matmul`` are intercepted too (see below). Every other op
+    raises ``NotImplementedError``, except the handlers inherited from
     :class:`~torchao_npu.quantized_tensors.base_quantized_tensor.BaseQuantizedTensor`.
 
     Matmul: the right operand is the weight and must be an ``MXTensor``
     quantized along ``dim=-2`` (the contracting dim); the left operand is either
     an ``MXTensor`` quantized along ``dim=-1`` (the contracting dim), which must
-    have been quantized with the right operand's ``act_quant_config``, or a
+    match the right operand's ``act_quant_config`` when it is set, or a
     high-precision tensor, which is quantized on the fly along ``dim=-1`` with
     that config -- a ``RuntimeError`` is raised when it is unset. The product is
     computed by the NPU kernels from the stored ``qdata``/``scale``, without
-    re-quantizing, and returned as a plain high-precision tensor. Inference only:
-    there is no backward.
+    re-quantizing, and returned as a plain high-precision tensor. There is no
+    backward.
 
     ``torch.matmul`` is only partially supported: it may apply various shape
     operations to an ``MXTensor`` operand, and raises an error for any of them
@@ -66,8 +77,7 @@ class MXTensor(BaseQuantizedTensor):
         scale: ``float8_e8m0fnu`` block scales with ndim = ``qdata.ndim + 1``, readers are
             referred to the doc of ``torch_npu.npu_dynamic_mx_quant`` for its shape details.
 
-        orig_dtype: The original high-precision dtype before quantization;
-            also this tensor's logical (outer) dtype.
+        dtype: The logical (high-precision) dtype this tensor presents; the dtype the values had before quantization.
 
         quant_axis: Non-negative dim along which the tensor is quantized.
 
@@ -85,7 +95,7 @@ class MXTensor(BaseQuantizedTensor):
 
     tensor_data_names = ["qdata", "scale"]
     tensor_attribute_names = [
-        "orig_dtype",
+        "dtype",
         "quant_axis",
         "quant_config",
         "act_quant_config",
@@ -96,21 +106,21 @@ class MXTensor(BaseQuantizedTensor):
         cls,
         qdata: torch.Tensor,
         scale: torch.Tensor,
-        orig_dtype: torch.dtype,
+        dtype: torch.dtype,
         quant_axis: int,
         quant_config: MXQuantizeConfig,
         act_quant_config: MXQuantizeConfig | None = None,
         pack_axis: int | None = None,
+        requires_grad: bool = False,
     ):
+        # Leave strides/storage_offset/layout at their defaults derived by torch:
+        # the metadata describes the logical (high-precision) tensor as a dense one.
         self = torch.Tensor._make_wrapper_subclass(
             cls,
             logical_qdata_shape(qdata, pack_axis),
-            strides=qdata.stride(),
-            storage_offset=qdata.storage_offset(),
-            layout=qdata.layout,
-            dtype=orig_dtype,
+            dtype=dtype,
             device=qdata.device,
-            requires_grad=False,
+            requires_grad=requires_grad,
         )
         return self
 
@@ -118,11 +128,12 @@ class MXTensor(BaseQuantizedTensor):
         self,
         qdata: torch.Tensor,
         scale: torch.Tensor,
-        orig_dtype: torch.dtype,
+        dtype: torch.dtype,
         quant_axis: int,
         quant_config: MXQuantizeConfig,
         act_quant_config: MXQuantizeConfig | None = None,
         pack_axis: int | None = None,
+        requires_grad: bool = False,
     ):
         elem_dtype = quant_config.elem_dtype
         if elem_dtype not in _SUPPORTED_MX_ELEM_DTYPES:
@@ -149,7 +160,6 @@ class MXTensor(BaseQuantizedTensor):
         self.act_quant_config = act_quant_config
         self.quant_config = quant_config
         self.quant_axis = normalize_dim(quant_axis, qdata.ndim)
-        self.orig_dtype = orig_dtype
         self.pack_axis = normalize_dim(pack_axis, qdata.ndim) if pack_axis is not None else None
 
     @classmethod
@@ -160,17 +170,29 @@ class MXTensor(BaseQuantizedTensor):
         axis: int,
         act_quant_config: MXQuantizeConfig | None = None,
     ) -> "MXTensor":
-        """Quantize a high-precision ``tensor`` along ``axis`` into an ``MXTensor``."""
+        """Quantize a high-precision ``tensor`` along ``axis`` into an ``MXTensor``.
+
+        The returned tensor inherits ``requires_grad`` from ``tensor``.
+        """
         axis = normalize_dim(axis, tensor.ndim)
         qdata, scale = mx_quantize(tensor, axis, quant_config)
         pack_axis = resolve_pack_axis(qdata) if qdata.dtype is torch.float4_e2m1fn_x2 else None
-        return cls(qdata, scale, tensor.dtype, axis, quant_config, act_quant_config, pack_axis)
+        return cls(
+            qdata,
+            scale,
+            tensor.dtype,
+            axis,
+            quant_config,
+            act_quant_config,
+            pack_axis,
+            requires_grad=tensor.requires_grad,
+        )
 
     def dequantize(self, output_dtype: torch.dtype | None = None) -> torch.Tensor:
-        """Dequantize back to ``orig_dtype``, or to ``output_dtype`` when given.
+        """Dequantize back to ``dtype``, or to ``output_dtype`` when given.
 
         Args:
-            output_dtype: The dtype of the returned tensor, ``orig_dtype`` when ``None``. Must be
+            output_dtype: The dtype of the returned tensor, ``dtype`` when ``None``. Must be
                 a dtype the dequantization op supports: ``torch.float32``, ``torch.bfloat16`` or
                 ``torch.float16``.
 
@@ -183,7 +205,46 @@ class MXTensor(BaseQuantizedTensor):
             self.quant_axis,
             block_size=self.quant_config.block_size,
             src_dtype=self.quant_config.elem_dtype,
-            output_dtype=self.orig_dtype if output_dtype is None else output_dtype,
+            # pyrefly: ignore [missing-attribute]
+            output_dtype=self.dtype if output_dtype is None else output_dtype,
+        )
+
+    def to_block_mx(self, quant_config: BlockMXQuantizeConfig) -> "BlockMXTensor":
+        """Convert this MXFP4 tensor into its Block MX form.
+
+        Args:
+            quant_config: The Block MX configuration of the returned tensor.
+
+        Returns:
+            A :class:`BlockMXTensor` with this tensor's logical shape,
+            ``dtype`` and ``act_quant_config``.
+        """
+        assert self.quant_axis == self.pack_axis, (
+            "The conversion is supported only when self.quant_axis == self.pack_axis, "
+            f"got self.quant_axis={self.quant_axis}, self.pack_axis={self.pack_axis}"
+        )
+        if quant_config.mxfp4_fake_quantize_config is not None:
+            assert self.quant_config == quant_config.mxfp4_fake_quantize_config, (
+                f"self.quant_config ({self.quant_config}) is not consistent with the target quant_config "
+                f"{quant_config.mxfp4_fake_quantize_config}"
+            )
+
+        q, s1, s2 = mxfp4_to_block_mx(
+            self.qdata, self.scale, self.quant_config, quant_config, quant_axis=self.quant_axis
+        )
+
+        # Imported here because ``block_mx_tensor`` imports this module.
+        from torchao_npu.quantized_tensors.block_mx_tensor import BlockMXTensor
+
+        return BlockMXTensor(
+            q,
+            s1,
+            s2,
+            self.dtype,  # pyrefly: ignore [missing-attribute]
+            quant_config,
+            self.act_quant_config,
+            None,
+            requires_grad=self.requires_grad,  # pyrefly: ignore [missing-attribute]
         )
 
 
@@ -208,7 +269,7 @@ def _permute(x: MXTensor, perm: list[int]) -> MXTensor:
     return MXTensor(
         x.qdata.permute(perm),
         x.scale.permute(scale_perm),
-        x.orig_dtype,
+        x.dtype,
         new_axis,
         x.quant_config,
         x.act_quant_config,
@@ -242,13 +303,96 @@ def _(func, types, args, kwargs):
     return return_and_correct_aliasing(func, args, kwargs, _permute(x, perm))
 
 
+def _view(func, x: MXTensor, new_shape: tuple[int, ...]) -> MXTensor:
+    """Re-shape ``x``, allowing only the changes its quantization axis can follow.
+
+    A re-shape is only supported when
+
+    * the quant axis is the last dim -- its block boundaries may not move;
+    * that axis is innermost-contiguous in ``qdata`` (``stride == 1``), the layout
+      the MX kernels consume;
+    * for FP4, the pack axis is that same last dim -- its packed pairs may not be split;
+    * the last dim either keeps its size, or changes between sizes that are both
+      multiples of ``2 * block_size`` -- every row then holds whole packed block pairs,
+      so merging or splitting rows preserves the flat pair sequence.
+
+    ``scale`` follows the same split: with the last dim unchanged it keeps its trailing
+    ``(blocks, 2)`` dims; when the last dim changes, both sides are pair-aligned, so the
+    flat pair sequence is preserved and it takes ``(dst[-1] // (2 * block_size), 2)``.
+    Both ``view`` and ``_unsafe_view`` re-view the components strictly; neither copies.
+
+    Args:
+        func: The ``aten`` op being handled, named in the messages.
+        x: The tensor to re-shape.
+        new_shape: The requested shape, possibly holding one ``-1``.
+
+    Returns:
+        An :class:`MXTensor` whose components are views of ``x``'s.
+
+    Raises:
+        ValueError: If an unsupported re-shape is requested.
+    """
+    src_shape = x.shape
+    dst_shape = resolve_view_shape(x.numel(), new_shape)  # logical numel; FP4's qdata is halved
+
+    if x.quant_axis != x.ndim - 1:
+        raise ValueError(
+            f"{type(x).__name__}'s {func.name()} requires the quant axis to be the last dim, "
+            f"got quant_axis={x.quant_axis} for a {x.ndim}D tensor."
+        )
+    if x.qdata.stride(x.quant_axis) != 1:
+        raise ValueError(
+            f"{type(x).__name__}'s {func.name()} requires an innermost-contiguous quant axis, "
+            f"got stride({x.quant_axis})={x.qdata.stride(x.quant_axis)} for ``qdata``."
+        )
+    if x.qdata.dtype in _FP4_DTYPES and x.pack_axis != normalize_dim(-1, x.ndim):
+        raise ValueError(
+            f"{type(x).__name__}'s {func.name()} requires pack_axis to be the last dim for FP4, "
+            f"got pack_axis={x.pack_axis}."
+        )
+    if not dst_shape:
+        raise ValueError(f"{type(x).__name__}'s {func.name()} must yield at least a 1D tensor, got {dst_shape}.")
+    packed_block_size = 2 * x.quant_config.block_size
+    if dst_shape[-1] != src_shape[-1] and (src_shape[-1] % packed_block_size or dst_shape[-1] % packed_block_size):
+        raise ValueError(
+            f"{type(x).__name__}'s {func.name()} can only change the last dim between multiples of "
+            f"{packed_block_size} (whole packed block pairs); got {src_shape[-1]} -> {dst_shape[-1]}."
+        )
+
+    # ``qdata``'s last dim is stored, not logical: FP4 packs two values per element
+    # along the quant axis, so the target's last dim is halved.
+    # ``scale`` keeps its trailing ``(blocks, 2)`` dims when the last dim is unchanged;
+    # otherwise both sides are pair-aligned and its blocks-per-row count is recomputed.
+    # Forwarding ``func`` re-views each component with the same op.
+    qdata_last = dst_shape[-1] // 2 if x.qdata.dtype in _FP4_DTYPES else dst_shape[-1]
+    scale_blocks = x.scale.shape[-2] if dst_shape[-1] == src_shape[-1] else dst_shape[-1] // packed_block_size
+    qdata = func(x.qdata, (*dst_shape[:-1], qdata_last))
+    scale = func(x.scale, (*dst_shape[:-1], scale_blocks, x.scale.shape[-1]))
+    # The quant axis stays last; FP4's pack axis is that same last dim.
+    pack_axis = -1 if x.pack_axis is not None else None
+    return MXTensor(qdata, scale, x.dtype, -1, x.quant_config, x.act_quant_config, pack_axis)
+
+
+@implements(aten.view.default)
+def _(func, types, args, kwargs):
+    x, new_shape = args[0], args[1]
+    return return_and_correct_aliasing(func, args, kwargs, _view(func, x, tuple(new_shape)))
+
+
+@implements(aten._unsafe_view.default)
+def _(func, types, args, kwargs):
+    # Not an aliasing op per its schema; the re-view shares the components either way.
+    x, new_shape = args[0], args[1]
+    return _view(func, x, tuple(new_shape))
+
+
 def _matmul_operands(A: torch.Tensor, B: torch.Tensor) -> tuple[MXTensor, MXTensor]:
     """Validate a matmul operand pair and return both operands as :class:`MXTensor`.
 
     The right operand is the weight: it must already be an :class:`MXTensor`
     quantized along ``dim=-2`` (the contracting dim). The left operand is either
     an :class:`MXTensor` quantized along ``dim=-1`` (the contracting dim) and
-    with the right operand's ``act_quant_config``, or a high-precision tensor,
+    matching the right operand's ``act_quant_config`` when set, or a high-precision tensor,
     which is quantized here along ``dim=-1`` with that config.
 
     Args:
@@ -264,12 +408,12 @@ def _matmul_operands(A: torch.Tensor, B: torch.Tensor) -> tuple[MXTensor, MXTens
             - If ``B`` is not an :class:`MXTensor`;
             - If either operand is quantized along the wrong dim;
             - If an :class:`MXTensor` ``A`` was not quantized with
-              ``B.act_quant_config``;
-            - If ``A`` is a quantized tensor of another class.
+              ``B.act_quant_config`` when that config is set;
+            - If ``A`` is a quantized tensor of another class;
+            - If the two operands' ``quant_config.block_size`` differ.
 
-        RuntimeError: If ``A`` is a high-precision tensor with
-            ``requires_grad=True``, or if ``B`` carries no ``act_quant_config``
-            to quantize a high-precision ``A`` with.
+        RuntimeError: If ``A`` is a high-precision tensor and ``B`` carries no
+            ``act_quant_config`` to quantize it with.
     """
     if A.shape[-1] != B.shape[-2]:
         raise ValueError(f"Contracting dim mismatch: {A.shape[-1]} != {B.shape[-2]}.")
@@ -284,7 +428,7 @@ def _matmul_operands(A: torch.Tensor, B: torch.Tensor) -> tuple[MXTensor, MXTens
         if A.quant_axis != A.ndim - 1:
             raise ValueError(f"The left matmul operand must be quantized along dim=-1, got quant_axis={A.quant_axis}.")
 
-        if A.quant_config != B.act_quant_config:
+        if B.act_quant_config is not None and A.quant_config != B.act_quant_config:
             raise ValueError(
                 f"The left matmul operand must be quantized with the right operand's ``act_quant_config``; "
                 f"got quant_config={A.quant_config} and act_quant_config={B.act_quant_config}."
@@ -296,12 +440,6 @@ def _matmul_operands(A: torch.Tensor, B: torch.Tensor) -> tuple[MXTensor, MXTens
         )
 
     else:
-        if A.requires_grad:
-            raise RuntimeError(
-                f"{MXTensor.__name__} matmul is inference-only and has no backward; "
-                f"got a left operand with requires_grad=True."
-            )
-
         if B.act_quant_config is None:
             raise RuntimeError(
                 "The left operand is a high-precision tensor, but the right operand carries no "
@@ -309,6 +447,12 @@ def _matmul_operands(A: torch.Tensor, B: torch.Tensor) -> tuple[MXTensor, MXTens
             )
 
         A = MXTensor.from_hp(A, B.act_quant_config, axis=-1)
+
+    if A.quant_config.block_size != B.quant_config.block_size:
+        raise ValueError(
+            "The operands must agree on ``block_size``, got "
+            f"{A.quant_config.block_size} for ``A`` and {B.quant_config.block_size} for ``B``."
+        )
 
     return A, B
 

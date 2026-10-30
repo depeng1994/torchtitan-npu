@@ -7,23 +7,33 @@ from types import SimpleNamespace
 
 import torch
 
-from torchtitan_npu.extensions.components.gradient_clipping import GradientClippingTrainer
 from torchtitan_npu.models.deepseek_v4_1 import config_registry
 from torchtitan_npu.models.deepseek_v4_1.indexer import FULL, Selector
+
+
+class _FusedStandIn(Selector):
+    """A stand-in for a fused port: the trainer discovers those by class, not by a flag.
+
+    The real ports subclass :class:`Selector` (and the reference selector is the only module
+    whose exact class is ``Selector``), which is what ``TrainerEx`` keys the step denominator on.
+    """
 
 
 def test_step_denominator_counts_queries_across_accumulation_and_data_ranks(monkeypatch):
     config = Selector.Config(
         mode=FULL, compress_ratio=2, num_index_heads=2, index_head_dim=4, index_topk=4
     )
-    selector, reference = Selector(config), Selector(config)
-    selector.consumes_indexer_teacher = True
+    selector, reference = _FusedStandIn(config), Selector(config)
 
     def initialize(self, config):
         self.model_parts = [torch.nn.ModuleList([selector, reference])]
+        self.anticipatory_schedule = None
 
-    monkeypatch.setattr(GradientClippingTrainer, "__init__", initialize)
-    trainer = config_registry.DeepSeekV41Trainer(None)
+    monkeypatch.setattr(config_registry.TrainerEx, "__init__", initialize)
+    job = SimpleNamespace(
+        override=SimpleNamespace(imports=["torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc"])
+    )
+    trainer = config_registry.DeepSeekV41Trainer(job)
     trainer.device = torch.device("cpu")
     mesh = object()
     trainer.parallel_dims = SimpleNamespace(dp_enabled=True, get_mesh=lambda name: mesh)
@@ -45,8 +55,8 @@ def test_step_denominator_counts_queries_across_accumulation_and_data_ranks(monk
         torch.testing.assert_close(selector.num_global_queries, torch.tensor(32.0))
 
     monkeypatch.setattr(config_registry.dist_utils, "dist_sum_tensor", reduce_count)
-    monkeypatch.setattr(GradientClippingTrainer, "train_step", run_step)
-    monkeypatch.setattr(GradientClippingTrainer, "forward_backward_step", run_microbatch)
+    monkeypatch.setattr(config_registry.GradientClippingTrainer, "train_step", run_step)
+    monkeypatch.setattr(config_registry.TrainerEx, "forward_backward_step", run_microbatch)
     trainer.train_step(iter(batches))
     assert reference.num_global_queries is None
     assert len(reductions) == 1

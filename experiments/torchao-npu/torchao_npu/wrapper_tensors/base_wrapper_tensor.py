@@ -88,6 +88,10 @@ else:
     _ops_to_preserve_subclass.add(torch.ops.spmd_types.replicate_to_varying.default)
 
 
+# Packed FP4 has no NPU dim-0 copy kernel, so it pads via the uint8 byte view.
+_PAD_SUBBYTE_UINT8_VIEW_DTYPES = {torch.float4_e2m1fn_x2}
+
+
 def _pad_uneven_shard_dim0(
     inputs: tuple[torch.Tensor, ...],
     outer_size: torch.Size,
@@ -97,8 +101,9 @@ def _pad_uneven_shard_dim0(
 
     ``fsdp_pre_all_gather`` must return the padded shard size or the padded
     rank alone fails the all-gather size assert and the collective hangs.
-    Only dim 0 can shard unevenly, and the gathered padding tail is dropped
-    by FSDP2 via ``as_strided(_orig_size)``.
+    Only dim 0 can shard unevenly. Callers trim the pad tail: FSDP2 drops it
+    via ``as_strided(_orig_size)``; multi-input payloads narrow it back in
+    their ``fsdp_post_all_gather``.
     """
     if world_size <= 1 or outer_size[0] % world_size == 0:
         return inputs
@@ -107,6 +112,11 @@ def _pad_uneven_shard_dim0(
     def pad_dim0(t: torch.Tensor) -> torch.Tensor:
         if t.size(0) >= padded_dim0:
             return t
+        if t.dtype in _PAD_SUBBYTE_UINT8_VIEW_DTYPES:
+            packed = t.view(torch.uint8)
+            padded = packed.new_zeros((padded_dim0, *packed.shape[1:]))
+            padded.narrow(0, 0, packed.size(0)).copy_(packed)
+            return padded.view(t.dtype)
         padded = t.new_zeros((padded_dim0, *t.shape[1:]))
         padded.narrow(0, 0, t.size(0)).copy_(t)
         return padded
@@ -127,7 +137,7 @@ class BaseTrainingWeightWrapperTensor(TorchAOBaseTensor):
 
     Carries decoupled weight/activation configs (either may be absent) and
     provides deferred-op infrastructure (subclass-preserving slicing/indexing,
-    FSDP2 hooks, ``__deepcopy__``, ``to_tensor``, ``requires_grad_`` sync)
+    FSDP2 hooks, ``__deepcopy__``, ``to_tensor``)
     usable by both fake-quantize and real-low-precision subclasses.
 
     Supports FSDP2 via :meth:`fsdp_pre_all_gather` and :meth:`fsdp_post_all_gather`,
@@ -172,6 +182,7 @@ class BaseTrainingWeightWrapperTensor(TorchAOBaseTensor):
         weight_config: FakeQuantizeConfigBase | None = None,
         activation_config: FakeQuantizeConfigBase | None = None,
     ):
+        # Preserve supplied storage when re-wrapping collective outputs.
         self._data = tensor
         self.weight_config = weight_config
         self.activation_config = activation_config
@@ -279,11 +290,7 @@ class BaseTrainingWeightWrapperTensor(TorchAOBaseTensor):
             weight_config=copy.deepcopy(self.weight_config),
         )
 
-        # self.requires_grad triggers __torch_function__ of self, use `DisableTorchFunctionSubclass`
-        # to avoid the NotImplementedError error if BaseTrainingWeightWrapperTensor is used.
-        with torch._C.DisableTorchFunctionSubclass():
-            result.requires_grad = self.requires_grad  # pyrefly: ignore [missing-attribute]
-
+        result.requires_grad_(self.requires_grad)  # pyrefly: ignore [missing-attribute]
         return result
 
     def __repr__(self):
@@ -308,15 +315,6 @@ class BaseTrainingWeightWrapperTensor(TorchAOBaseTensor):
             activation_config=tensor_attributes["activation_config"],
             weight_config=tensor_attributes["weight_config"],
         )
-
-    def requires_grad_(self, requires_grad: bool = True):
-        # requires_grad_ bypasses both __torch_function__ and __torch_dispatch__,
-        # so it only sets the flag on the wrapper. Need to keep _data in sync, otherwise
-        # Dynamo sees _data.requires_grad=False and may drop custom autograd.Function
-        # backward during tracing, causing eager/compile gradient mismatches.
-        super().requires_grad_(requires_grad)
-        self._data.requires_grad_(requires_grad)
-        return self
 
     def to_tensor(self) -> torch.Tensor:
         """Return the underlying raw tensor, unwrapping the subclass."""

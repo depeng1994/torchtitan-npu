@@ -15,11 +15,10 @@
 """Per-document pooling alignment for the pinned text data path.
 
 Models with a compressed KV pool each group of ``R`` consecutive tokens into one
-main-KV entry, and the indexer addresses that entry axis as ``doc_ids[:, j * R]``.  A
-document whose token count is not a multiple of ``R`` therefore gets a partial
+main-KV entry, and the indexer addresses that entry axis as the row's boundaries over
+``R``.  A document whose token count is not a multiple of ``R`` therefore gets a partial
 trailing group that the *next* document's tokens complete: the pooled value mixes two
-documents, and the entry stays selectable by the first document's queries because its
-document is read off its first token.
+documents, and the boundaries no longer say which document the group belongs to.
 
 Padding every packed document segment up to a multiple of the model's alignment keeps
 each group inside one document.  The pad stays inside its segment -- positions keep
@@ -88,10 +87,12 @@ def pad_segments_to_multiple(segment: tuple, *, multiple: int) -> tuple:
 class AlignedTextDataset(HuggingFaceTextDataset):
     """``HuggingFaceTextDataset`` with per-document pooling alignment.
 
-    The alignment makes a document that fits in one row pool exactly.  It does not
-    extend to the row cut: a document longer than ``seq_len`` is still chunked by the
-    generic row cut, and the continuation row starts its own group grid, so a group can
-    straddle the cut.
+    The alignment makes a document that does not straddle a row cut pool
+    exactly.  It does not extend to the row cut: the cut lands on a block boundary
+    (``seq_len`` and every padded segment are multiples of the alignment), not
+    necessarily on a document boundary, so a document that spans it -- a long one,
+    or any one that starts too late in the row to fit -- is still chunked there and
+    the continuation row starts its own group grid, so a group can straddle the cut.
     """
 
     def __init__(

@@ -6,7 +6,7 @@
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](#特性支持概览)
 [![license](https://img.shields.io/badge/license-BSD_3--Clause-lightgrey.svg)](https://gitcode.com/cann/torchtitan-npu/tree/master/LICENSE)
-[![contributing](https://img.shields.io/badge/CONTRIBUTING-teal)](https://gitcode.com/cann/torchtitan-npu/blob/master/CONTRIBUTING.md)
+[![contributing](https://img.shields.io/badge/CONTRIBUTING-teal)](https://gitcode.com/cann/torchtitan-npu/blob/master/docs/community/governance.md)
 [![SIG](https://img.shields.io/badge/SIG-framework--adapter-yellow)](https://gitcode.com/cann/community/tree/master/CANN/sigs/framework-adapter)
 [![pypi](https://img.shields.io/badge/pypi-0.2.2.post2-blue)](https://pypi.org/project/torchtitan-npu/)
 [![zread](https://img.shields.io/badge/Ask_Zread-_.svg?style=plastic&color=00b0aa&labelColor=000000&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTQuOTYxNTYgMS42MDAxSDIuMjQxNTZDMS44ODgxIDEuNjAwMSAxLjYwMTU2IDEuODg2NjQgMS42MDE1NiAyLjI0MDFWNC45NjAxQzEuNjAxNTYgNS4zMTM1NiAxLjg4ODEgNS42MDAxIDIuMjQxNTYgNS42MDAxSDQuOTYxNTZDNS4zMTUwMiA1LjYwMDEgNS42MDE1NiA1LjMxMzU2IDUuNjAxNTYgNC45NjAxVjIuMjQwMUM1LjYwMTU2IDEuODg2NjQgNS4zMTUwMiAxLjYwMDEgNC45NjE1NiAxLjYwMDFaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00Ljk2MTU2IDEwLjM5OTlIMi4yNDE1NkMxLjg4ODEgMTAuMzk5OSAxLjYwMTU2IDEwLjY4NjQgMS42MDE1NiAxMS4wMzk5VjEzLjc1OTlDMS42MDE1NiAxNC4xMTM0IDEuODg4MSAxNC4zOTk5IDIuMjQxNTYgMTQuMzk5OUg0Ljk2MTU2QzUuMzE1MDIgMTQuMzk5OSA1LjYwMTU2IDE0LjExMzQgNS42MDE1NiAxMy43NTk5VjExLjAzOTlDNS42MDE1NiAxMC42ODY0IDUuMzE1MDIgMTAuMzk5OSA0Ljk2MTU2IDEwLjM5OTlaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik0xMy43NTg0IDEuNjAwMUgxMS4wMzg0QzEwLjY4NSAxLjYwMDEgMTAuMzk4NCAxLjg4NjY0IDEwLjM5ODQgMi4yNDAxVjQuOTYwMUMxMC4zOTg0IDUuMzEzNTYgMTAuNjg1IDUuNjAwMSAxMS4wMzg0IDUuNjAwMUgxMy43NTg0QzE0LjExMTkgNS42MDAxIDE0LjM5ODQgNS4zMTM1NiAxNC4zOTg0IDQuOTYwMVYyLjI0MDFDMTQuMzk4NCAxLjg4NjY0IDE0LjExMTkgMS42MDAxIDEzLjc1ODQgMS42MDAxWiIgZmlsbD0iI2ZmZiIvPgo8cGF0aCBkPSJNNCAxMkwxMiA0TDQgMTJaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00IDEyTDEyIDQiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K&logoColor=ffffff)](https://zread.ai/hicann/torchtitan-npu)
@@ -17,7 +17,7 @@
 
 ---
 
-`torchtitan-npu`定位为`torchtitan`的昇腾（Ascend）后端扩展插件，通过即插即用的硬件亲和性优化，充分释放NPU算力，助力`PyTorch native`训练在昇腾平台无缝、高效、稳定地运行。
+`torchtitan-npu`定位为CANN社区基于`torchtitan`在昇腾（Huawei Ascend）上的训练recipe，通过即插即用的硬件亲和性优化，充分释放NPU算力，助力`PyTorch native`训练在昇腾平台无缝、高效、稳定地运行。
 
 本插件通过 torchtitan 配置级 override 和 PyTorch backend 注册机制扩展上游能力，涵盖 NPU 融合算子、显存管理、分布式并行以及调试维测等能力。
 
@@ -232,34 +232,40 @@ pip install -e .
 
 # 项目结构
 
-`torchtitan-npu` 是 `torchtitan` 的 Ascend NPU 适配层，主要通过三类机制扩展上游能力：`override/` 使用配置级 `@override` 替换组件，并通过 `override.imports` 显式启用；`patches/` 补齐 PyTorch NPU backend 缺口，以及当前依赖版本尚未包含的临时上游能力；`extensions/` 提供 NPU 的扩展能力。模型实现与并行化策略放在 `models/`，CANN 和设备专属算子封装放在 `ops/`。此外，`config/` 提供配置注册与管理，`compile/` 提供编译期扩展，`distributed/` 提供 NPU 后端 HF32 控制。
+`torchtitan-npu` 是 `torchtitan` 的 Ascend NPU 适配层，主要通过三类机制扩展上游能力：`override/` 使用配置级 `@override` 替换组件，并通过 `override.imports` 显式启用；`patches/` 补齐 PyTorch NPU backend 缺口，以及当前依赖版本尚未包含的临时上游能力；`extensions/` 提供 NPU 的训练组件、编译和运行期扩展，其中只有包入口显式导入的模块会自动生效，其他模块按调用路径加载。模型实现与并行化策略放在 `models/`，CANN 和设备专属算子封装放在 `ops/`，`config/` 提供配置 schema 与转换，`tools/` 提供随 Python package 分发的离线工具。
 
 ```text
 torchtitan-npu/
 ├── torchtitan_npu/
-│   ├── models/                    # 模型实现与并行化（DeepSeek-V3.2/V4/V4.1、Qwen3.5）
-│   ├── override/                  # 配置级组件替换，含 common 与各模型专属目录
-│   ├── patches/                   # 补齐 PyTorch NPU backend 缺口与临时上游能力
-│   ├── extensions/                # 随 package 导入自动生效的运行时扩展
-│   │   ├── components/            # 训练组件扩展（checkpoint/metrics 等）
-│   │   ├── experiment/            # 实验性质的特性
-│   │   │   └── torchft/           # TorchFT 容错训练适配
-│   │   ├── novaswap/              # NovaSwap 显存交换扩展
-│   │   └── tools/                 # 工具扩展
 │   ├── config/                    # 配置注册与管理（configs/manager 等）
-│   ├── compile/                   # 编译期扩展（SDC checksum pass）
-│   ├── distributed/               # NPU 后端 HF32 控制（set_allow_hf32）
+│   ├── patches/                   # PyTorch/torch_npu 补丁与临时上游能力
+│   ├── extensions/                # 永久训练、编译和运行期扩展
+│   │   ├── torchtitan/            # 按上游 torchtitan 目录镜像的扩展
+│   │   │   ├── components/        # checkpoint、metrics、LoRA、optimizer 扩展
+│   │   │   ├── distributed/       # FSDP 扩展
+│   │   │   ├── experiments/       # GraphTrainer 与 TorchFT 扩展
+│   │   │   └── tools/             # profiler 与上游工具扩展
+│   │   ├── adaptor/               # TorchAO-NPU 等可选外部包适配，按需导入
+│   │   ├── compile/               # 编译期扩展（SDC checksum pass）
+│   │   ├── components/            # 本仓训练组件及接线逻辑
+│   │   ├── cpu_offload/           # CPU offload 运行时与 staging
+│   │   ├── distributed/           # 梯度累积与梯度裁剪扩展
+│   │   ├── experiment/            # Anticipatory Routing、CV Parallel 等实验能力
+│   │   ├── mx_storage_reader/     # MX 量化权重读取能力
+│   │   └── novaswap/              # NovaSwap 显存交换扩展
+│   ├── override/                  # 配置级组件替换，含 common 与模型专属目录
+│   ├── models/                    # 模型实现与并行化（DeepSeek-V3.2/V4/V4.1、Qwen3.5）
 │   ├── ops/                       # CANN 与 NPU 专属算子封装
 │   │   ├── ascendc/               # AscendC 算子适配（导入时自动加载）
 │   │   ├── misc/                  # 杂项算子
 │   │   ├── pypto/                 # PyPTO 算子
 │   │   ├── tilelang/              # TileLang 融合算子
 │   │   └── triton/                # Triton 算子（MHC/GDN 等）
+│   ├── tools/                     # 随 package 分发的 checkpoint 转换与导出工具
 │   ├── __init__.py                # 导入 package patch 与 extension
 │   └── train.py                   # 训练入口
 ├── examples/                      # 各模型训练示例脚本与说明
 ├── experiments/                   # 实验性适配包（torchao-npu 量化）
-├── interfaces/                    # 量化接入接口（torchao_converter）
 ├── scripts/                       # 训练与仓库辅助脚本
 ├── tests/                         # 单元测试和测试数据
 └── docs/                          # 使用指南与设计说明

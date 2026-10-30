@@ -47,7 +47,7 @@ override，用于消融或定位问题。
 
 本目录的入口脚本与仓库通用的 `scripts/run_train.sh` 使用相同的参数透传方式：
 脚本只设置模型、数据和多模态参数默认值，所有训练参数继续交给
-`torchtitan.train`。上游目录按以下优先级解析：
+`torchtitan_npu.train`。上游目录按以下优先级解析：
 
 1. `TORCHTITAN_REPO`；
 2. `TORCHTITAN_DIR`（`.ci/common.sh` 会导出此变量指向 third_party 克隆）；
@@ -73,16 +73,16 @@ TorchTitan 提供：
 
 ```text
 qwen3_5_debugmodel_1p_cpt_512.sh
-  ÚÄ 组装 tokenizer、cc12m-test、override.imports 和用户参数
-  ÚÄ scripts/run_train.sh -> torchrun -m torchtitan_npu.train
-       ÚÄ torchtitan_npu.models.qwen3_5 导入时安装视觉/MRoPE/FLA patch
-       ÚÄ 上游 config_registry 构造 qwen35_debugmodel(_moe)
-       ÚÄ GDN override 替换 delta kernel；可选 dispatcher 替换 MoE dispatch
-       ÚÄ parallelize_qwen3_5_npu 建立 TP/EP/FSDP；CP 使用序列元数据与 mesh resolver
-       ÚÄ upstream multimodal collator 读取文本、图像/视频并生成 MRoPE
-       ÚÄ vision encoder + language decoder 前向，执行 GDN/MoE/CP 数据交换
-       ÚÄ backward、优化器更新与 TensorBoard/JSONL 日志
-       ä 进程组销毁
+  ├─ 组装 tokenizer、cc12m-test、override.imports 和用户参数
+  └─ scripts/run_train.sh -> torchrun -m torchtitan_npu.train
+       ├─ torchtitan_npu.models.qwen3_5 导入时安装视觉/MRoPE/FLA patch
+       ├─ 上游 config_registry 构造 qwen35_debugmodel(_moe)
+       ├─ GDN override 替换 delta kernel；可选 dispatcher 替换 MoE dispatch
+       ├─ parallelize_qwen3_5_npu 建立 TP/EP/FSDP；CP 使用序列元数据与 mesh resolver
+       ├─ upstream multimodal collator 读取文本、图像/视频并生成 MRoPE
+       ├─ vision encoder + language decoder 前向，执行 GDN/MoE/CP 数据交换
+       ├─ backward、优化器更新与 TensorBoard/JSONL 日志
+       └─ 进程组销毁
 ```
 
 `spmd_types` 使用 TorchTitan v0.3 的 `resolve_fsdp_mesh`/
@@ -95,7 +95,7 @@ parallelizer 可兼容当前主线和旧 NPU 运行环境。当前 Qwen3.5-VL �
 
 ```bash
 python -m tests.integration_tests.run_tests /tmp/qwen3_5-tests \
-  --test_suite qwen3_5 --test_name all --ngpu 2
+  --test_suite qwen3_5 --test_name all --ngpu 1
 ```
 
 ## Qwen3.5 视觉 mask 边界

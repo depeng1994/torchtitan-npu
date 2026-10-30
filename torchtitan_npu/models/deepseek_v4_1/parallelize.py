@@ -1,4 +1,8 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -22,7 +26,8 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh, validate_config
 
-from torchtitan_npu.extensions.distributed.fsdp import apply_fsdp_to_decoder
+from torchtitan_npu.extensions.torchtitan.distributed.fsdp import apply_fsdp_to_decoder
+from torchtitan_npu.models.common.compile_policy import skip_compile_under_cp
 
 from .engram.host import HostEngramTable
 from .model import DeepSeekV41MultimodalModel
@@ -61,7 +66,7 @@ def _apply_compile_v4_1(model, *, compile_config: CompileConfig) -> None:
     data-dependent MoE routing, a graph break around the dispatcher
     communication.  Once apply_compile grows fullgraph/dynamic parameters
     this collapses back to a plain call.  The regional-inductor helper is
-    intentionally not used: V4.1's sparse core is the selected_attention
+    intentionally not used: V4.1's sparse core is the gather_attn
     reference implementation (no FlexAttention), for which it is the
     identity.  The shared per-block code object plus role-level graphs keep
     the recompile count within the stock recompile_limit.
@@ -163,6 +168,7 @@ def parallelize_deepseek_v4_1(
     dump_folder: str,
 ):
     """Parallelize V4.1: sharding config, AC, then the decoder FSDP wrap."""
+    compile_config = skip_compile_under_cp(model, compile_config, parallel_dims)
     if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
         validate_config(parallel_dims, model)
         model.parallelize(parallel_dims)
@@ -220,4 +226,10 @@ def parallelize_deepseek_v4_1(
         edp_mesh_dims=edp_mesh_dims,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
     )
+    if getattr(model, "lora_config", None) is not None:
+        # Keep ordinary V4.1 imports independent of the optional V4 LoRA implementation.
+        from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
+
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(is_lora_parameter(name))
     return model

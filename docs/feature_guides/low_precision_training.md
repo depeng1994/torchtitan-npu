@@ -88,6 +88,10 @@ LI 各模式的实现细节不同：`fp8` 使用 8 bit E4M3 数据，按 token-h
 
 `li-quantization` 默认值为 `None`，即不启用 LI 量化。本节表中的四种格式适用于 DeepSeek-V4；DeepSeek-V4.1 当前仅支持 `mxfp4`，并使用下一节说明的独立 QLI/QSLI 实现。
 
+量化 LI 的前向使用选定的 Q/K 格式计算 Top-K 索引，训练时通过 `topk_scores` 传递稀疏 attention 的教师信号。
+反向复用 BF16 `sparse_lightning_indexer_kl_loss_grad`，按当前 microbatch 的完整 query token 数归一化，
+更新 indexer 的 Q/K 投影和权重分支；Q/K 量化不改变这条反向链路的 dtype。
+
 ### DeepSeek-V4.1 LI 与稀疏 attention 量化
 
 QLI（Quantized Lightning Indexer，量化索引器）与 QSLI（Quantized Sparse Lightning Indexer，量化稀疏索引器）负责为每个 query 选择参与稀疏 attention 的 Top-K key。在当前 V4.1 实现中，两者都将 indexer 的 Q/K 量化为 MXFP4，主要区别是选分的搜索范围及是否生产候选池：
@@ -99,12 +103,27 @@ QLI（Quantized Lightning Indexer，量化索引器）与 QSLI（Quantized Spars
 
 候选池保存 key 的块索引，每块包含 `candidate_block_size` 个位置，最多保留 `candidate_topk_blocks` 个块。它与最终的 `index_topk` 个 key 是两级筛选：QLI 候选源层先确定候选块，后续 QSLI 层使用各自的 query 和权重在这些块内重新选分。Reuse 层直接沿用已有选择，不调用 QLI 或 QSLI。
 
+QLI/QSLI 的 metadata（一条 QLI schedule、一条 QSLI schedule 以及 QSLI 被约束的 per-row 候选数
+`sparse_length`）在每 microbatch 的 eager 边界预计算，随 attention metadata 下发、全层共享；候选数
+按本 rank 的 frames 推导而不是回读 QLI 的输出，所以这些 metadata 在 forward 之前就绪，层内不再
+调用任何 metadata 算子。量化后的 sparse attention 是**另一个 backend**：`li-quantization` 只在
+`enable-sparse-attention-quantization` 同开时可用（converter 直接报错），由量化适配层
+（`torchtitan_npu/extensions/adaptor/torchao/converter.py`）安装它自己的 attention config，该 config
+用 `torchao_npu` 的 provider（`quantized_modules/deepseek_v4_1/attention_metadata.py`）建整份 entry
+——SMLA 前后向、QLI schedule、QSLI schedule + 候选数、BF16 SLIKG 的 backward metadata，字段分组与
+非量化路径同一套（`sparse_attn` / `lightning_indexer`，各按 `fwd` / `bwd` 取值）。候选池的容量与块大小
+取自模型 config（`candidate_topk_blocks` / `candidate_block_size`，参考 selector 建池、搜池用的就是它们），
+只作为 **launch 参数**与候选数推导的输入；QLI metadata 本身与池宽度无关（实测三组宽度逐字节相同），
+所以一个几何只有一条 QLI schedule，建池层和 pool-free 层共用它。`sparse_attn.asc` 上没有任何池参数，
+在这条路径上也不生效；只跑 BF16 selector 的配方不装量化 attention，`fwd_sparse` / `sparse_length`
+保持为空（字段存在，值 `None`）。
+
 `li-quantization=mxfp4` 同时启用这两种实现，由模型层的角色和候选池配置自动选择，无需分别指定。两者输出的索引交给 sparse attention 计算注意力；训练反向均使用 BF16 SLIKG 消费教师信号，QLI/QSLI 本身不替代 sparse attention。
 
-V4.1 的 indexer 训练目标通过 sparse attention 反向提供 teacher（教师信号），再由 selector 的 SLIKG 反向消费。标准 A5 融合路径会同时导入两侧 BF16 override 作为 fallback；在此前提下，以下两个配置可以独立替换对应一侧：
+V4.1 的 indexer 训练目标通过 sparse attention 反向提供 teacher（教师信号），再由 selector 的 SLIKG 反向消费。目标侧可以通过 `enable-sparse-attention-quantization` 单独量化；选分侧则不能单独量化，因为量化 selector 启动的是量化 attention 建的 schedule（单独开启 `li-quantization` 会被 converter 拒绝）：
 
-- `--extension.quantization.li-quantization mxfp4`：将 BF16 LI selector 替换为 MXFP4 QLI/QSLI，SLIKG 反向保持 BF16。
-- `--extension.quantization.enable-sparse-attention-quantization`：同时替换 KV source Compressor 和 sparse attention；sparse attention 反向继续提供 indexer teacher。
+- `--extension.quantization.li-quantization mxfp4`：将 BF16 LI selector 替换为 MXFP4 QLI/QSLI，SLIKG 反向保持 BF16；必须与下一条同开。
+- `--extension.quantization.enable-sparse-attention-quantization`：同时替换 KV source Compressor 和 sparse attention；sparse attention 反向继续提供 indexer teacher。该开关本身也决定 entry 由哪个 backend 建——开着就是量化 attention 自建，关着就是 `sparse_attn.asc` 那份。
 
 稀疏 attention 量化路径中，swa_kv 使用 `mxfp8_bf16`，cmp_kv 使用 `mxfp4_bf16`。该路径对 KV 量化再反量化后调用 sparse attention 算子，以引入对应的量化误差。
 
@@ -127,7 +146,7 @@ V4.1 的 indexer 训练目标通过 sparse attention 反向提供 teacher（教�
 
 ## FSDP 权重预量化
 
-`--extension.quantization.enable-fsdp-prequantize` 将 Block FP8 权重的量化提前到 FSDP all-gather 之前。all-gather 传输量化后的 FP8 权重与 scale，前向和反向复用量化数据，以减少通信量和重复量化计算。
+`--extension.quantization.enable-fsdp-prequantize` 将 Block FP8 权重的量化提前到 FSDP all-gather 之前：各 rank 先量化本地权重分片，再传输 FP8 权重与 scale，前向和反向在同一次 unshard 周期内复用量化结果。相较于先聚合高精度权重、再在各 rank 上量化完整权重，该方式减少了参数通信量和重复量化计算，主要用于 attention 等 dense 权重的 FP8 训练优化。
 
 ### 工作原理
 
@@ -170,6 +189,31 @@ FSDP 的参数通信和梯度通信是两个阶段：参数在模块计算前通
 
 典型示例：默认白名单包含 `.attention.wkv`（dim0=512）。`dp_shard=8` 时每卡分片 64 行，满足对齐、正常预量化；`dp_shard=16` 时每卡 32 行，启动即报错，需把 `.attention.wkv` 从 `fsdp-prequantize-fqns` 中排除（列出默认白名单的其余模式）。更高并行度会成批触发：如 `dp_shard=128` 时要求 dim0 为 8192 的倍数，均分切分的 `wq_a`/`wkv`/`wo_b`/shared experts（dim0 为 512–4096）全部违规，仅按 head/group 块切分的 `wq_b`/`wo_a`/`indexer.wq_b` 与按专家轴切分的 routed experts 仍可预量化。
 
+### MoE 专家低精度通信
+
+专家存在 EFSDP 分片时，也支持 FP8 或 MXFP4 参数通信。该能力主要用于功能支持，不以增加 EFSDP 并行度来获取训练加速为目标。
+专家参数 all-gather 在 `EFSDP>1` 时发生，EP 切分本身不产生该通信。
+
+默认专家通信格式为 `fp8`。在 `all_block_fp8` recipe 下，以下配置将启用 MXFP4 QAT 的 routed experts 切换为 MXFP4 通信，同时保留 attention 等 dense 权重的 FP8 通信：
+
+```bash
+--extension.quantization.enable-quantized-training \
+--extension.quantization.recipe all_block_fp8 \
+--extension.quantization.enable-mxfp4-qat \
+--extension.quantization.enable-fsdp-prequantize \
+--extension.quantization.fsdp-prequantize-dtype mxfp4
+```
+
+`enable-fsdp-prequantize` 启用参数通信预量化；`fsdp-prequantize-dtype mxfp4` 只将 routed experts 的通信格式切换为 MXFP4，
+attention 等 dense 权重仍使用 FP8。专家在 `[E, N, K]` 布局下沿 K 轴量化；all-gather 返回的 MXFP4 权重直接保留为反分片权重，
+在前向矩阵乘时再转换为 Block FP8，因此计算仍按 FP8 × FP8 执行。梯度通信仍使用 FSDP 原有配置。
+
+该模式要求 routed experts 启用 MXFP4 QAT，并使用 `Shard(0)` 分片（不均分时自动 pad 对齐、通信后 trim 还原）、2D/3D 权重和 block size 32；不支持 `Shard(1)`。
+未显式设置 `fsdp-prequantize-fqns` 时使用 recipe 默认白名单；若只指定 `.moe.routed_experts.inner_experts`，则只启用专家预量化通信，attention 的 FP8 预量化通信也会关闭。白名单不影响原有计算量化。
+
+该功能基于 FSDP2，当前不支持 FSDP1 低精度通信。`EFSDP=1` 时不发生 all-gather；开启该开关后，post-all-gather 仍会按
+`fsdp-prequantize-dtype` 量化反分片权重，使单卡与多卡路径保存相同的权重格式。
+
 ## 配置与生效检查
 
 以下字段均位于 `--extension.quantization` 下，表中省略公共前缀：
@@ -182,8 +226,9 @@ FSDP 的参数通信和梯度通信是两个阶段：参数在模块计算前通
 | `li-quantization` | `None` | LI Q/K 量化；V4 可选 `fp8`、`mxfp8`、`mxfp4`、`hif8`，V4.1 仅支持 `mxfp4` |
 | `enable-sparse-attention-quantization` | `False` | V4.1 KV source Compressor 与稀疏 attention 混合量化 |
 | `dst-type-max` | `0.0` | 用于 MXFP4 量化的目标类型最大值，可取值 0.0, 6.0-12.0 |
-| `enable-fsdp-prequantize` | `False` | Block FP8 权重在 FSDP all-gather 前预量化 |
-| `fsdp-prequantize-fqns` | `None` | 预量化权重 FQN 后缀白名单；`None` 用 recipe 默认白名单（全部 Block FP8 投影），显式空表与开关同开报 `ValueError`，命中但对齐失败的权重启动即报错 |
+| `enable-fsdp-prequantize` | `False` | 启用 FSDP 参数 all-gather 前预量化 |
+| `fsdp-prequantize-dtype` | `fp8` | Routed experts 的预量化通信格式；`mxfp4` 要求专家启用 MXFP4 QAT。`all_block_fp8` 下 attention 等 dense 权重仍使用 FP8 通信，启用范围由白名单决定 |
+| `fsdp-prequantize-fqns` | `None` | 预量化权重 FQN 后缀白名单，多个模式写在同一参数内并以英文逗号分隔（如 `.attention.wq_b,.attention.wo_a`）；`None` 用 recipe 默认白名单（全部 Block FP8 投影），显式空表与开关同开报 `ValueError`，命中但对齐失败的权重启动即报错 |
 | `kv-norm-quantization.format` | 未设置 | V4 nope KV Cache 量化格式，目前为 `mxfp8`（8 bit E4M3） |
 | `kv-norm-quantization.fqns` | 空列表 | V4 的量化插入位置，脚本使用 `.attention.kv_norm,.attention.compressor.norm` |
 | `kv-norm-quantization.block-size` | `32` | V4 KV Cache MXFP8 的 block size；A5 脚本使用 `64` |
@@ -192,14 +237,14 @@ FSDP 的参数通信和梯度通信是两个阶段：参数在模块计算前通
 
 启动日志中的 `Applied TorchAO-NPU recipe=...` 表示 recipe 已应用；同时检查 `mxfp4_qat`、`li_quantization`、`sparse_attention_quantization` 和 `enable_fsdp_prequantize` 是否符合预期。预量化白名单的生效来源由 `fsdp_prequantize whitelist = recipe default ...`（默认白名单）或 `fsdp_prequantize whitelist = user ...`（用户白名单）日志行确认。该日志用于确认配置应用情况，不能替代训练精度和性能验证。
 
-需要采集性能信息时，可增加 `--profiler.enable-profiling`。示例脚本中的 `USE_GOLDEN=1` 用于选择数值基线 attention override，默认使用 Ascend 融合路径；该变量不控制低精度训练总开关。
+需要采集性能信息时，可增加 `--profiler.enable-profiling`。示例脚本中的 `USE_GOLDEN=1` 用于选择参考 recipe（模型目录默认 attention，attn-gym 的 `gather_attn`），默认使用 Ascend 融合路径；该变量不控制低精度训练总开关。
 
 ## 实现与验证入口
 
 量化入口根据模型类型选择匹配规则，通过 converter 转换模型配置节点，并在模块构建时应用 TorchAO-NPU 量化。本文依据当前配置、转换逻辑和启动脚本整理，未在本文档重构中执行 NPU 训练；不同并行配置的精度与性能需在目标环境中验证。
 
 - [量化配置字段](../../torchtitan_npu/config/configs.py)
-- [TorchAO-NPU converter 与 recipe](../../interfaces/torchao_converter.py)
+- [TorchAO-NPU converter 与 recipe](../../torchtitan_npu/extensions/adaptor/torchao/converter.py)
 - [Block FP8 权重与 FSDP 预量化实现](../../experiments/torchao-npu/torchao_npu/wrapper_tensors/block_mx_wrapper_tensor.py)
-- [V4.1 Lightning Indexer 量化实现](../../experiments/torchao-npu/torchao_npu/quantized_modules/v41_lightning_indexer.py)
-- [V4.1 稀疏 attention 量化实现](../../experiments/torchao-npu/torchao_npu/quantized_modules/v41_sparse_attention.py)
+- [V4.1 Lightning Indexer 量化实现](../../experiments/torchao-npu/torchao_npu/quantized_modules/deepseek_v4_1/lightning_indexer.py)
+- [V4.1 稀疏 attention 量化实现](../../experiments/torchao-npu/torchao_npu/quantized_modules/deepseek_v4_1/sparse_attention.py)

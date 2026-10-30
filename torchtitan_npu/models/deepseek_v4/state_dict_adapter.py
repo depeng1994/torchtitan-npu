@@ -19,6 +19,7 @@ from .lora import (
     PEFT_PREFIX,
     DeepSeekV4LoRAConverter,
     LoRAOptions,
+    is_lora_parameter,
     pack_expert_factor,
     peft_target_modules,
 )
@@ -146,6 +147,14 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
 
     def get_hf_storage_reader(self, path: str, from_quantized: bool = False) -> HuggingFaceStorageReader:
         if from_quantized:
+            # Probe AO protocol first; its headers defeat the fixed-format MX reader.
+            from torchtitan_npu.extensions.mx_storage_reader.ao_hf_storage import MxAOHuggingFaceStorageReader
+
+            ao_reader = MxAOHuggingFaceStorageReader(path)
+            if ao_reader.detect():
+                ao_reader.read_metadata()
+                return ao_reader
+
             from torchtitan_npu.extensions.mx_storage_reader.hf_storage import MXHuggingFaceStorageReader
 
             reader = MXHuggingFaceStorageReader(path)
@@ -159,7 +168,7 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
         hf_state_dict = {}
 
         for key, value in state_dict.items():
-            if "lora_" in key:
+            if is_lora_parameter(key):
                 continue
             if any(t in key for t in ("compressor", "indexer", "tid2eid")):
                 new_key = to_hf_map[key]
@@ -217,7 +226,7 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
     def to_peft(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         peft_state_dict = {}
         for key, value in state_dict.items():
-            if "lora_" not in key:
+            if not is_lora_parameter(key):
                 continue
             if key.startswith("mtp_layers."):
                 raise NotImplementedError("Transformers DeepSeek-V4 PEFT export does not consume MTP adapters")

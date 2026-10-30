@@ -26,13 +26,14 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 from torchtitan_npu.config import MuonOptimizerProfile, OptimizerConfig, TrainingConfig
 from torchtitan_npu.extensions.components.gradient_clipping import GradientClippingTrainer
-from torchtitan_npu.extensions.components.optimizer import HostSparseOptimizersContainer
-from torchtitan_npu.extensions.trainer import TrainerEx
+from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
+from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.common.muon import make_owned_layout
+from torchtitan_npu.models.common.packing import compression_alignment
 
 from . import model_registry
 from .indexer import Selector
-from .model import DeepSeekV41Model, DeepSeekV41MultimodalModel, compression_alignment
+from .model import DeepSeekV41Model, DeepSeekV41MultimodalModel
 
 
 def _per_doc_alignment(model_spec: ModelSpec) -> int:
@@ -50,7 +51,7 @@ class EngramTableParamGroupConfig(ParamGroupConfig):
     """The recipe-owned table group, distinct from user-defined groups."""
 
 
-class DeepSeekV41Trainer(GradientClippingTrainer, TrainerEx):
+class DeepSeekV41Trainer(TrainerEx, GradientClippingTrainer):
     """V4.1 training with instance-owned Host sparse gradient clipping."""
 
     @dataclass(kw_only=True, slots=True)
@@ -77,26 +78,30 @@ class DeepSeekV41Trainer(GradientClippingTrainer, TrainerEx):
 
     def __init__(self, config):
         super().__init__(config)
+        # The step denominator is for the selectors that consume the fused teacher.  A port
+        # subclasses :class:`Selector`, so the reference selector -- the only module whose
+        # exact class is ``Selector`` -- is the one that does not.
         self._indexer_selectors = [
             module
             for part in self.model_parts
             for module in part.modules()
-            if isinstance(module, Selector) and module.consumes_indexer_teacher
+            if isinstance(module, Selector) and type(module) is not Selector
         ]
 
-    def train_step(self, data_iterator):
+    def step_batches(self, batches):
+        batches = super().step_batches(batches)
         if not self._indexer_selectors:
-            return super().train_step(data_iterator)
+            return batches
         self._num_step_queries = 0
         self._indexer_denominator_ready = False
 
         def counted_batches():
-            for inputs, labels in data_iterator:
+            for inputs, labels in batches:
                 # Count before CP sharding; LI also trains unsupervised input positions.
                 self._num_step_queries += inputs["input"].numel()
                 yield inputs, labels
 
-        return super().train_step(counted_batches())
+        return counted_batches()
 
     def forward_backward_step(self, *args, **kwargs):
         if self._indexer_selectors and not self._indexer_denominator_ready:
@@ -191,6 +196,17 @@ def _v41_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
             f"layers.{layer_id}.moe.routed_experts.inner_experts.{projection}": expert_sharding
             for projection in routed_expert_projections
         }
+        if getattr(model_config, "lora", None) is not None:
+            from torchtitan_npu.models.deepseek_v4.lora import DEEPSEEK_V4_LORA_TARGETS
+
+            for shardings in (attention_shardings, dense_shardings):
+                for base_key, layout in tuple(shardings.items()):
+                    owner = base_key.removesuffix(".weight")
+                    if owner.removeprefix(f"layers.{layer_id}.") in DEEPSEEK_V4_LORA_TARGETS:
+                        shardings[f"{owner}.lora_a.weight"] = owned
+                        shardings[f"{owner}.lora_b.weight"] = layout
+            for projection in ("w13_lora_a", "w1_lora_b", "w3_lora_b", "w2_lora_a", "w2_lora_b"):
+                routed_shardings[f"layers.{layer_id}.moe.routed_experts.inner_experts.{projection}"] = expert_sharding
         # Split each layer into three buckets: the routed-expert GEMMs are
         # by far the largest and get a bucket of their own so the
         # Newton-Schulz all-gather peak stays bounded on the 40-layer
@@ -202,6 +218,11 @@ def _v41_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
         bucket_configs.append(BucketConfig(name=f"layers.{layer_id}.dense", patterns=tuple(dense_shardings)))
         bucket_configs.append(BucketConfig(name=f"layers.{layer_id}.routed", patterns=tuple(routed_shardings)))
 
+    lora_pattern = ""
+    if getattr(model_config, "lora", None) is not None:
+        from torchtitan_npu.models.deepseek_v4.config_registry import _lora_muon_pattern
+
+        lora_pattern = _lora_muon_pattern(compute_sharding_by_fqn)
     muon_pattern = (
         r"(?:"
         rf"attention\.(?:{'|'.join(attention_projections)})\.weight|"
@@ -210,8 +231,7 @@ def _v41_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
         rf"moe\.routed_experts\.inner_experts\.(?:{'|'.join(routed_expert_projections)})|"
         r"moe\.router\.gate\.weight|"
         r"engram\.gate\.wkv|"
-        rf"(?:{'|'.join(hc_pre_modules)})\.hc_fn"
-        r")$"
+        rf"(?:{'|'.join(hc_pre_modules)})\.hc_fn" + (f"|{lora_pattern}" if lora_pattern else "") + r")$"
     )
     return MuonOptimizerProfile(
         muon_pattern=muon_pattern,
@@ -226,6 +246,8 @@ def _v41_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
 
 def _v41_optimizer_config(model_spec: ModelSpec) -> OptimizerConfig:
     adamw = default_adamw(lr=1e-5, eps=1e-6)
+    if getattr(model_spec.model, "lora", None) is not None:
+        return derive(adamw, OptimizerConfig, name="AdamW", _muon_profile=_v41_muon_profile(model_spec))
     has_engram = any(
         getattr(layer, "engram", None) is not None for layer in cast("DeepSeekV41Model.Config", model_spec.model).layers
     )
@@ -268,8 +290,8 @@ def _text_dataloader_config(model_spec: ModelSpec):
     return AlignedHuggingfaceDataloader.Config(per_doc_alignment=_per_doc_alignment(model_spec))
 
 
-def _make_trainer_config(flavor: str) -> TrainerEx.Config:
-    model_spec = model_registry(flavor)
+def _make_trainer_config(flavor: str, *, converters=None) -> TrainerEx.Config:
+    model_spec = model_registry(flavor, converters=converters)
     if model_spec.model.n_layers != len(model_spec.model.layers):  # pyrefly: ignore [missing-attribute]
         raise ValueError("registered V4.1 model does not describe every configured layer")
     vision = isinstance(model_spec.model, DeepSeekV41MultimodalModel.Config)
@@ -310,6 +332,14 @@ def deepseek_v4_1_flash_40layers_16experts_text() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_flash_40layers_16experts_text")
 
 
+def deepseek_v4_1_flash_40layers_24experts_multimodal() -> TrainerEx.Config:
+    return _make_trainer_config("deepseek_v4_1_flash_40layers_24experts_multimodal")
+
+
+def deepseek_v4_1_flash_40layers_24experts_text() -> TrainerEx.Config:
+    return _make_trainer_config("deepseek_v4_1_flash_40layers_24experts_text")
+
+
 def deepseek_v4_1_debugmodel_multimodal() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_debugmodel")
 
@@ -326,3 +356,29 @@ def deepseek_v4_1_stripped() -> TrainerEx.Config:
     on one card.
     """
     return _make_trainer_config("deepseek_v4_1_stripped")
+
+
+def deepseek_v4_1_flash_lora() -> TrainerEx.Config:
+    return _make_lora_trainer_config("deepseek_v4_1_flash")
+
+
+def deepseek_v4_1_flash_text_lora() -> TrainerEx.Config:
+    return _make_lora_trainer_config("deepseek_v4_1_flash_text")
+
+
+def deepseek_v4_1_debugmodel_lora() -> TrainerEx.Config:
+    return _make_lora_trainer_config("deepseek_v4_1_debugmodel_text")
+
+
+def _make_lora_trainer_config(flavor: str) -> TrainerEx.Config:
+    from .checkpoint import DeepSeekV41LoRACheckpointManager
+    from .lora import DeepSeekV41LoRAConverter
+
+    config = _make_trainer_config(
+        flavor, converters=[DeepSeekV41LoRAConverter.Config(rank=16, alpha=32, rank_experts=16)]
+    )
+    config.checkpoint = derive(config.checkpoint, DeepSeekV41LoRACheckpointManager.Config)
+    config.checkpoint.enable = True
+    config.checkpoint.last_save_model_only = False
+    config.checkpoint.last_save_in_hf = False
+    return config

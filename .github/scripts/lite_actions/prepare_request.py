@@ -11,11 +11,10 @@ GitHub prepares one immutable, SHA-bound case plan. The dispatcher owns training
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-from pathlib import Path
 import re
+from pathlib import Path
 
 TEST = re.compile(r"[a-z][a-z0-9_]{0,79}\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
@@ -41,7 +40,7 @@ def parse_cases(value: str) -> list[dict]:
     return cases
 
 
-from tests.integration_tests.tools.lite_actions.contract import normalize, create_plan, digest as digest_plan
+from tests.integration_tests.tools.lite_actions.contract import create_plan, normalize
 
 
 def expand_cases(selectors, defaults):
