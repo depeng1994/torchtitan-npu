@@ -46,7 +46,7 @@ jobs:
       - name: Validate and expand trusted test plan
         id: plan
         env:
-          CI_TEST_CASES: ${{ github.event_name == 'pull_request' && inputs.default_cases || inputs.test_cases }}
+          CI_TEST_CASES: ${{ inputs.test_cases != '' && inputs.test_cases || inputs.default_cases }}
           CI_SOURCE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           CI_PIPELINE: ${{ inputs.pipeline }}
         run: PYTHONPATH="$PWD" python3 .github/scripts/lite_actions/prepare_request.py
