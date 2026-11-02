@@ -1,0 +1,61 @@
+{
+  "schema": 3,
+  "repo": "cann-framework/torchtitan-npu",
+  "workflow": "nightly_fulltests.yml",
+  "run_id": 19,
+  "attempt": 2,
+  "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "defaults": {
+    "worker": "blue",
+    "target_pool": "a3_shared_blue",
+    "docker": "image:tag"
+  },
+  "cases": [
+    {
+      "case_id": "case_000_wire_train",
+      "order": 0,
+      "test_id": "wire_train",
+      "label": "Wire training",
+      "kind": "train",
+      "worker": "blue",
+      "target_pool": "a3_shared_blue",
+      "resources": {
+        "nodes": 1,
+        "devices_per_node": 8
+      },
+      "docker": "image:tag",
+      "execution_timeout_seconds": 7200
+    },
+    {
+      "case_id": "case_001_renamed_smoke",
+      "order": 1,
+      "test_id": "renamed_smoke",
+      "label": "Wire smoke",
+      "kind": "npu_smoke",
+      "worker": "blue",
+      "target_pool": "a3_shared_blue",
+      "resources": {
+        "nodes": 2,
+        "devices_per_node": 8
+      },
+      "docker": "image:tag",
+      "execution_timeout_seconds": 120
+    },
+    {
+      "case_id": "case_002_worker_os_yellow",
+      "order": 2,
+      "test_id": "worker_os_yellow",
+      "label": "Wire worker probe",
+      "kind": "worker_probe",
+      "worker": "yellow",
+      "target_pool": null,
+      "resources": {
+        "nodes": 0,
+        "devices_per_node": 0
+      },
+      "docker": null,
+      "execution_timeout_seconds": 90
+    }
+  ],
+  "plan_digest": "2eefa0f27e50948eb3c0965b1fe1e0f5cfbe03828488e71542763a37d202dd76"
+}
