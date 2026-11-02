@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "runner_protocol": "lite-gitcode-torchtitan-v1",
+  "baseline_reference_commit": "f20d073aec6bb7543b2e7db706d1e01b5298c8ca",
+  "pipelines": {
+    "smoke": ["worker_os_blue", "dispatch_smoke_8p", "dispatch_smoke_16p"],
+    "nightly": ["dsv4_flash_a3_8p_example", "dsv4_flash_a3_8p_adamw", "dsv4_flash_a3_16p_example"]
+  },
+  "cases": {
+    "worker_os_blue": {
+      "test_id": "worker_os_blue", "label": "Blue worker OS probe", "kind": "worker_probe", "worker": "blue", "target_pool": null, "docker": null,
+      "resources": {"nodes": 0, "devices_per_node": 0}, "execution_timeout_seconds": 90
+    },
+    "dispatch_smoke_8p": {
+      "test_id": "dispatch_smoke_8p", "label": "Lite Actions dispatch smoke: single-node 8P HCCL/DP handshake", "kind": "npu_smoke", "worker": "blue", "target_pool": "a3_shared_blue", "docker": "cann_master_torchtitan_master_xyj",
+      "resources": {"nodes": 1, "devices_per_node": 8}, "execution_timeout_seconds": 75
+    },
+    "dispatch_smoke_16p": {
+      "test_id": "dispatch_smoke_16p", "label": "Lite Actions dispatch smoke: two-node 16P HCCL/DP handshake", "kind": "npu_smoke", "worker": "blue", "target_pool": "a3_shared_blue", "docker": "cann_master_torchtitan_master_xyj",
+      "resources": {"nodes": 2, "devices_per_node": 8}, "execution_timeout_seconds": 75
+    },
+    "dsv4_flash_a3_8p_example": {
+      "test_id": "dsv4_flash_a3_8p_example", "label": "DeepSeek-V4 Flash A3 8P Muon Eager, 5 steps", "kind": "train", "worker": "blue", "target_pool": "a3_shared_blue", "docker": "cann_master_torchtitan_master_xyj",
+      "resources": {"nodes": 1, "devices_per_node": 8}, "execution_timeout_seconds": 7200
+    },
+    "dsv4_flash_a3_8p_adamw": {
+      "test_id": "dsv4_flash_a3_8p_adamw", "label": "DeepSeek-V4 Flash A3 8P AdamW Virtual Optimizer Eager, 5 steps", "kind": "train", "worker": "blue", "target_pool": "a3_shared_blue", "docker": "cann_master_torchtitan_master_xyj",
+      "resources": {"nodes": 1, "devices_per_node": 8}, "execution_timeout_seconds": 7200
+    },
+    "dsv4_flash_a3_16p_example": {
+      "test_id": "dsv4_flash_a3_16p_example", "label": "DeepSeek-V4 Flash two-node 16P AdamW Eager, 5 steps", "kind": "train", "worker": "blue", "target_pool": "a3_shared_blue", "docker": "cann_master_torchtitan_master_xyj",
+      "resources": {"nodes": 2, "devices_per_node": 8}, "execution_timeout_seconds": 7200
+    }
+  },
+  "profiles": {
+    "worker_os_blue": {"env_vars": {}, "source_paths": [], "payload": null, "train_script": null, "train_args": [], "expected_steps": []},
+    "dispatch_smoke_8p": {
+      "env_vars": {"ASCEND_SET_ENV_PATH": "/usr/local/Ascend/ascend-toolkit/set_env.sh"},
+      "source_paths": [".github/scripts/lite_actions/gitcode/smoke_payload.py"], "payload": ".github/scripts/lite_actions/gitcode/smoke_payload.py", "train_script": null, "train_args": [], "expected_steps": []
+    },
+    "dispatch_smoke_16p": {
+      "env_vars": {"ASCEND_SET_ENV_PATH": "/usr/local/Ascend/ascend-toolkit/set_env.sh"},
+      "source_paths": [".github/scripts/lite_actions/gitcode/smoke_payload.py"], "payload": ".github/scripts/lite_actions/gitcode/smoke_payload.py", "train_script": null, "train_args": [], "expected_steps": []
+    },
+    "dsv4_flash_a3_8p_example": {
+      "env_vars": {"ASCEND_SET_ENV_PATH": "/usr/local/Ascend/ascend-toolkit/set_env.sh", "HF_ASSETS_PATH": "/mnt/share/models/DeepSeek-V4-Flash-bf16", "HF_HOME": "/mnt/share/ci_tests/.lite-actions-hf-cache", "HF_DATASETS_CACHE": "/mnt/share/ci_tests/.lite-actions-hf-cache/datasets", "CKPT_INIT_LOAD_PATH": "/mnt/share/dsv4_ckpt_8rank", "CONFIG": "deepseek_v4_flash_43layers_16experts", "TORCHINDUCTOR_NPU_BACKEND": "ascendc"},
+      "source_paths": ["examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh", "scripts/run_train.sh", "torchtitan_npu/train.py", "torchtitan_npu/models/deepseek_v4/__init__.py"],
+      "payload": null, "train_script": "examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh",
+      "train_args": ["--metrics.enable_tensorboard", "--metrics.log_freq=1", "--training.steps", "5", "--compile.no-enable"], "expected_steps": [1, 2, 3, 4, 5]
+    },
+    "dsv4_flash_a3_8p_adamw": {
+      "env_vars": {"ASCEND_SET_ENV_PATH": "/usr/local/Ascend/ascend-toolkit/set_env.sh", "HF_ASSETS_PATH": "/mnt/share/models/DeepSeek-V4-Flash-bf16", "HF_HOME": "/mnt/share/ci_tests/.lite-actions-hf-cache", "HF_DATASETS_CACHE": "/mnt/share/ci_tests/.lite-actions-hf-cache/datasets", "CKPT_INIT_LOAD_PATH": "/mnt/share/dsv4_ckpt_8rank", "CONFIG": "deepseek_v4_flash_43layers_16experts", "OPTIMIZER_OVERRIDES": "torchtitan_npu.override.common.optimizer.virtual", "TORCHINDUCTOR_NPU_BACKEND": "ascendc"},
+      "source_paths": ["examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh", "scripts/run_train.sh", "torchtitan_npu/train.py", "torchtitan_npu/models/deepseek_v4/__init__.py"],
+      "payload": null, "train_script": "examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh",
+      "train_args": ["--metrics.enable_tensorboard", "--metrics.log_freq=1", "--training.steps", "5", "--compile.no-enable", "--optimizer.name", "AdamW"], "expected_steps": [1, 2, 3, 4, 5]
+    },
+    "dsv4_flash_a3_16p_example": {
+      "env_vars": {"ASCEND_SET_ENV_PATH": "/usr/local/Ascend/ascend-toolkit/set_env.sh", "HF_ASSETS_PATH": "/mnt/share/models/DeepSeek-V4-Flash-bf16", "HF_HOME": "/mnt/share/ci_tests/.lite-actions-hf-cache", "HF_DATASETS_CACHE": "/mnt/share/ci_tests/.lite-actions-hf-cache/datasets", "CKPT_INIT_LOAD_PATH": "/mnt/share/dsv4_ckpt_8rank", "CONFIG": "deepseek_v4_flash_43layers_16experts", "OPTIMIZER_OVERRIDES": "", "TORCHINDUCTOR_NPU_BACKEND": "ascendc"},
+      "source_paths": ["examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh", "scripts/run_train_multinodes.sh", "torchtitan_npu/train.py", "torchtitan_npu/models/deepseek_v4/__init__.py"],
+      "payload": null, "train_script": "examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh",
+      "train_args": ["--metrics.enable_tensorboard", "--metrics.log_freq=1", "--parallelism.expert-parallel-degree", "16", "--parallelism.data-parallel-shard-degree", "16", "--parallelism.data-parallel-replicate-degree", "1", "--training.global-batch-size", "128", "--training.steps", "5", "--optimizer.name", "AdamW", "--compile.no-enable", "--checkpoint.no-enable", "--debug.moe-force-load-balance", "--comm.init-timeout-seconds", "600"], "expected_steps": [1, 2, 3, 4, 5]
+    }
+  }
+}
