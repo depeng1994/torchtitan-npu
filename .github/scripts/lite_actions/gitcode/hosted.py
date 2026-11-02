@@ -49,7 +49,11 @@ class ArtifactUploader:
     """One SDK invocation per call; Producer owns durable recovery and readback."""
 
     def __init__(self, command, *, timeout_seconds=300):
-        if not command or not all(isinstance(part, str) and part for part in command):
+        if (
+            not isinstance(command, (list, tuple))
+            or not command
+            or not all(isinstance(part, str) and part and "\0" not in part for part in command)
+        ):
             raise HostedError("TRUSTED_UPLOAD_COMMAND_REQUIRED")
         self.command = tuple(command)
         self.timeout_seconds = timeout_seconds
@@ -102,9 +106,7 @@ class ArtifactUploader:
 
 def prepare(*, environment, producer, intent, runner_path, workspace):
     run_id = validate_context(environment, producer.policy)
-    return producer.prepare(
-        run_id=run_id, intent=intent, runner_path=runner_path, workspace=workspace
-    )
+    return producer.prepare(run_id=run_id, intent=intent, runner_path=runner_path, workspace=workspace)
 
 
 def wait(
