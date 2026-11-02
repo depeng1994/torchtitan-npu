@@ -15,11 +15,21 @@ import json
 import os
 import sys
 
-
 OPTION_NAMES = (
-    "nnodes", "node_rank", "nproc_per_node", "master_addr", "master_port",
-    "rdzv_backend", "rdzv_endpoint", "rdzv_id", "rdzv_conf",
-    "local_ranks_filter", "role", "tee", "max_restarts", "log_dir",
+    "nnodes",
+    "node_rank",
+    "nproc_per_node",
+    "master_addr",
+    "master_port",
+    "rdzv_backend",
+    "rdzv_endpoint",
+    "rdzv_id",
+    "rdzv_conf",
+    "local_ranks_filter",
+    "role",
+    "tee",
+    "max_restarts",
+    "log_dir",
 )
 
 
@@ -49,11 +59,30 @@ def launch_args(argv, env):
     if not 1024 <= port <= 65535 or int(env["MASTER_PORT"]) != port:
         raise ValueError("training rendezvous port lease mismatch")
     return [
-        sys.executable, "-m", "torch.distributed.run",
-        "--nnodes", str(nodes), "--nproc-per-node", str(devices),
-        "--node-rank", str(rank), "--master-addr", address, "--master-port", str(port),
-        "--max-restarts", "0", "--local-ranks-filter", "0", "--role", "rank", "--tee", "3",
-        "-m", "_lite_gitcode_train", *argv[split + 2:],
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nnodes",
+        str(nodes),
+        "--nproc-per-node",
+        str(devices),
+        "--node-rank",
+        str(rank),
+        "--master-addr",
+        address,
+        "--master-port",
+        str(port),
+        "--max-restarts",
+        "0",
+        "--local-ranks-filter",
+        "0",
+        "--role",
+        "rank",
+        "--tee",
+        "3",
+        "-m",
+        "_lite_gitcode_train",
+        *argv[split + 2 :],
     ]
 
 
