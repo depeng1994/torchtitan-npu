@@ -21,8 +21,13 @@ This is a strong static cause consistent with the runtime reason, but not claime
 
 Changed only model generator capture step ID to `1`; the job identifier remains `manual_capture`. The generated workflow is regenerated from the builder. No SDK identity checks were weakened or removed. Name, shell, working directory, generated script SHA-256, task, sequence, job binding, status, command digest, and retained evidence re-read remain strict.
 
-The capture bootstrap script digest is unchanged:
+At this historical step-ID correction, the capture bootstrap digest was
 `8eb518a2fc3708de3f8e41015fb952d68f3b767754e699eb1697c33df5ab442d`.
+That digest is superseded by the later reviewed phase-diagnostic bootstrap:
+`2a468c43fa38a69d6e037965c6f4b003039261e5f3307396d0d5f3e94367e1ca`.
+The latter is the current generated digest for all six formal jobs and is the
+value carried by the current PR18 workflow generator. The historical test and
+step-ID evidence above remains valid for its original revision only.
 
 ## Regression evidence
 

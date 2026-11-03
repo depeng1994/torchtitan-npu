@@ -61,6 +61,9 @@ jobs:
           retention-days: 1
           if-no-files-found: error
   case:
+    # Pull-request CI validates and expands the immutable plan, but never
+    # dispatches NPU work. Hardware cases require an explicit workflow_dispatch.
+    if: github.event_name != 'pull_request'
     needs: prepare
     name: ${{ matrix.test_id }}
     runs-on: ubuntu-latest

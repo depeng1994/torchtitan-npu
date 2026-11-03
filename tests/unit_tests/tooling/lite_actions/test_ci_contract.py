@@ -158,12 +158,16 @@ class CIContract(unittest.TestCase):
             data = yaml.load((ROOT / ".github/workflows" / name).read_text(), Loader=yaml.BaseLoader)
             self.assertEqual(set(data["on"]), {"pull_request", "workflow_dispatch"})
             self.assertIn("result", data["jobs"])
+            result_script = data["jobs"]["result"]["steps"][0]["run"]
+            self.assertIn('CI_RESULT" = success', result_script)
+            self.assertIn('CI_RESULT" = skipped', result_script)
 
     def test_common_keeps_exact_sha_matrix_and_bounded_waiter(self):
         p = ROOT / ".github/workflows/lite_actions_common.yml"
         text = p.read_text()
         data = yaml.load(text, Loader=yaml.BaseLoader)
         self.assertEqual(data["jobs"]["case"]["strategy"]["fail-fast"], "false")
+        self.assertEqual(data["jobs"]["case"]["if"], "github.event_name != 'pull_request'")
         self.assertIn("github.event.pull_request.head.sha", text)
         self.assertNotIn("pull_request_target", text)
 

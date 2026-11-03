@@ -50,7 +50,7 @@ jobs:
     steps:
       - env:
           CI_RESULT: ${{ needs.ci.result }}
-        run: test "$CI_RESULT" = success
+        run: test "$CI_RESULT" = success || test "$CI_RESULT" = skipped
 
   prepare-gitcode:
     name: prepare-gitcode
